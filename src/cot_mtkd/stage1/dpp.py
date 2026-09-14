@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+
+@dataclass(frozen=True)
+class DPPMetrics:
+    groups: int
+    samples: int
+    cholesky_fallbacks: int
+    maximum_jitter: float
+
+
+def normalized_support_features(
+    support_logits: torch.Tensor,
+    support_mask: torch.Tensor,
+    epsilon: float = 1.0e-12,
+) -> torch.Tensor:
+    """L2-normalized exponentiated-logit vectors on common support.
+
+    `support_logits` is `[experts, tokens, support]`; `support_mask` is
+    `[tokens, support]`. Padding coordinates are exactly zero.
+    """
+    mask = support_mask.unsqueeze(0).to(device=support_logits.device)
+    masked = support_logits.float().masked_fill(~mask, -torch.inf)
+    maximum = masked.max(dim=-1, keepdim=True).values
+    values = torch.exp(masked - maximum).masked_fill(~mask, 0.0)
+    norm = values.pow(2).sum(dim=-1, keepdim=True).sqrt().clamp_min(epsilon)
+    return values / norm
+
+
+def _cholesky_logdet(
+    gram: torch.Tensor, initial_jitter: float, maximum_jitter: float
+) -> tuple[torch.Tensor, float, int]:
+    identity = torch.eye(gram.shape[-1], device=gram.device, dtype=torch.float32)
+    jitter = initial_jitter
+    fallback_count = 0
+    while True:
+        factor, info = torch.linalg.cholesky_ex(gram.float() + jitter * identity)
+        if int(info.max().item()) == 0:
+            return 2.0 * torch.log(torch.diagonal(factor)).sum(), jitter, fallback_count
+        if jitter >= maximum_jitter:
+            sign, logabsdet = torch.linalg.slogdet(
+                gram.float() + maximum_jitter * identity
+            )
+            if float(sign.item()) <= 0:
+                raise FloatingPointError(
+                    "DPP Gram matrix remains non-positive after maximum jitter"
+                )
+            return logabsdet, maximum_jitter, fallback_count + 1
+        jitter = min(maximum_jitter, jitter * 10.0)
+        fallback_count += 1
+
+
+def step_dpp_loss(
+    features: torch.Tensor,
+    sample_ids: torch.Tensor,
+    step_ids: torch.Tensor,
+    jitter: float = 1.0e-4,
+    maximum_jitter: float = 1.0e-2,
+    reduction: str = "mean",
+) -> tuple[torch.Tensor, DPPMetrics]:
+    """Negative log-volume, mean over steps per sample then over samples."""
+    if features.ndim != 3:
+        raise ValueError("features must have shape [experts, tokens, dimensions]")
+    if sample_ids.numel() != features.shape[1] or step_ids.numel() != features.shape[1]:
+        raise ValueError("Token metadata does not match DPP features")
+    if (step_ids < 0).any():
+        raise ValueError("DPP received a non-reasoning token")
+    expert_count = features.shape[0]
+    pair_ids = torch.stack([sample_ids.long(), step_ids.long()], dim=-1)
+    unique_pairs = torch.unique(pair_ids, dim=0)
+    per_sample: dict[int, list[torch.Tensor]] = {}
+    fallback_count = 0
+    used_jitter = jitter
+    for pair in unique_pairs:
+        mask = (pair_ids == pair).all(dim=-1)
+        token_features = features[:, mask, :]
+        gram = torch.einsum("mtk,ntk->mn", token_features, token_features) / mask.sum()
+        logdet, actual_jitter, fallbacks = _cholesky_logdet(
+            gram, jitter, maximum_jitter
+        )
+        loss = -logdet / expert_count
+        per_sample.setdefault(int(pair[0].item()), []).append(loss)
+        fallback_count += fallbacks
+        used_jitter = max(used_jitter, actual_jitter)
+    sample_losses = [torch.stack(losses).mean() for losses in per_sample.values()]
+    if not sample_losses:
+        zero = features.sum() * 0.0
+        return zero, DPPMetrics(0, 0, 0, jitter)
+    stacked = torch.stack(sample_losses)
+    if reduction == "mean":
+        result = stacked.mean()
+    elif reduction == "sum":
+        result = stacked.sum()
+    elif reduction == "none":
+        result = stacked
+    else:
+        raise ValueError(f"Unknown DPP reduction: {reduction}")
+    return result, DPPMetrics(
+        groups=len(unique_pairs),
+        samples=len(sample_losses),
+        cholesky_fallbacks=fallback_count,
+        maximum_jitter=used_jitter,
+    )
+
+
+def marginal_log_uniqueness(gram: torch.Tensor, jitter: float = 1.0e-4) -> torch.Tensor:
+    """Log Schur-complement contribution of each expert to `gram + eps I`."""
+    gram = gram.float()
+    count = gram.shape[0]
+    values: list[torch.Tensor] = []
+    for expert in range(count):
+        others = torch.tensor(
+            [i for i in range(count) if i != expert], device=gram.device
+        )
+        cross = gram[expert, others]
+        sub = gram[others][:, others]
+        identity = torch.eye(count - 1, device=gram.device, dtype=gram.dtype)
+        solution = torch.linalg.solve(sub + jitter * identity, gram[others, expert])
+        schur = gram[expert, expert] + jitter - cross @ solution
+        values.append(torch.log(schur.clamp_min(1.0e-12)))
+    return torch.stack(values)

@@ -1,0 +1,24 @@
+schema_version: 1
+seed: 42
+model:
+  name_or_path: Qwen/Qwen2.5-7B-Instruct
+  revision: a09a35458c702b33eeacc393d103063234e8bc28
+  dtype: bfloat16
+  attn_implementation: flash_attention_2
+signals:
+  temperature_features: 1.0
+  temperature_medoid: 2.0
+  importance_clip: [0.25, 4.0]
+  importance_consensus_floor: 0.5
+  importance_js_scale: 1.0
+  robust_mad_scale: 1.4826
+  feature_epsilon: 1.0e-6
+  uniform_teacher_mass: 0.10
+  dpp_jitter: 1.0e-4
+  pag_nonfinite_fallback: neutral
+runtime:
+  lm_head_chunk_tokens: 64
+paths:
+  prepared: artifacts/prepared/s1k_1_1
+  stage1: artifacts/stage1/main
+  output: artifacts/supervision/main

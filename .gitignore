@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# GAC-CoT-MTKD local artifacts
+artifacts/
+outputs/
+logs/
+.DS_Store

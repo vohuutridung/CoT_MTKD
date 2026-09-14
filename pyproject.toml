@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cot-mtkd"
+version = "0.1.0"
+description = "Geometry-aware multi-expert distillation for long-chain reasoning"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4",
+  "transformers>=4.48",
+  "peft>=0.14",
+  "datasets>=3.2",
+  "safetensors>=0.4.5",
+  "PyYAML>=6.0",
+  "tqdm>=4.66",
+  "numpy>=1.26",
+  "math-verify==0.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.8",
+]
+
+[project.scripts]
+cot-mtkd-prepare = "cot_mtkd.cli.prepare_data:main"
+cot-mtkd-stage1 = "cot_mtkd.cli.train_stage1:main"
+cot-mtkd-supervision = "cot_mtkd.cli.build_supervision:main"
+cot-mtkd-cache = "cot_mtkd.cli.build_teacher_cache:main"
+cot-mtkd-stage2 = "cot_mtkd.cli.train_stage2:main"
+cot-mtkd-evaluate = "cot_mtkd.cli.evaluate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.isort]
+profile = "black"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
