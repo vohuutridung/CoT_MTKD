@@ -245,6 +245,8 @@ def replay_expert_gradients(
     token_weights, sft_count, dropped_steps = step_level_token_weights(
         batch, expert_index, base_seed, global_step, rng_stream, drop_probability
     )
+    # `sft_count` is the number of contributing segments: retained reasoning
+    # steps plus always-on answer/format blocks. Dropped steps are excluded.
     sft_hidden_gradient, sft_loss_sum, _ = cross_entropy_hidden_gradient(
         response_hidden,
         head,
@@ -590,10 +592,10 @@ def train_stage1(
     # instead of flushing three undersized batches at each epoch boundary.
     sft_buffers = [zeros_like_parameters(parameters) for parameters in parameter_lists]
     dpp_buffers = [zeros_like_parameters(parameters) for parameters in parameter_lists]
-    sft_token_count = 0
+    sft_segment_counts = [0] * len(adapter_names)
     dpp_sample_count = 0
     accumulated_microbatches = 0
-    accumulated_sft_loss = 0.0
+    accumulated_sft_losses = [0.0] * len(adapter_names)
     accumulated_dpp_loss = 0.0
     selected_k_sum = 0.0
     support_selection_count = valid_candidate_count = cholesky_fallbacks = 0
@@ -645,8 +647,8 @@ def train_stage1(
                 )
                 add_gradients_(sft_buffers[expert], sft_gradient)
                 add_gradients_(dpp_buffers[expert], dpp_gradient)
-                accumulated_sft_loss += sft_loss
-                sft_token_count += segment_count if expert == 0 else 0
+                accumulated_sft_losses[expert] += sft_loss
+                sft_segment_counts[expert] += segment_count
                 dropped_step_count += dropped_steps
             accumulated_dpp_loss += probe.dpp_loss_sum
             dpp_sample_count += probe.dpp_sample_count
@@ -663,12 +665,12 @@ def train_stage1(
             all_reduce_grad_lists(sft_buffers)
             all_reduce_grad_lists(dpp_buffers)
             counts = torch.tensor(
-                [sft_token_count, dpp_sample_count],
+                [*sft_segment_counts, dpp_sample_count],
                 device=distributed.device,
                 dtype=torch.float64,
             )
             losses = torch.tensor(
-                [accumulated_sft_loss, accumulated_dpp_loss],
+                [*accumulated_sft_losses, accumulated_dpp_loss],
                 device=distributed.device,
                 dtype=torch.float64,
             )
@@ -686,10 +688,10 @@ def train_stage1(
                 dtype=torch.float64,
             )
             all_reduce_tensor(probe_statistics)
-            for values in sft_buffers:
-                divide_gradients_(values, max(float(counts[0].item()), 1.0))
+            for expert, values in enumerate(sft_buffers):
+                divide_gradients_(values, max(float(counts[expert].item()), 1.0))
             for values in dpp_buffers:
-                divide_gradients_(values, max(float(counts[1].item()), 1.0))
+                divide_gradients_(values, max(float(counts[-1].item()), 1.0))
 
             set_all_adapters_trainable(model, adapter_names)
             repulsion, _kernel, distances, current_bandwidth = grassmann_repulsion_updates(
@@ -738,10 +740,13 @@ def train_stage1(
                     step=global_step,
                     epoch=epoch,
                     sft_nll=float(
-                        losses[0].item()
-                        / max(counts[0].item() * len(adapter_names), 1.0)
+                        sum(
+                            losses[expert].item() / max(counts[expert].item(), 1.0)
+                            for expert in range(len(adapter_names))
+                        )
+                        / max(len(adapter_names), 1)
                     ),
-                    dpp_loss=float(losses[1].item() / max(counts[1].item(), 1.0)),
+                    dpp_loss=float(losses[-1].item() / max(counts[-1].item(), 1.0)),
                     dropped_reasoning_steps=int(probe_statistics[4].item()),
                     learning_rate=optimizers[0].param_groups[0]["lr"],
                     grassmann_bandwidth=current_bandwidth,
@@ -786,8 +791,10 @@ def train_stage1(
             dpp_buffers = [
                 zeros_like_parameters(parameters) for parameters in parameter_lists
             ]
-            sft_token_count = dpp_sample_count = accumulated_microbatches = 0
-            accumulated_sft_loss = accumulated_dpp_loss = 0.0
+            sft_segment_counts = [0] * len(adapter_names)
+            accumulated_sft_losses = [0.0] * len(adapter_names)
+            dpp_sample_count = accumulated_microbatches = 0
+            accumulated_dpp_loss = 0.0
             selected_k_sum = 0.0
             support_selection_count = valid_candidate_count = cholesky_fallbacks = 0
             dropped_step_count = 0

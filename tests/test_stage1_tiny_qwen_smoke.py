@@ -117,7 +117,7 @@ class Stage1TinyQwenSmokeTest(unittest.TestCase):
             )
             self.assertEqual(len(sft), len(groups[expert]))
             self.assertEqual(len(dpp), len(groups[expert]))
-            self.assertEqual(segment_count, 8)
+            self.assertEqual(segment_count, 8 - _dropped)
             self.assertGreater(loss, 0.0)
             self.assertTrue(all(torch.isfinite(grad).all() for grad in sft + dpp))
             captured_data_gradients.append(

@@ -15,13 +15,15 @@ def step_level_token_weights(
     rng_stream: int,
     drop_probability: float,
 ) -> tuple[torch.Tensor, int, int]:
-    """Length-normalized step NLL with one Bernoulli mask per step and expert.
+    """Length-normalized step NLL with Bernoulli step dropout.
 
-    Answer tokens form their own fixed-weight block. Format/control tokens
-    form a separate always-on block, preserving the hard-loss token contract
-    without diluting final-answer NLL with delimiters or markers.
-    Returns weights in `response_targets` order, the fixed segment count for
-    batch normalization, and the number of dropped reasoning steps.
+    The final SFT reduction averages only over contributing segments.
+    Dropped reasoning steps have zero weight and are excluded from the
+    denominator. Answer tokens form their own always-on block.
+    Format/control tokens form a separate always-on block, preserving
+    the hard-loss token contract without diluting final-answer NLL.
+    Returns weights in `response_targets` order, the contributing
+    segment count, and the number of dropped reasoning steps.
     """
     if not 0.0 <= drop_probability < 1.0:
         raise ValueError("step dropout probability must be in [0, 1)")
@@ -40,6 +42,7 @@ def step_level_token_weights(
     )
     retained = torch.rand(unique_pairs.shape[0], generator=generator) >= drop_probability
     dropped = int((~retained).sum().item())
+    retained_reasoning_steps = int(retained.sum().item())
     for index, pair in enumerate(unique_pairs):
         mask = reasoning & batch_ids.eq(pair[0]) & step_ids.eq(pair[1])
         if bool(retained[index]):
@@ -52,4 +55,4 @@ def step_level_token_weights(
             if mask.any():
                 weights[mask] = 1.0 / int(mask.sum().item())
                 fixed_blocks += 1
-    return weights, int(unique_pairs.shape[0]) + fixed_blocks, dropped
+    return weights, retained_reasoning_steps + fixed_blocks, dropped
