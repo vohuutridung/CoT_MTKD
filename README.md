@@ -1,3 +1,4 @@
+./project_commands.sh setup
 # GAC-CoT-MTKD
 
 Train five LoRA experts and distill them into one student adapter.

@@ -43,6 +43,42 @@ class DataContractTest(unittest.TestCase):
         )
         self.assertEqual(steps, [-1, -1, 0])
 
+    def test_fused_short_step_prefers_reasoning_over_delimiter(self) -> None:
+        segments = (
+            CharacterSegment(0, 1, TokenRegion.REASONING, 0),
+            CharacterSegment(1, 3, TokenRegion.DELIMITER, 0),
+            CharacterSegment(3, 4, TokenRegion.REASONING, 1),
+            CharacterSegment(4, 6, TokenRegion.DELIMITER, 1),
+            CharacterSegment(6, 11, TokenRegion.REASONING, 2),
+        )
+        regions, steps = assign_token_regions([(0, 3), (3, 6), (6, 11)], segments)
+        self.assertEqual(
+            regions,
+            [
+                int(TokenRegion.REASONING),
+                int(TokenRegion.REASONING),
+                int(TokenRegion.REASONING),
+            ],
+        )
+        self.assertEqual(steps, [0, 1, 2])
+
+    def test_pure_delimiter_token_stays_delimiter(self) -> None:
+        segments = (
+            CharacterSegment(0, 5, TokenRegion.REASONING, 0),
+            CharacterSegment(5, 7, TokenRegion.DELIMITER, 0),
+            CharacterSegment(7, 12, TokenRegion.REASONING, 1),
+        )
+        regions, steps = assign_token_regions([(0, 5), (5, 7), (7, 12)], segments)
+        self.assertEqual(
+            regions,
+            [
+                int(TokenRegion.REASONING),
+                int(TokenRegion.DELIMITER),
+                int(TokenRegion.REASONING),
+            ],
+        )
+        self.assertEqual(steps, [0, 0, 1])
+
     def test_structural_answer_boundary_and_delimiter_ownership(self) -> None:
         serialized = serialize_record(
             "Question?",

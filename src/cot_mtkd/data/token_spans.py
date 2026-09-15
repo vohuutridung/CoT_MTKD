@@ -5,6 +5,27 @@ from collections.abc import Sequence
 from .schema import CharacterSegment, TokenRegion
 
 
+def _segment_assignment_key(
+    segment: CharacterSegment, start: int, end: int
+) -> tuple[int, int]:
+    overlap = segment.overlap(start, end)
+    if overlap <= 0:
+        return (0, 0)
+    # BPE may fuse a short reasoning span with a longer delimiter. Prefer the
+    # content region so the tokenized step still has a content token.
+    rank = 1 if segment.region == TokenRegion.REASONING else 0
+    return (rank, overlap)
+
+
+def _select_segment(
+    segments: Sequence[CharacterSegment], start: int, end: int
+) -> CharacterSegment:
+    best = max(segments, key=lambda item: _segment_assignment_key(item, start, end))
+    if best.overlap(start, end) == 0:
+        return min(segments, key=lambda item: abs(item.start - start))
+    return best
+
+
 def assign_token_regions(
     offsets: Sequence[tuple[int, int]], segments: Sequence[CharacterSegment]
 ) -> tuple[list[int], list[int]]:
@@ -23,9 +44,7 @@ def assign_token_regions(
     previous_end = segments[0].start
     for index, (start, end) in enumerate(offsets):
         if end > start:
-            best = max(segments, key=lambda item: item.overlap(start, end))
-            if best.overlap(start, end) == 0:
-                best = min(segments, key=lambda item: abs(item.start - start))
+            best = _select_segment(segments, start, end)
             last_segment = best
             previous_end = max(previous_end, end)
         else:
@@ -34,14 +53,7 @@ def assign_token_regions(
             # tokens provides a deterministic structural state transition.
             gap_end = next_nonempty_start[index]
             if gap_end > previous_end:
-                best = max(
-                    segments,
-                    key=lambda item: item.overlap(previous_end, gap_end),
-                )
-                if best.overlap(previous_end, gap_end) == 0:
-                    best = min(
-                        segments, key=lambda item: abs(item.start - previous_end)
-                    )
+                best = _select_segment(segments, previous_end, gap_end)
                 last_segment = best
             else:
                 best = last_segment
