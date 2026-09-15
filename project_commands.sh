@@ -15,6 +15,7 @@ Commands:
   setup         Create .venv and install the local project.
   prepare       Download/read and preprocess s1K-1.1.
   stage1        Train the five GAC-CoT LoRA experts.
+  publish-stage1 Publish completed Stage-1 LoRA experts to Hugging Face.
   supervision  Build PAG, importance, teacher features, weights, and medoid.
   cache         Compile Top-512 plus tail-bucket teacher targets.
   stage2        Train the single medoid-initialized student adapter.
@@ -28,6 +29,7 @@ Environment overrides:
   NPROC_PER_NODE, PYTHON_BIN, DATA_CONFIG, STAGE1_CONFIG,
   SIGNALS_CONFIG, STAGE2_CONFIG, EVAL_CONFIG, STAGE1_RESUME,
   STAGE2_RESUME, HF_HUB_OFFLINE.
+  HF_REPO_ID, HF_REPO_PRIVATE, HF_TOKEN (or Hugging Face CLI login).
 EOF
 }
 
@@ -36,6 +38,7 @@ case "$command" in
   setup) run_step 00_setup.sh ;;
   prepare) run_step 10_prepare_data.sh ;;
   stage1) run_step 20_train_stage1.sh ;;
+  publish-stage1) bash "$PROJECT_ROOT/scripts/25_publish_stage1.sh" ;;
   supervision) run_step 30_build_supervision.sh ;;
   cache) run_step 40_build_teacher_cache.sh ;;
   stage2) run_step 50_train_stage2.sh ;;

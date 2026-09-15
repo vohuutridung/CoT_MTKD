@@ -14,6 +14,7 @@ dependencies = [
   "peft>=0.14",
   "datasets>=3.2",
   "safetensors>=0.4.5",
+  "huggingface_hub>=0.32",
   "PyYAML>=6.0",
   "tqdm>=4.66",
   "numpy>=1.26",
@@ -29,6 +30,7 @@ dev = [
 [project.scripts]
 cot-mtkd-prepare = "cot_mtkd.cli.prepare_data:main"
 cot-mtkd-stage1 = "cot_mtkd.cli.train_stage1:main"
+cot-mtkd-publish-stage1 = "cot_mtkd.cli.publish_stage1:main"
 cot-mtkd-supervision = "cot_mtkd.cli.build_supervision:main"
 cot-mtkd-cache = "cot_mtkd.cli.build_teacher_cache:main"
 cot-mtkd-stage2 = "cot_mtkd.cli.train_stage2:main"

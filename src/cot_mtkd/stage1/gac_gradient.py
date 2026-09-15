@@ -17,6 +17,58 @@ class GACDiagnostics:
     final_norms: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class Phase1Diagnostics:
+    task_norms: tuple[float, ...]
+    dpp_norms: tuple[float, ...]
+    repulsion_norms: tuple[float, ...]
+    final_norms: tuple[float, ...]
+
+
+def apply_grassmann_force_(
+    parameters: list[torch.nn.Parameter],
+    outward_force: list[torch.Tensor],
+    learning_rate: float,
+    repulsion_weight: float,
+) -> None:
+    """Apply Eq. (23)'s +eta*lambda_rep*F_rep after the data optimizer step."""
+    if len(parameters) != len(outward_force):
+        raise ValueError("Grassmann force does not match LoRA parameters")
+    with torch.no_grad():
+        for parameter, force in zip(parameters, outward_force, strict=True):
+            parameter.add_(
+                force.to(device=parameter.device, dtype=parameter.dtype),
+                alpha=learning_rate * repulsion_weight,
+            )
+
+
+def phase1_data_gradients(
+    task: list[list[torch.Tensor]],
+    diversity: list[list[torch.Tensor]],
+    outward_force: list[list[torch.Tensor]],
+    diversity_weight: float,
+) -> tuple[list[list[torch.Tensor]], Phase1Diagnostics]:
+    """The data-loss gradient of Eq. (23), kept separate from Grassmann force."""
+    if not len(task) == len(diversity) == len(outward_force):
+        raise ValueError("Inconsistent expert dimensions in Phase 1 gradients")
+    final = []
+    for local, dpp, force in zip(task, diversity, outward_force, strict=True):
+        if not len(local) == len(dpp) == len(force):
+            raise ValueError("Inconsistent LoRA parameter dimensions")
+        final.append(
+            [
+                sft.float() + diversity_weight * div.float()
+                for sft, div in zip(local, dpp, strict=True)
+            ]
+        )
+    return final, Phase1Diagnostics(
+        task_norms=tuple(float(vector_norm(values).item()) for values in task),
+        dpp_norms=tuple(float(vector_norm(values).item()) for values in diversity),
+        repulsion_norms=tuple(float(vector_norm(values).item()) for values in outward_force),
+        final_norms=tuple(float(vector_norm(values).item()) for values in final),
+    )
+
+
 def stable_gac_gradients(
     sft_gradients: list[list[torch.Tensor]],
     dpp_gradients: list[list[torch.Tensor]],

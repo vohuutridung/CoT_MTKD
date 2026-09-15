@@ -26,32 +26,39 @@ def normalized_support_features(
     mask = support_mask.unsqueeze(0).to(device=support_logits.device)
     masked = support_logits.float().masked_fill(~mask, -torch.inf)
     maximum = masked.max(dim=-1, keepdim=True).values
+    maximum = torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum))
     values = torch.exp(masked - maximum).masked_fill(~mask, 0.0)
     norm = values.pow(2).sum(dim=-1, keepdim=True).sqrt().clamp_min(epsilon)
     return values / norm
 
 
-def _cholesky_logdet(
-    gram: torch.Tensor, initial_jitter: float, maximum_jitter: float
+def _batched_cholesky_logdet(
+    grams: torch.Tensor, initial_jitter: float, maximum_jitter: float
 ) -> tuple[torch.Tensor, float, int]:
-    identity = torch.eye(gram.shape[-1], device=gram.device, dtype=torch.float32)
-    jitter = initial_jitter
-    fallback_count = 0
+    identity = torch.eye(grams.shape[-1], device=grams.device, dtype=torch.float32)
+    jitter = torch.full(
+        (grams.shape[0],), initial_jitter, device=grams.device, dtype=torch.float32
+    )
+    fallbacks = 0
     while True:
-        factor, info = torch.linalg.cholesky_ex(gram.float() + jitter * identity)
-        if int(info.max().item()) == 0:
-            return 2.0 * torch.log(torch.diagonal(factor)).sum(), jitter, fallback_count
-        if jitter >= maximum_jitter:
-            sign, logabsdet = torch.linalg.slogdet(
-                gram.float() + maximum_jitter * identity
+        regularized = grams.float() + jitter[:, None, None] * identity
+        factors, info = torch.linalg.cholesky_ex(regularized)
+        failed = info.ne(0)
+        if not failed.any():
+            return (
+                2.0 * torch.log(torch.diagonal(factors, dim1=-2, dim2=-1)).sum(dim=-1),
+                float(jitter.max().item()),
+                fallbacks,
             )
-            if float(sign.item()) <= 0:
+        fallbacks += int(failed.sum().item())
+        if bool((jitter[failed] >= maximum_jitter).all()):
+            sign, logabsdet = torch.linalg.slogdet(regularized)
+            if (sign <= 0).any():
                 raise FloatingPointError(
                     "DPP Gram matrix remains non-positive after maximum jitter"
                 )
-            return logabsdet, maximum_jitter, fallback_count + 1
-        jitter = min(maximum_jitter, jitter * 10.0)
-        fallback_count += 1
+            return logabsdet, float(jitter.max().item()), fallbacks
+        jitter = torch.where(failed, (jitter * 10.0).clamp(max=maximum_jitter), jitter)
 
 
 def step_dpp_loss(
@@ -62,34 +69,30 @@ def step_dpp_loss(
     maximum_jitter: float = 1.0e-2,
     reduction: str = "mean",
 ) -> tuple[torch.Tensor, DPPMetrics]:
-    """Negative log-volume, mean over steps per sample then over samples."""
+    """Token-wise negative logdet, averaged within steps and then samples."""
     if features.ndim != 3:
         raise ValueError("features must have shape [experts, tokens, dimensions]")
     if sample_ids.numel() != features.shape[1] or step_ids.numel() != features.shape[1]:
         raise ValueError("Token metadata does not match DPP features")
     if (step_ids < 0).any():
         raise ValueError("DPP received a non-reasoning token")
-    expert_count = features.shape[0]
     pair_ids = torch.stack([sample_ids.long(), step_ids.long()], dim=-1)
     unique_pairs = torch.unique(pair_ids, dim=0)
     per_sample: dict[int, list[torch.Tensor]] = {}
-    fallback_count = 0
-    used_jitter = jitter
-    for pair in unique_pairs:
-        mask = (pair_ids == pair).all(dim=-1)
-        token_features = features[:, mask, :]
-        gram = torch.einsum("mtk,ntk->mn", token_features, token_features) / mask.sum()
-        logdet, actual_jitter, fallbacks = _cholesky_logdet(
-            gram, jitter, maximum_jitter
-        )
-        loss = -logdet / expert_count
-        per_sample.setdefault(int(pair[0].item()), []).append(loss)
-        fallback_count += fallbacks
-        used_jitter = max(used_jitter, actual_jitter)
-    sample_losses = [torch.stack(losses).mean() for losses in per_sample.values()]
-    if not sample_losses:
+    if not unique_pairs.numel():
         zero = features.sum() * 0.0
         return zero, DPPMetrics(0, 0, 0, jitter)
+    grams = torch.einsum("mtk,ntk->tmn", features.float(), features.float())
+    logdets, used_jitter, fallback_count = _batched_cholesky_logdet(
+        grams, jitter, maximum_jitter
+    )
+    token_losses = -logdets
+    for pair in unique_pairs:
+        mask = (pair_ids == pair).all(dim=-1)
+        per_sample.setdefault(int(pair[0].item()), []).append(
+            token_losses[mask].mean()
+        )
+    sample_losses = [torch.stack(losses).mean() for losses in per_sample.values()]
     stacked = torch.stack(sample_losses)
     if reduction == "mean":
         result = stacked.mean()

@@ -3,6 +3,53 @@ from __future__ import annotations
 import torch
 
 
+def council_kneedle_candidates(
+    council_probabilities: torch.Tensor,
+    targets: torch.Tensor,
+    epsilon: float = 1.0e-12,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Full-vocabulary Kneedle on the mean expert distribution at each token.
+
+    The ground-truth token is removed only after the elbow and Top-k are
+    selected, as specified by the proposal. Candidate ids are detached.
+    """
+    if council_probabilities.ndim != 2 or targets.shape != council_probabilities.shape[:1]:
+        raise ValueError("Council probabilities and targets have incompatible shapes")
+    vocab_size = council_probabilities.shape[-1]
+    probabilities, ids = torch.sort(council_probabilities.float(), dim=-1, descending=True)
+    ranks = torch.arange(1, vocab_size + 1, device=probabilities.device, dtype=torch.float32)
+    x = ranks / vocab_size
+    maximum = probabilities[:, :1]
+    minimum = probabilities[:, -1:]
+    y = (probabilities - minimum) / (maximum - minimum).clamp_min(epsilon)
+    elbow = ((1.0 - x) - y).argmax(dim=-1) + 1
+    candidates = []
+    for row, k in enumerate(elbow.tolist()):
+        top_ids = ids[row, :k]
+        candidates.append(top_ids[top_ids.ne(targets[row])].detach().to("cpu", torch.long))
+    return candidates, elbow.detach().to("cpu", torch.long)
+
+
+def pad_candidate_support(
+    candidates: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad per-token candidate sets for chunked logits and VJPs."""
+    width = max((ids.numel() for ids in candidates), default=0)
+    if width == 0:
+        return (
+            torch.empty((len(candidates), 0), dtype=torch.long),
+            torch.empty((len(candidates), 0), dtype=torch.bool),
+        )
+    support = torch.zeros((len(candidates), width), dtype=torch.long)
+    mask = torch.zeros((len(candidates), width), dtype=torch.bool)
+    for row, ids in enumerate(candidates):
+        count = ids.numel()
+        if count:
+            support[row, :count] = ids
+            mask[row, :count] = True
+    return support, mask
+
+
 def capped_k_from_probe(
     sorted_probe_logits: torch.Tensor,
     non_target_min: torch.Tensor,

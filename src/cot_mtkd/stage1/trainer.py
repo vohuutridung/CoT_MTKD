@@ -16,10 +16,10 @@ from ..data.dataset import JsonlRecordDataset
 from ..data.prepare import tokenizer_fingerprint
 from ..data.schema import TokenRegion
 from ..models.chunked_head import (
+    chunked_probability_statistics,
     cross_entropy_hidden_gradient,
     decoder_and_lm_head,
     forward_hidden,
-    full_vocab_probe,
     gather_hidden_positions,
     gather_support_logits,
     support_vjp_hidden_gradient,
@@ -58,13 +58,14 @@ from ..utils.training import (
     cosine_warmup_lambda,
     divide_gradients_,
     global_clip_grad_list_,
-    interaction_scale,
     zeros_like_parameters,
 )
 from .dpp import DPPMetrics, normalized_support_features, step_dpp_loss
-from .gac_gradient import stable_gac_gradients
-from .kneedle import build_union_support, capped_k_from_probe
-from .rbf import BandwidthEMA, effective_update_distances, repulsion_updates
+from .dropout import step_level_token_weights
+from .gac_gradient import apply_grassmann_force_, phase1_data_gradients
+from .grassmann import grassmann_repulsion_updates
+from .kneedle import council_kneedle_candidates, pad_candidate_support
+from .rbf import BandwidthEMA
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,9 +79,8 @@ class ProbeResult:
     dpp_sample_count: int
     dpp_metrics: DPPMetrics
     mean_selected_k: float
-    cap_rate: float
-    probe_saturation_rate: float
     selection_count: int
+    valid_candidate_count: int
 
 
 def _batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -103,11 +103,10 @@ def _empty_probe(device: torch.device, expert_count: int) -> ProbeResult:
         ),
         dpp_loss_sum=0.0,
         dpp_sample_count=0,
-        dpp_metrics=DPPMetrics(0, 0, 0, 1.0e-4),
+        dpp_metrics=DPPMetrics(0, 0, 0, 1.0e-5),
         mean_selected_k=0.0,
-        cap_rate=0.0,
-        probe_saturation_rate=0.0,
         selection_count=0,
+        valid_candidate_count=0,
     )
 
 
@@ -130,12 +129,7 @@ def probe_stage1_dpp(
         config["runtime"].get("probe_hidden_device", "cpu")
     )
     hidden_by_expert: list[torch.Tensor] = []
-    top_values: list[torch.Tensor] = []
-    top_ids: list[torch.Tensor] = []
-    minima: list[torch.Tensor] = []
-    maxima: list[torch.Tensor] = []
     chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
-    probe_k = int(config["kneedle"]["probe_k"])
 
     model.train()
     for expert, adapter_name in enumerate(adapter_names):
@@ -150,72 +144,63 @@ def probe_stage1_dpp(
                 views["reasoning_batch_indices"],
                 views["reasoning_hidden_indices"],
             ).to(probe_hidden_device)
-        values, ids, minimum, maximum = full_vocab_probe(
-            selected_hidden,
-            head,
-            views["reasoning_targets"].to("cpu"),
-            probe_k,
-            chunk_tokens,
-        )
         hidden_by_expert.append(selected_hidden)
-        top_values.append(values)
-        top_ids.append(ids)
-        minima.append(minimum)
-        maxima.append(maximum)
 
-    selected_k = torch.stack(
-        [
-            capped_k_from_probe(
-                values,
-                minimum,
-                maximum,
-                vocab_size=head.weight.shape[0],
-                min_k=int(config["kneedle"]["min_k"]),
-                max_k=int(config["kneedle"]["max_k"]),
-            )
-            for values, minimum, maximum in zip(top_values, minima, maxima, strict=True)
-        ]
+    candidates: list[torch.Tensor] = []
+    selected_k: list[torch.Tensor] = []
+
+    def select_council_candidates(
+        start: int,
+        end: int,
+        probabilities: list[torch.Tensor],
+        _log_probabilities: list[torch.Tensor],
+    ) -> None:
+        council = torch.stack(probabilities).mean(dim=0)
+        current, elbows = council_kneedle_candidates(
+            council,
+            views["reasoning_targets"][start:end].to(council.device),
+        )
+        candidates.extend(current)
+        selected_k.append(elbows)
+
+    chunked_probability_statistics(
+        hidden_by_expert,
+        head,
+        views["reasoning_targets"],
+        int(config["runtime"]["council_chunk_tokens"]),
+        1.0,
+        select_council_candidates,
     )
-    support_ids_cpu, support_mask_cpu = build_union_support(
-        torch.stack(top_ids), selected_k
-    )
+    support_ids_cpu, support_mask_cpu = pad_candidate_support(candidates)
     support_ids = support_ids_cpu.to(device, non_blocking=True)
     support_mask = support_mask_cpu.to(device, non_blocking=True)
-    support_logits = torch.stack(
-        [
-            gather_support_logits(
-                hidden, head, support_ids_cpu, chunk_tokens, output_device=device
-            )
-            for hidden in hidden_by_expert
-        ],
-        dim=0,
-    ).detach()
-    support_logits.requires_grad_(True)
-    features = normalized_support_features(support_logits, support_mask)
-    loss, metrics = step_dpp_loss(
-        features,
-        views["reasoning_batch_indices"],
-        views["reasoning_step_ids"],
-        jitter=float(config["dpp"]["jitter"]),
-        maximum_jitter=float(config["dpp"]["max_jitter"]),
-        reduction="sum",
-    )
-    gradients = torch.autograd.grad(loss, support_logits)[0].detach()
-    cap = int(config["kneedle"]["max_k"])
-    probe_limit = int(config["kneedle"]["probe_k"])
-    raw_elbow = torch.stack(
-        [
-            capped_k_from_probe(
-                values,
-                minimum,
-                maximum,
-                vocab_size=head.weight.shape[0],
-                min_k=1,
-                max_k=probe_limit,
-            )
-            for values, minimum, maximum in zip(top_values, minima, maxima, strict=True)
-        ]
-    )
+    eligible = support_mask.any(dim=-1)
+    if eligible.any():
+        support_logits = torch.stack(
+            [
+                gather_support_logits(
+                    hidden, head, support_ids_cpu, chunk_tokens, output_device=device
+                )
+                for hidden in hidden_by_expert
+            ],
+            dim=0,
+        ).detach().requires_grad_(True)
+        features = normalized_support_features(support_logits, support_mask)
+        loss, metrics = step_dpp_loss(
+            features[:, eligible],
+            views["reasoning_batch_indices"][eligible],
+            views["reasoning_step_ids"][eligible],
+            jitter=float(config["dpp"]["jitter"]),
+            maximum_jitter=float(config["dpp"]["max_jitter"]),
+            reduction="sum",
+        )
+        gradients = torch.autograd.grad(loss, support_logits)[0].detach()
+    else:
+        loss = torch.zeros((), device=device)
+        metrics = DPPMetrics(0, 0, 0, float(config["dpp"]["jitter"]))
+        gradients = torch.empty(
+            (len(adapter_names), token_count, 0), device=device, dtype=torch.float32
+        )
     return ProbeResult(
         support_ids=support_ids,
         support_mask=support_mask,
@@ -223,10 +208,9 @@ def probe_stage1_dpp(
         dpp_loss_sum=float(loss.detach().item()),
         dpp_sample_count=metrics.samples,
         dpp_metrics=metrics,
-        mean_selected_k=float(selected_k.float().mean().item()),
-        cap_rate=float((raw_elbow > cap).float().mean().item()),
-        probe_saturation_rate=float((raw_elbow == probe_limit).float().mean().item()),
-        selection_count=int(selected_k.numel()),
+        mean_selected_k=float(torch.cat(selected_k).float().mean().item()),
+        selection_count=token_count,
+        valid_candidate_count=int(eligible.sum().item()),
     )
 
 
@@ -240,9 +224,10 @@ def replay_expert_gradients(
     global_step: int,
     rng_stream: int,
     base_seed: int,
+    drop_probability: float,
     chunk_tokens: int,
     device: torch.device,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], float, int]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor], float, int, int]:
     views = shifted_token_views(batch)
     set_active_adapter(model, adapter_name)
     model.train()
@@ -257,8 +242,15 @@ def replay_expert_gradients(
         views["response_hidden_indices"],
     )
     _, head = decoder_and_lm_head(model)
-    sft_hidden_gradient, sft_loss_sum, sft_count = cross_entropy_hidden_gradient(
-        response_hidden, head, views["response_targets"], chunk_tokens
+    token_weights, sft_count, dropped_steps = step_level_token_weights(
+        batch, expert_index, base_seed, global_step, rng_stream, drop_probability
+    )
+    sft_hidden_gradient, sft_loss_sum, _ = cross_entropy_hidden_gradient(
+        response_hidden,
+        head,
+        views["response_targets"],
+        chunk_tokens,
+        token_weights=token_weights,
     )
     dpp_full_hidden_gradient = torch.zeros_like(response_hidden)
     if probe.support_ids.numel() > 0:
@@ -296,6 +288,7 @@ def replay_expert_gradients(
         [value.detach().float() for value in dpp_parameter_gradients],
         float(sft_loss_sum.item()),
         int(sft_count),
+        dropped_steps,
     )
 
 
@@ -344,37 +337,31 @@ def _validate_stage1_config(config: dict[str, Any]) -> None:
         raise ValueError("stage1.epochs must be positive")
     if float(config["stage1"]["learning_rate"]) <= 0.0:
         raise ValueError("stage1.learning_rate must be positive")
-    if float(config["stage1"]["dpp_weight"]) < 0.0:
-        raise ValueError("stage1.dpp_weight must be non-negative")
-    if float(config["stage1"]["rbf_weight"]) < 0.0:
-        raise ValueError("stage1.rbf_weight must be non-negative")
+    if float(config["stage1"]["diversity_weight"]) < 0.0:
+        raise ValueError("stage1.diversity_weight must be non-negative")
+    if float(config["stage1"]["repulsion_weight"]) < 0.0:
+        raise ValueError("stage1.repulsion_weight must be non-negative")
+    if not 0 <= float(config["stage1"]["step_drop_probability"]) < 1:
+        raise ValueError("stage1.step_drop_probability must be in [0, 1)")
     if float(config["stage1"]["max_grad_norm"]) <= 0.0:
         raise ValueError("stage1.max_grad_norm must be positive")
     experts = int(config["stage1"]["num_experts"])
-    probe_k = int(config["kneedle"]["probe_k"])
-    min_k = int(config["kneedle"]["min_k"])
-    max_k = int(config["kneedle"]["max_k"])
     if experts < 2:
-        raise ValueError("GAC Stage 1 requires at least two experts")
-    if not (experts <= min_k <= max_k <= probe_k):
-        raise ValueError(
-            "Kneedle must satisfy num_experts <= min_k <= max_k <= probe_k"
-        )
-    off = float(config["stage1"]["interaction_off_until"])
-    ramp = float(config["stage1"]["interaction_ramp_until"])
-    if not (0.0 <= off < ramp <= 1.0):
-        raise ValueError("Interaction schedule must satisfy 0 <= off < ramp <= 1")
+        raise ValueError("Grassmann Stage 1 requires at least two experts")
     jitter = float(config["dpp"]["jitter"])
     maximum_jitter = float(config["dpp"]["max_jitter"])
     if not (0.0 < jitter <= maximum_jitter):
         raise ValueError("DPP jitter must be positive and no larger than max_jitter")
-    decay = float(config["rbf"]["bandwidth_ema"])
-    if not (0.0 <= decay < 1.0):
-        raise ValueError("rbf.bandwidth_ema must be in [0, 1)")
-    if float(config["rbf"]["bandwidth_floor"]) <= 0.0:
-        raise ValueError("rbf.bandwidth_floor must be positive")
+    if float(config["grassmann"]["rank_epsilon"]) <= 0.0:
+        raise ValueError("grassmann.rank_epsilon must be positive")
+    if not 0 < float(config["grassmann"]["angle_epsilon"]) < 1:
+        raise ValueError("grassmann.angle_epsilon must be in (0, 1)")
+    if float(config["grassmann"]["bandwidth_floor"]) <= 0.0:
+        raise ValueError("grassmann.bandwidth_floor must be positive")
     if int(config["runtime"]["lm_head_chunk_tokens"]) <= 0:
         raise ValueError("runtime.lm_head_chunk_tokens must be positive")
+    if int(config["runtime"]["council_chunk_tokens"]) <= 0:
+        raise ValueError("runtime.council_chunk_tokens must be positive")
 
 
 def _save_training_checkpoint(
@@ -383,7 +370,7 @@ def _save_training_checkpoint(
     adapter_names: list[str],
     optimizers: list[torch.optim.Optimizer],
     schedulers: list[torch.optim.lr_scheduler.LRScheduler],
-    bandwidth: BandwidthEMA,
+    bandwidth: BandwidthEMA | None,
     global_step: int,
     epoch: int,
     batch_in_epoch: int,
@@ -399,7 +386,7 @@ def _save_training_checkpoint(
         },
         "optimizers": [optimizer.state_dict() for optimizer in optimizers],
         "schedulers": [scheduler.state_dict() for scheduler in schedulers],
-        "bandwidth": bandwidth.state_dict(),
+        "bandwidth": bandwidth.state_dict() if bandwidth is not None else None,
         "global_step": global_step,
         "epoch": epoch,
         "batch_in_epoch": batch_in_epoch,
@@ -412,6 +399,10 @@ def _save_training_checkpoint(
         },
         "expert_dropout_rng": {
             "scheme": "sha256(base_seed,stage1,global_step,epoch_batch_rank,expert)",
+            "base_seed": base_seed,
+        },
+        "step_dropout_rng": {
+            "scheme": "sha256(base_seed,stage1_step_dropout,global_step,epoch_batch_rank,expert)",
             "base_seed": base_seed,
         },
         "python_rng": random.getstate(),
@@ -431,7 +422,7 @@ def _load_training_checkpoint(
     adapter_names: list[str],
     optimizers: list[torch.optim.Optimizer],
     schedulers: list[torch.optim.lr_scheduler.LRScheduler],
-    bandwidth: BandwidthEMA,
+    bandwidth: BandwidthEMA | None,
     expected_run_fingerprint: str,
 ) -> tuple[int, int, int]:
     value = torch.load(path, map_location="cpu", weights_only=False)
@@ -443,7 +434,10 @@ def _load_training_checkpoint(
         optimizer.load_state_dict(state)
     for scheduler, state in zip(schedulers, value["schedulers"], strict=True):
         scheduler.load_state_dict(state)
-    bandwidth.load_state_dict(value["bandwidth"])
+    if bandwidth is not None:
+        if value.get("bandwidth") is None:
+            raise RuntimeError("Checkpoint is missing the legacy bandwidth state")
+        bandwidth.load_state_dict(value["bandwidth"])
     random.setstate(value["python_rng"])
     np.random.set_state(value["numpy_rng"])
     torch.set_rng_state(value["torch_rng"])
@@ -542,11 +536,6 @@ def train_stage1(
         distributed.device,
         int(config["seed"]),
     )
-    _, stage1_head = decoder_and_lm_head(model)
-    if int(config["kneedle"]["probe_k"]) > int(stage1_head.weight.shape[0]) - 1:
-        raise ValueError(
-            "kneedle.probe_k cannot exceed vocabulary_size - 1 non-target tokens"
-        )
     groups = adapter_parameter_groups(model, adapter_names)
     parameter_lists = [list(group.values()) for group in groups]
     optimizers_and_schedulers = [
@@ -555,10 +544,7 @@ def train_stage1(
     ]
     optimizers = [item[0] for item in optimizers_and_schedulers]
     schedulers = [item[1] for item in optimizers_and_schedulers]
-    bandwidth = BandwidthEMA(
-        decay=float(config["rbf"]["bandwidth_ema"]),
-        floor=float(config["rbf"]["bandwidth_floor"]),
-    )
+    bandwidth = None
     public_config = _stable_config(config)
     config_hash = fingerprint(_stable_config(config))
     run_hash = fingerprint(
@@ -598,7 +584,6 @@ def train_stage1(
         truncate=not bool(resume),
     )
     chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
-    scaling = float(config["lora"]["alpha"]) / float(config["lora"]["rank"])
 
     # Accumulation deliberately crosses epoch boundaries. For the canonical
     # 1,000 x 3 run this produces ceil(3,000 / 32) = 94 optimizer updates,
@@ -610,8 +595,9 @@ def train_stage1(
     accumulated_microbatches = 0
     accumulated_sft_loss = 0.0
     accumulated_dpp_loss = 0.0
-    selected_k_sum = cap_hits = saturation_hits = 0.0
-    support_selection_count = cholesky_fallbacks = 0
+    selected_k_sum = 0.0
+    support_selection_count = valid_candidate_count = cholesky_fallbacks = 0
+    dropped_step_count = 0
 
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
@@ -635,14 +621,13 @@ def train_stage1(
                 distributed.device,
             )
             selected_k_sum += probe.mean_selected_k * probe.selection_count
-            cap_hits += probe.cap_rate * probe.selection_count
-            saturation_hits += probe.probe_saturation_rate * probe.selection_count
             support_selection_count += probe.selection_count
+            valid_candidate_count += probe.valid_candidate_count
             cholesky_fallbacks += probe.dpp_metrics.cholesky_fallbacks
             for expert, (adapter_name, parameters) in enumerate(
                 zip(adapter_names, parameter_lists, strict=True)
             ):
-                sft_gradient, dpp_gradient, sft_loss, token_count = (
+                sft_gradient, dpp_gradient, sft_loss, segment_count, dropped_steps = (
                     replay_expert_gradients(
                         model,
                         adapter_name,
@@ -653,6 +638,7 @@ def train_stage1(
                         global_step,
                         rng_stream,
                         int(config["seed"]),
+                        float(config["stage1"]["step_drop_probability"]),
                         chunk_tokens,
                         distributed.device,
                     )
@@ -660,7 +646,8 @@ def train_stage1(
                 add_gradients_(sft_buffers[expert], sft_gradient)
                 add_gradients_(dpp_buffers[expert], dpp_gradient)
                 accumulated_sft_loss += sft_loss
-                sft_token_count += token_count if expert == 0 else 0
+                sft_token_count += segment_count if expert == 0 else 0
+                dropped_step_count += dropped_steps
             accumulated_dpp_loss += probe.dpp_loss_sum
             dpp_sample_count += probe.dpp_sample_count
             accumulated_microbatches += 1
@@ -690,52 +677,49 @@ def train_stage1(
             probe_statistics = torch.tensor(
                 [
                     selected_k_sum,
-                    cap_hits,
-                    saturation_hits,
                     support_selection_count,
+                    valid_candidate_count,
                     cholesky_fallbacks,
+                    dropped_step_count,
                 ],
                 device=distributed.device,
                 dtype=torch.float64,
             )
             all_reduce_tensor(probe_statistics)
             for values in sft_buffers:
-                divide_gradients_(values, float(counts[0].item()))
+                divide_gradients_(values, max(float(counts[0].item()), 1.0))
             for values in dpp_buffers:
-                divide_gradients_(values, float(counts[1].item()))
+                divide_gradients_(values, max(float(counts[1].item()), 1.0))
 
             set_all_adapters_trainable(model, adapter_names)
-            distance_for_bandwidth = effective_update_distances(
-                groups, scaling
-            ).detach()
-            current_bandwidth = bandwidth.update(distance_for_bandwidth)
-            repulsion, kernel, distances = repulsion_updates(
-                groups, scaling, current_bandwidth
+            repulsion, _kernel, distances, current_bandwidth = grassmann_repulsion_updates(
+                groups,
+                rank_epsilon=float(config["grassmann"]["rank_epsilon"]),
+                angle_epsilon=float(config["grassmann"]["angle_epsilon"]),
+                bandwidth_floor=float(config["grassmann"]["bandwidth_floor"]),
             )
-            progress = global_step / max(total_steps - 1, 1)
-            gamma = interaction_scale(
-                progress,
-                float(config["stage1"]["interaction_off_until"]),
-                float(config["stage1"]["interaction_ramp_until"]),
-            )
-            final_gradients, diagnostics = stable_gac_gradients(
+            final_gradients, diagnostics = phase1_data_gradients(
                 sft_buffers,
                 dpp_buffers,
                 repulsion,
-                kernel,
-                gamma,
-                float(config["stage1"]["dpp_weight"]),
-                float(config["stage1"]["rbf_weight"]),
+                float(config["stage1"]["diversity_weight"]),
             )
             preclip_norms = [
                 global_clip_grad_list_(values, float(config["stage1"]["max_grad_norm"]))
                 for values in final_gradients
             ]
-            for parameters, gradients, optimizer, scheduler in zip(
-                parameter_lists, final_gradients, optimizers, schedulers, strict=True
+            for parameters, gradients, force, optimizer, scheduler in zip(
+                parameter_lists, final_gradients, repulsion, optimizers, schedulers, strict=True
             ):
                 assign_gradients(parameters, gradients)
+                learning_rate = float(optimizer.param_groups[0]["lr"])
                 optimizer.step()
+                apply_grassmann_force_(
+                    parameters,
+                    force,
+                    learning_rate,
+                    float(config["stage1"]["repulsion_weight"]),
+                )
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
             global_step += 1
@@ -758,27 +742,23 @@ def train_stage1(
                         / max(counts[0].item() * len(adapter_names), 1.0)
                     ),
                     dpp_loss=float(losses[1].item() / max(counts[1].item(), 1.0)),
-                    interaction=gamma,
+                    dropped_reasoning_steps=int(probe_statistics[4].item()),
                     learning_rate=optimizers[0].param_groups[0]["lr"],
-                    bandwidth=current_bandwidth,
-                    mean_delta_w_distance=float(off_diagonal.mean().item()),
-                    min_delta_w_distance=float(off_diagonal.min().item()),
+                    grassmann_bandwidth=current_bandwidth,
+                    mean_grassmann_distance=float(off_diagonal.sqrt().mean().item()),
+                    min_grassmann_distance=float(off_diagonal.sqrt().min().item()),
                     mean_selected_k=float(
                         probe_statistics[0].item()
-                        / max(probe_statistics[3].item(), 1.0)
+                        / max(probe_statistics[1].item(), 1.0)
                     ),
-                    k_cap_rate=float(
-                        probe_statistics[1].item()
-                        / max(probe_statistics[3].item(), 1.0)
-                    ),
-                    probe_saturation_rate=float(
+                    candidate_valid_rate=float(
                         probe_statistics[2].item()
-                        / max(probe_statistics[3].item(), 1.0)
+                        / max(probe_statistics[1].item(), 1.0)
                     ),
-                    cholesky_fallbacks=int(probe_statistics[4].item()),
+                    cholesky_fallbacks=int(probe_statistics[3].item()),
                     task_gradient_norms=diagnostics.task_norms,
                     dpp_gradient_norms=diagnostics.dpp_norms,
-                    repulsion_cap_factors=diagnostics.repulsion_cap_factors,
+                    repulsion_gradient_norms=diagnostics.repulsion_norms,
                     preclip_gradient_norms=preclip_norms,
                 )
             if (
@@ -808,8 +788,9 @@ def train_stage1(
             ]
             sft_token_count = dpp_sample_count = accumulated_microbatches = 0
             accumulated_sft_loss = accumulated_dpp_loss = 0.0
-            selected_k_sum = cap_hits = saturation_hits = 0.0
-            support_selection_count = cholesky_fallbacks = 0
+            selected_k_sum = 0.0
+            support_selection_count = valid_candidate_count = cholesky_fallbacks = 0
+            dropped_step_count = 0
         start_batch = 0
         barrier()
 
@@ -839,9 +820,21 @@ def train_stage1(
             "adapter_names": adapter_names,
             "adapter_bundle": str(bundle_path.relative_to(output_dir)),
             "adapter_bundle_sha256": file_sha256(bundle_path),
+            "expert_files": {
+                name: {
+                    "adapter_config": f"final/adapters/{name}/adapter_config.json",
+                    "adapter_config_sha256": file_sha256(
+                        final_dir / "adapters" / name / "adapter_config.json"
+                    ),
+                    "adapter_weights": f"final/adapters/{name}/adapter_model.safetensors",
+                    "adapter_weights_sha256": file_sha256(
+                        final_dir / "adapters" / name / "adapter_model.safetensors"
+                    ),
+                }
+                for name in adapter_names
+            },
             "prepared_manifest_fingerprint": fingerprint(prepared_manifest),
             "tokenizer_fingerprint": prepared_manifest["tokenizer_fingerprint"],
-            "bandwidth": bandwidth.state_dict(),
             "config": public_config,
             "config_fingerprint": config_hash,
             "config_file": config_snapshot.name,
