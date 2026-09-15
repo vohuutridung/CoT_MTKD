@@ -87,8 +87,9 @@ It verifies the files at the new commit and can run again after a completed
 training resume.
 
 ```bash
-HF_REPO_ID=username/cot-mtkd-experts ./project_commands.sh stage1
-HF_REPO_ID=username/cot-mtkd-experts ./project_commands.sh publish-stage1
+export HF_TOKEN=hf_xxx
+export HF_REPO_ID=username/repo-name
+bash scripts/25_publish_stage1.sh
 ```
 
 New repositories are private by default. Set `HF_REPO_PRIVATE=false` or use
