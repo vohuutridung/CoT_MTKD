@@ -1,0 +1,57 @@
+schema_version: 1
+seed: 42
+model:
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+  revision: 7ae557604adf67be50417f59c2c2f167def9a775
+  dtype: bfloat16
+  attn_implementation: sdpa
+  gradient_checkpointing: false
+  use_cache: false
+lora:
+  rank: 16
+  alpha: 16
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+stage1:
+  num_experts: 5
+  epochs: 1
+  learning_rate: 5.0e-5
+  micro_batch_size: 1
+  global_batch_size: 2
+  gradient_accumulation_steps: null
+  dpp_weight: 0.2
+  rbf_weight: 1.0
+  interaction_off_until: 0.10
+  interaction_ramp_until: 0.30
+  max_grad_norm: 1.0
+  checkpoint_every_steps: 2
+  log_every_steps: 1
+  resume_from: null
+kneedle:
+  probe_k: 32
+  min_k: 5
+  max_k: 16
+dpp:
+  jitter: 1.0e-4
+  max_jitter: 1.0e-2
+rbf:
+  bandwidth_ema: 0.9
+  bandwidth_floor: 1.0e-12
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+scheduler:
+  name: cosine
+  warmup_ratio: 0.10
+  min_lr_ratio: 0.0
+runtime:
+  lm_head_chunk_tokens: 64
+  dataloader_workers: 0
+  pin_memory: true
+  probe_hidden_device: cuda
+  deterministic_algorithms: false
+paths:
+  prepared: artifacts/smoke/prepared
+  output: artifacts/smoke/stage1

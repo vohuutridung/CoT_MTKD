@@ -1,0 +1,21 @@
+schema_version: 1
+dataset:
+  name: simplescaling/s1K-1.1
+  split: train
+  revision: 96c411f1fe4c49d20f0e2a1565f61e1a28b0b84d
+  local_json: artifacts/smoke/source.jsonl
+  expected_records: 8
+  keep_all_grades: true
+model:
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+  revision: 7ae557604adf67be50417f59c2c2f167def9a775
+tokenization:
+  max_length: 2048
+  padding_side: right
+  truncation: complete_reasoning_step_prefix
+  packing: false
+  add_special_tokens: false
+serialization:
+  system_prompt: You are Qwen, created by Alibaba Cloud. You are a helpful assistant.
+  step_pattern: "\\r?\\n[ \\t]*\\r?\\n+"
+output_dir: artifacts/smoke/prepared

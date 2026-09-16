@@ -534,6 +534,15 @@ def train_stage1(
             )
     epochs = int(config["stage1"]["epochs"])
     total_steps = math.ceil(epochs * len(dataloader) / accumulation_steps)
+    LOGGER.info(
+        "Stage 1 setup: samples=%d epochs=%d micro_batch=%d "
+        "accumulation=%d optimizer_steps=%d",
+        len(dataset),
+        epochs,
+        micro_batch,
+        accumulation_steps,
+        total_steps,
+    )
 
     model, adapter_names = create_multi_adapter_model(
         config["model"],
@@ -619,6 +628,12 @@ def train_stage1(
             if epoch == start_epoch and batch_index < start_batch:
                 continue
             batch = _batch_to_device(raw_batch, distributed.device)
+            if epoch == start_epoch and batch_index == start_batch:
+                LOGGER.info(
+                    "Stage 1 first microbatch: tokens=%d seq_len=%d",
+                    int(batch["attention_mask"].sum().item()),
+                    int(batch["input_ids"].shape[1]),
+                )
             # The same stream id is used for the no-grad probe and replay so dropout
             # masks match exactly, while distinct microbatches never reuse a mask.
             rng_stream = (

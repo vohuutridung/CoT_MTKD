@@ -88,6 +88,12 @@ def load_base_causal_lm(model_config: dict[str, Any], device: torch.device):
         )
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
+    LOGGER.info(
+        "Loaded %s on %s (attn=%s)",
+        model_config["name_or_path"],
+        device,
+        getattr(model.config, "_attn_implementation", None),
+    )
     return model
 
 
@@ -129,9 +135,12 @@ def create_multi_adapter_model(
         )
     for expert, name in enumerate(names[1:], start=1):
         with deterministic_rng(base_seed + expert, device):
-            model.add_adapter(name, configuration)
+            model.add_adapter(
+                name, configuration, autocast_adapter_dtype=False
+            )
     model.to(device)
     set_active_adapter(model, names[0])
+    LOGGER.info("Attached LoRA experts: %s", names)
     return model, names
 
 
