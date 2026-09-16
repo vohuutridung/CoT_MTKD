@@ -7,9 +7,9 @@ model:
   attn_implementation: flash_attention_2
   gradient_checkpointing: true
 lora:
-  rank: 16
-  alpha: 16
-  dropout: 0.05
+  rank: 4
+  alpha: 8
+  dropout: 0.0
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 cache:
   temperature: 2.0

@@ -8,9 +8,9 @@ model:
   gradient_checkpointing: false
   use_cache: false
 lora:
-  rank: 16
-  alpha: 16
-  dropout: 0.05
+  rank: 4
+  alpha: 8
+  dropout: 0.0
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 stage1:
   num_experts: 5
@@ -25,6 +25,7 @@ stage1:
   max_grad_norm: 1.0
   checkpoint_every_steps: 2
   log_every_steps: 1
+  benchmark_checkpoint_epoch: 1
   resume_from: null
 kneedle:
   probe_k: 32

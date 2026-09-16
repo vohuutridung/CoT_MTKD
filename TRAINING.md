@@ -10,9 +10,9 @@ Model: `Qwen/Qwen2.5-7B-Instruct` · seed `42` · dtype `bfloat16`.
 
 | Tham số | Giá trị |
 |---|---|
-| LoRA Rank (r) | 16 |
-| LoRA Alpha (α) | 16 |
-| LoRA Dropout | 5.0% |
+| LoRA Rank (r) | 4 |
+| LoRA Alpha (α) | 8 |
+| LoRA Dropout | 0.0% |
 | Target Modules | `["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]` |
 | Bias | none |
 
@@ -24,13 +24,15 @@ LoRA này dùng chung cho 5 expert Stage 1 và student Stage 2.
 
 | Tham số | Stage 1 | Stage 2 |
 |---|---|---|
-| Số Epoch | 3 | 3 |
+| Số Epoch | 5 | 5 |
+| Scheduler horizon | 5 epoch | 5 epoch |
+| Benchmark checkpoint | ~epoch 3 | ~epoch 3 |
 | Micro batch size | 1 | 1 |
-| Effective Batch Size (`global_batch_size`) | **8** | **8** |
-| Gradient accumulation (world_size=1) | 8 | 8 |
-| Optimizer updates / run | ceil(1000 × 3 / 8) = 375 | 375 |
+| Effective Batch Size (`global_batch_size`) | **2** | **2** |
+| Gradient accumulation (world_size=1) | 2 | 2 |
+| Optimizer updates / run | ceil(1000 × 5 / 2) = 2500 | 2500 |
 | Max Sequence Length | 32,768 | 32,768 |
-| Learning Rate (LR) | **5.00e-05** | **2.00e-05** |
+| Learning Rate (LR) | **5.00e-05** | **5.00e-05** |
 | Max grad norm | 1.0 | 1.0 |
 | Số expert | 5 | 1 (init từ merge) |
 | Step dropout | 0.20 | — |
@@ -39,7 +41,9 @@ LoRA này dùng chung cho 5 expert Stage 1 và student Stage 2.
 | Merge method | — | `ta` (ablate: ties, dare_ties, tsv, iso_c) |
 | $\lambda_U$ / $\lambda_D$ | — | 0.5 / 0.5 |
 
-Effective batch = `micro_batch_size × world_size × accumulation` = 1 × 1 × 8 = **8**.
+Effective batch = `micro_batch_size × world_size × accumulation` = 1 × 1 × 2 = **2**.
+
+Cosine schedule trải đủ 5 epoch (2500 bước). Snapshot `benchmark/` được ghi khoảng epoch 3 (bước 1500) để eval giữa lịch, trước khi LR về 0 ở cuối epoch 5.
 
 ---
 

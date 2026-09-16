@@ -8,16 +8,16 @@ model:
   gradient_checkpointing: true
   use_cache: false
 lora:
-  rank: 16
-  alpha: 16
-  dropout: 0.05
+  rank: 4
+  alpha: 8
+  dropout: 0.0
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 stage1:
   num_experts: 5
-  epochs: 3
+  epochs: 5
   learning_rate: 5.0e-5
   micro_batch_size: 1
-  global_batch_size: 8
+  global_batch_size: 2
   gradient_accumulation_steps: null
   step_drop_probability: 0.20
   diversity_weight: 0.2
@@ -25,6 +25,7 @@ stage1:
   max_grad_norm: 1.0
   checkpoint_every_steps: 10
   log_every_steps: 1
+  benchmark_checkpoint_epoch: 3
   resume_from: null
 kneedle:
   # Retained for Phase-2 signal construction. Phase-1 council Top-k uses the full vocabulary.

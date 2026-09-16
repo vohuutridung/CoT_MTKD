@@ -26,6 +26,9 @@ Output:
 artifacts/stage1/main/
 ├── manifest.json
 ├── checkpoint.pt
+├── benchmark/
+│   ├── adapter_states.pt
+│   └── checkpoint.pt
 ├── final/
 │   └── adapters/
 └── metrics.jsonl
@@ -897,15 +900,16 @@ configs/stage1/qwen25_7b_m5.yaml
 | Model                   | `Qwen/Qwen2.5-7B-Instruct` (revision pin) |
 | Precision               | `bf16`                                    |
 | Attention               | FlashAttention-2                          |
-| LoRA rank               | $16$                                      |
-| LoRA alpha              | $16$                                      |
-| LoRA dropout            | $0.05$                                    |
+| LoRA rank               | $4$                                       |
+| LoRA alpha              | $8$                                       |
+| LoRA dropout            | $0$                                       |
 | LoRA targets            | `q,k,v,o,gate,up,down`                    |
 | Experts                 | $M=5$                                     |
-| Epochs                  | $3$                                       |
+| Epochs                  | $5$ (scheduler horizon)                   |
+| Benchmark checkpoint    | ~epoch $3$                                |
 | Learning rate           | $5\times10^{-5}$                          |
 | Micro batch             | $1$                                       |
-| Global batch            | $32$                                      |
+| Global batch            | $2$                                       |
 | Step dropout            | $p_{\mathrm{drop}}=0.20$                  |
 | Diversity weight        | $\lambda_{\mathrm{div}}=0.2$              |
 | Repulsion weight        | $\lambda_{\mathrm{rep}}=1.0$              |
@@ -930,25 +934,35 @@ configs/stage1/qwen25_7b_m5.yaml
 Canonical dataset:
 
 ```text
-1000 samples × 3 epochs × global batch 32
+1000 samples × 5 epochs × global batch 2
 ```
 
 Tổng số samples được xử lý:
 
 $$
-1000 \times 3
+1000 \times 5
 =
-3000
+5000
 $$
 
 Số optimizer updates:
 
 $$
 \left\lceil
-\frac{3000}{32}
+\frac{5000}{2}
 \right\rceil
 =
-94
+2500
+$$
+
+Benchmark checkpoint (~epoch 3):
+
+$$
+\left\lceil
+\frac{1000 \times 3}{2}
+\right\rceil
+=
+1500
 $$
 
 **Accumulation không flush ở biên epoch.**

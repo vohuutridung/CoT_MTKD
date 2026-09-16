@@ -53,6 +53,9 @@ artifacts/stage2/main/
 ├── manifest.json
 ├── checkpoint.pt
 ├── config.yaml
+├── benchmark/
+│   ├── adapter_states.pt
+│   └── checkpoint.pt
 ├── final/
 │   └── adapters/student/
 └── metrics.jsonl
@@ -273,15 +276,16 @@ Logged metric: `nll` (= `total_loss`).
 | Hạng mục | Default 7B |
 | --- | --- |
 | Init | merge $M=5$ expert (`merge_method=ta`) |
-| Epochs | 3 |
+| Epochs | 5 (scheduler horizon) |
+| Benchmark checkpoint | ~epoch 3 (step 1500) |
 | Micro batch | 1 |
-| Global batch | 8 |
-| Accumulation (1 GPU) | 8 |
-| Optimizer updates | $\lceil 1000\times 3/8\rceil=375$ |
-| LR | $2\times 10^{-5}$ |
+| Global batch | 2 |
+| Accumulation (1 GPU) | 2 |
+| Optimizer updates | $\lceil 1000\times 5/2\rceil=2500$ |
+| LR | $5\times 10^{-5}$ |
 | Optimizer | AdamW, $\beta=(0.9,0.999)$, wd $=0$ |
 | Scheduler | cosine, `warmup_ratio=0.10` |
-| LoRA dropout | 0.05 |
+| LoRA rank / alpha / dropout | $4$ / $8$ / $0$ |
 | Clip | 1.0 |
 | $\lambda_U$, $\lambda_D$ | 0.5, 0.5 |
 

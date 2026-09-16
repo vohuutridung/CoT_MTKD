@@ -60,8 +60,10 @@ Tests (no model download):
 ## Multi-GPU
 
 ```bash
-NPROC_PER_NODE=8 ./project_commands.sh all
+NPROC_PER_NODE=2 ./project_commands.sh all
 ```
+
+`global_batch_size` is 2, so `world_size` must divide 2 (`1` or `2`).
 
 ## Resume
 

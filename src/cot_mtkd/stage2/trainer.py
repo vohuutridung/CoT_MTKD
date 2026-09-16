@@ -111,6 +111,13 @@ def _validate_stage2_config(config: dict[str, Any]) -> None:
         raise ValueError("stage2.lambda_disagreement must be non-negative")
     if int(config["runtime"]["lm_head_chunk_tokens"]) <= 0:
         raise ValueError("runtime.lm_head_chunk_tokens must be positive")
+    benchmark_epoch = config["stage2"].get("benchmark_checkpoint_epoch")
+    if benchmark_epoch is not None:
+        benchmark_epoch = int(benchmark_epoch)
+        if not 1 <= benchmark_epoch <= int(config["stage2"]["epochs"]):
+            raise ValueError(
+                "stage2.benchmark_checkpoint_epoch must be in 1..stage2.epochs"
+            )
 
 
 def _save_checkpoint(
@@ -297,6 +304,12 @@ def train_stage2(
             )
     epochs = int(config["stage2"]["epochs"])
     total_steps = math.ceil(epochs * len(dataloader) / accumulation_steps)
+    benchmark_epoch = config["stage2"].get("benchmark_checkpoint_epoch")
+    benchmark_step = (
+        math.ceil(int(benchmark_epoch) * len(dataset) / global_batch)
+        if benchmark_epoch is not None
+        else None
+    )
 
     merge_kwargs = merge_config_values(config)
     adapter_names = list(stage1_manifest["adapter_names"])
@@ -487,6 +500,27 @@ def train_stage2(
                     distributed.world_size,
                     last_source_metrics,
                 )
+            if distributed.is_main and benchmark_step == global_step:
+                benchmark_dir = output_dir / "benchmark"
+                LOGGER.info(
+                    "Saving Stage 2 benchmark checkpoint at step=%d (~epoch %s)",
+                    global_step,
+                    benchmark_epoch,
+                )
+                save_adapter_bundle(model, ["student"], benchmark_dir)
+                _save_checkpoint(
+                    benchmark_dir / "checkpoint.pt",
+                    model,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    epoch,
+                    batch_index + 1,
+                    run_hash,
+                    int(config["seed"]),
+                    distributed.world_size,
+                    last_source_metrics,
+                )
             gradient_buffer = zeros_like_parameters(parameters)
             nll_total = 0.0
             weight_total = 0.0
@@ -522,6 +556,13 @@ def train_stage2(
             "merged_adapters": adapter_names,
             "adapter_bundle": str(bundle_path.relative_to(output_dir)),
             "adapter_bundle_sha256": file_sha256(bundle_path),
+            "benchmark_checkpoint_epoch": benchmark_epoch,
+            "benchmark_step": benchmark_step,
+            "benchmark_adapter_bundle": (
+                "benchmark/adapter_states.pt"
+                if (output_dir / "benchmark" / "adapter_states.pt").is_file()
+                else None
+            ),
             "prepared_manifest_fingerprint": fingerprint(prepared_manifest),
             "stage1_manifest_fingerprint": fingerprint(stage1_manifest),
             "supervision_manifest_fingerprint": fingerprint(supervision_manifest),

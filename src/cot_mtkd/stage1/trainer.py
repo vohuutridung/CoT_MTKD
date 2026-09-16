@@ -364,6 +364,13 @@ def _validate_stage1_config(config: dict[str, Any]) -> None:
         raise ValueError("runtime.lm_head_chunk_tokens must be positive")
     if int(config["runtime"]["council_chunk_tokens"]) <= 0:
         raise ValueError("runtime.council_chunk_tokens must be positive")
+    benchmark_epoch = config["stage1"].get("benchmark_checkpoint_epoch")
+    if benchmark_epoch is not None:
+        benchmark_epoch = int(benchmark_epoch)
+        if not 1 <= benchmark_epoch <= int(config["stage1"]["epochs"]):
+            raise ValueError(
+                "stage1.benchmark_checkpoint_epoch must be in 1..stage1.epochs"
+            )
 
 
 def _save_training_checkpoint(
@@ -538,6 +545,12 @@ def train_stage1(
         micro_batch,
         accumulation_steps,
         total_steps,
+    )
+    benchmark_epoch = config["stage1"].get("benchmark_checkpoint_epoch")
+    benchmark_step = (
+        math.ceil(int(benchmark_epoch) * len(dataset) / requested_global_batch)
+        if benchmark_epoch is not None
+        else None
     )
 
     model, adapter_names = create_multi_adapter_model(
@@ -799,6 +812,28 @@ def train_stage1(
                     int(config["seed"]),
                     distributed.world_size,
                 )
+            if distributed.is_main and benchmark_step == global_step:
+                benchmark_dir = output_dir / "benchmark"
+                LOGGER.info(
+                    "Saving Stage 1 benchmark checkpoint at step=%d (~epoch %s)",
+                    global_step,
+                    benchmark_epoch,
+                )
+                save_adapter_bundle(model, adapter_names, benchmark_dir)
+                _save_training_checkpoint(
+                    benchmark_dir / "checkpoint.pt",
+                    model,
+                    adapter_names,
+                    optimizers,
+                    schedulers,
+                    bandwidth,
+                    global_step,
+                    epoch,
+                    batch_index + 1,
+                    run_hash,
+                    int(config["seed"]),
+                    distributed.world_size,
+                )
 
             sft_buffers = [
                 zeros_like_parameters(parameters) for parameters in parameter_lists
@@ -842,6 +877,13 @@ def train_stage1(
             "adapter_names": adapter_names,
             "adapter_bundle": str(bundle_path.relative_to(output_dir)),
             "adapter_bundle_sha256": file_sha256(bundle_path),
+            "benchmark_checkpoint_epoch": benchmark_epoch,
+            "benchmark_step": benchmark_step,
+            "benchmark_adapter_bundle": (
+                "benchmark/adapter_states.pt"
+                if (output_dir / "benchmark" / "adapter_states.pt").is_file()
+                else None
+            ),
             "expert_files": {
                 name: {
                     "adapter_config": f"final/adapters/{name}/adapter_config.json",
