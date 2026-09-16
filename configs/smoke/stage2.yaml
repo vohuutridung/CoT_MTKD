@@ -1,11 +1,11 @@
 schema_version: 1
 seed: 42
 model:
-  name_or_path: Qwen/Qwen2.5-7B-Instruct
-  revision: a09a35458c702b33eeacc393d103063234e8bc28
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+  revision: 7ae557604adf67be50417f59c2c2f167def9a775
   dtype: bfloat16
-  attn_implementation: flash_attention_2
-  gradient_checkpointing: true
+  attn_implementation: sdpa
+  gradient_checkpointing: false
 lora:
   rank: 16
   alpha: 16
@@ -13,21 +13,21 @@ lora:
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 cache:
   temperature: 2.0
-  top_k: 512
+  top_k: 32
   probability_dtype: bfloat16
   clamp_epsilon: 1.0e-8
-  tokens_per_shard: 100000
-  audit_samples: 16
+  tokens_per_shard: 10000
+  audit_samples: 2
 stage2:
-  epochs: 3
+  epochs: 1
   learning_rate: 2.0e-5
   micro_batch_size: 1
-  global_batch_size: 8
+  global_batch_size: 2
   gradient_accumulation_steps: null
   hard_loss_weight: 1.0
   kd_loss_weight: 1.0
   max_grad_norm: 1.0
-  checkpoint_every_steps: 10
+  checkpoint_every_steps: 2
   log_every_steps: 1
   resume_from: null
 optimizer:
@@ -44,8 +44,8 @@ runtime:
   dataloader_workers: 0
   pin_memory: true
 paths:
-  prepared: artifacts/prepared/s1k_1_1
-  stage1: artifacts/stage1/main
-  supervision: artifacts/supervision/main
-  cache: artifacts/teacher_cache/top512_tail
-  output: artifacts/stage2/main
+  prepared: artifacts/smoke/prepared
+  stage1: artifacts/smoke/stage1
+  supervision: artifacts/smoke/supervision
+  cache: artifacts/smoke/teacher_cache
+  output: artifacts/smoke/stage2

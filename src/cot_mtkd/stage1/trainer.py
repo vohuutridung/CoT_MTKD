@@ -530,6 +530,15 @@ def train_stage1(
             )
     epochs = int(config["stage1"]["epochs"])
     total_steps = math.ceil(epochs * len(dataloader) / accumulation_steps)
+    LOGGER.info(
+        "Stage 1 setup: samples=%d epochs=%d micro_batch=%d "
+        "accumulation=%d optimizer_steps=%d",
+        len(dataset),
+        epochs,
+        micro_batch,
+        accumulation_steps,
+        total_steps,
+    )
 
     model, adapter_names = create_multi_adapter_model(
         config["model"],
@@ -588,7 +597,7 @@ def train_stage1(
     chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
 
     # Accumulation deliberately crosses epoch boundaries. For the canonical
-    # 1,000 x 3 run this produces ceil(3,000 / 32) = 94 optimizer updates,
+    # 1,000 x 3 run this produces ceil(3,000 / 8) = 375 optimizer updates,
     # instead of flushing three undersized batches at each epoch boundary.
     sft_buffers = [zeros_like_parameters(parameters) for parameters in parameter_lists]
     dpp_buffers = [zeros_like_parameters(parameters) for parameters in parameter_lists]
@@ -607,6 +616,12 @@ def train_stage1(
             if epoch == start_epoch and batch_index < start_batch:
                 continue
             batch = _batch_to_device(raw_batch, distributed.device)
+            if epoch == start_epoch and batch_index == start_batch:
+                LOGGER.info(
+                    "Stage 1 first microbatch: tokens=%d seq_len=%d",
+                    int(batch["attention_mask"].sum().item()),
+                    int(batch["input_ids"].shape[1]),
+                )
             # The same stream id is used for the no-grad probe and replay so dropout
             # masks match exactly, while distinct microbatches never reuse a mask.
             rng_stream = (

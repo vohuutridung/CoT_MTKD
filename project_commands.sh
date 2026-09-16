@@ -20,6 +20,7 @@ Commands:
   cache         Compile Top-512 plus tail-bucket teacher targets.
   stage2        Train the single medoid-initialized student adapter.
   evaluate      Generate and grade the P-ALIGN benchmark suite.
+  smoke         Tiny Qwen2.5-0.5B-Instruct run of setup/tests/full pipeline.
   test          Run local unit tests without downloading a model.
   all           Run prepare through evaluate (assumes setup is complete).
   full          Run setup, tests, and the complete pipeline.
@@ -43,6 +44,9 @@ case "$command" in
   cache) run_step 40_build_teacher_cache.sh ;;
   stage2) run_step 50_train_stage2.sh ;;
   evaluate) run_step 60_evaluate.sh ;;
+  smoke)
+    bash "$PROJECT_ROOT/scripts/95_smoke.sh"
+    ;;
   test) run_step 90_test.sh ;;
   all)
     run_step 10_prepare_data.sh

@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+LOGGER = logging.getLogger(__name__)
+
 
 def configure_logging(rank: int = 0) -> None:
     level = logging.INFO if rank == 0 else logging.WARNING
@@ -33,3 +35,17 @@ class JsonlLogger:
         record = {"time": time.time(), "event": event, **values}
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        summary_keys = (
+            "step",
+            "epoch",
+            "sft_nll",
+            "dpp_loss",
+            "learning_rate",
+            "mean_selected_k",
+            "mean_grassmann_distance",
+            "hard_loss",
+            "kd_loss",
+            "total_loss",
+        )
+        summary = {key: values[key] for key in summary_keys if key in values}
+        LOGGER.info("%s %s", event, summary)

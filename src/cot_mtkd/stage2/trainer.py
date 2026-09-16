@@ -439,7 +439,7 @@ def train_stage2(
 
     # Keep partial accumulation across epoch boundaries. This implements the
     # optimizer-step schedule on the complete 3-epoch sample stream, yielding
-    # ceil(3,000 / 32) = 94 canonical updates.
+    # ceil(3,000 / 8) = 375 canonical updates.
     hard_buffer = zeros_like_parameters(parameters)
     kd_buffer = zeros_like_parameters(parameters)
     hard_weight_count = kd_token_count = 0.0

@@ -1,0 +1,27 @@
+schema_version: 1
+seed: 42
+model:
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+  revision: 7ae557604adf67be50417f59c2c2f167def9a775
+  dtype: bfloat16
+  attn_implementation: sdpa
+  use_cache: true
+generation:
+  prompt_prefix: "Please reason step by step, and put your final answer within \\boxed{}."
+  num_return_sequences: 1
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+  repetition_penalty: 1.0
+  max_new_tokens: 64
+benchmarks:
+  - name: smoke
+    local_json: artifacts/smoke/eval.jsonl
+    split: train
+    expected_records: 2
+grading:
+  timeout_seconds: 10
+  prefer_math_verify: true
+paths:
+  stage2: artifacts/smoke/stage2
+  output: artifacts/smoke/evaluation

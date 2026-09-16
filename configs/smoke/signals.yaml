@@ -1,0 +1,24 @@
+schema_version: 1
+seed: 42
+model:
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+  revision: 7ae557604adf67be50417f59c2c2f167def9a775
+  dtype: bfloat16
+  attn_implementation: sdpa
+signals:
+  temperature_features: 1.0
+  temperature_medoid: 2.0
+  importance_clip: [0.25, 4.0]
+  importance_consensus_floor: 0.5
+  importance_js_scale: 1.0
+  robust_mad_scale: 1.4826
+  feature_epsilon: 1.0e-6
+  uniform_teacher_mass: 0.10
+  dpp_jitter: 1.0e-4
+  pag_nonfinite_fallback: neutral
+runtime:
+  lm_head_chunk_tokens: 64
+paths:
+  prepared: artifacts/smoke/prepared
+  stage1: artifacts/smoke/stage1
+  output: artifacts/smoke/supervision
