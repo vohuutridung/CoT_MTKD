@@ -83,7 +83,6 @@ class DataContractTest(unittest.TestCase):
         serialized = serialize_record(
             "Question?",
             "First step.\n\nFinal Answer: \\boxed{7}",
-            "7",
         )
         reasoning = [
             segment
@@ -102,7 +101,8 @@ class DataContractTest(unittest.TestCase):
         ]
         self.assertEqual(len(reasoning), 2)
         self.assertEqual(delimiters[0].step_id, 0)
-        self.assertEqual(serialized.text[answers[0].start : answers[0].end], "7")
+        self.assertEqual(answers, [])
+        self.assertNotIn("deepseek_attempt", serialized.text)
         self.assertIn(
             "Final Answer", serialized.text[reasoning[1].start : reasoning[1].end]
         )
@@ -130,6 +130,10 @@ class DataContractTest(unittest.TestCase):
                 self.assertNotEqual(label, -100)
         self.assertEqual(len(record.offset_mapping), len(record.input_ids))
         self.assertEqual(record.thinking, "one\n\ntwo")
+        self.assertEqual(record.attempt, "2")
+        self.assertFalse(
+            any(region == int(TokenRegion.ANSWER) for region in record.region_ids)
+        )
         delimiter_steps = [
             step
             for step, region in zip(record.step_ids, record.region_ids, strict=True)

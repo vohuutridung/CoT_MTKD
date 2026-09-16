@@ -53,10 +53,10 @@ def prepare_one(
         .replace("\r\n", "\n")
         .replace("\r", "\n")
     )
-    attempt = str(raw["deepseek_attempt"])
+    attempt = str(raw.get("deepseek_attempt", ""))
     solution = str(raw["solution"])
     serialized = serialize_record(
-        question, thinking, attempt, system_prompt, step_pattern
+        question, thinking, system_prompt, step_pattern
     )
     encoded = tokenizer(
         serialized.text,

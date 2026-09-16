@@ -102,7 +102,6 @@ def reasoning_character_segments(
 def serialize_record(
     question: str,
     thinking: str,
-    attempt: str,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     step_pattern: str = DEFAULT_STEP_PATTERN,
 ) -> SerializedResponse:
@@ -119,7 +118,6 @@ def serialize_record(
     answer_start, _ = builder.append(
         "\n<|im_start|>answer\nAnswer: ", TokenRegion.ANSWER_MARKER
     )
-    builder.append(attempt, TokenRegion.ANSWER)
     builder.append("\n<|im_end|>", TokenRegion.EOS)
     return SerializedResponse(
         text=builder.build(),
