@@ -14,17 +14,21 @@ class DPPMetrics:
 
 
 def normalized_support_features(
-    support_logits: torch.Tensor,
+    support_log_probabilities: torch.Tensor,
     support_mask: torch.Tensor,
     epsilon: float = 1.0e-12,
 ) -> torch.Tensor:
-    """L2-normalized exponentiated-logit vectors on common support.
+    """L2-normalize full-vocabulary softmax probabilities restricted to C.
 
-    `support_logits` is `[experts, tokens, support]`; `support_mask` is
-    `[tokens, support]`. Padding coordinates are exactly zero.
+    `support_log_probabilities` is `[experts, tokens, support]` with
+    log p_c = z_c - logsumexp(z_full): the candidate slice of a softmax
+    over the whole vocabulary, not a softmax renormalized on C.
+    `support_mask` is `[tokens, support]`. Padding coordinates are zero.
     """
-    mask = support_mask.unsqueeze(0).to(device=support_logits.device)
-    masked = support_logits.float().masked_fill(~mask, -torch.inf)
+    mask = support_mask.unsqueeze(0).to(device=support_log_probabilities.device)
+    # Subtract the per-row max of log p_C for overflow safety. This is
+    # equivalent to L2-normalizing p_full[C] because L2 is scale-invariant.
+    masked = support_log_probabilities.float().masked_fill(~mask, -torch.inf)
     maximum = masked.max(dim=-1, keepdim=True).values
     maximum = torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum))
     values = torch.exp(masked - maximum).masked_fill(~mask, 0.0)

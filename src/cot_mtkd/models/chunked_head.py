@@ -114,6 +114,30 @@ def gather_support_logits(
     return torch.cat(values, dim=0)
 
 
+def gather_support_log_probabilities(
+    hidden: torch.Tensor,
+    head: torch.nn.Module,
+    support_ids: torch.Tensor,
+    chunk_tokens: int,
+    output_device: torch.device | None = None,
+) -> torch.Tensor:
+    """Slice full-vocabulary log-softmax onto C: log p_c = z_c - logsumexp(z)."""
+    count = hidden.shape[0]
+    values: list[torch.Tensor] = []
+    head_device = next(head.parameters()).device
+    head_dtype = next(head.parameters()).dtype
+    with torch.no_grad():
+        for start in range(0, count, chunk_tokens):
+            end = min(count, start + chunk_tokens)
+            current = hidden[start:end].to(device=head_device, dtype=head_dtype)
+            logits = head(current).float()
+            ids = support_ids[start:end].to(logits.device, dtype=torch.long)
+            log_normalizer = torch.logsumexp(logits, dim=-1, keepdim=True)
+            selected = logits.gather(-1, ids) - log_normalizer
+            values.append(selected.to(output_device or head_device))
+    return torch.cat(values, dim=0)
+
+
 def cross_entropy_hidden_gradient(
     hidden: torch.Tensor,
     head: torch.nn.Module,
@@ -186,6 +210,32 @@ def support_vjp_hidden_gradient(
             selected.device, dtype=torch.float32
         )
         surrogate = (selected * cotangent).sum()
+        grad = torch.autograd.grad(surrogate, leaf)[0]
+        gradient[start:end] = grad.to(gradient.dtype)
+    return gradient
+
+
+def support_logprob_vjp_hidden_gradient(
+    hidden: torch.Tensor,
+    head: torch.nn.Module,
+    support_ids: torch.Tensor,
+    support_logprob_gradient: torch.Tensor,
+    chunk_tokens: int,
+) -> torch.Tensor:
+    """VJP for a cotangent on log p_C = z_C - logsumexp(z_full)."""
+    gradient = torch.zeros_like(hidden)
+    head_dtype = next(head.parameters()).dtype
+    for start in range(0, hidden.shape[0], chunk_tokens):
+        end = min(hidden.shape[0], start + chunk_tokens)
+        leaf = hidden[start:end].detach().to(dtype=head_dtype).requires_grad_(True)
+        logits = head(leaf).float()
+        ids = support_ids[start:end].to(logits.device, dtype=torch.long)
+        log_normalizer = torch.logsumexp(logits, dim=-1, keepdim=True)
+        log_probabilities = logits.gather(-1, ids) - log_normalizer
+        cotangent = support_logprob_gradient[start:end].to(
+            log_probabilities.device, dtype=torch.float32
+        )
+        surrogate = (log_probabilities * cotangent).sum()
         grad = torch.autograd.grad(surrogate, leaf)[0]
         gradient[start:end] = grad.to(gradient.dtype)
     return gradient

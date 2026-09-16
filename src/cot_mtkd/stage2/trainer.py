@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 from ..data.collator import LongCoTCollator, shifted_token_views
 from ..data.dataset import JsonlRecordDataset, load_jsonl_files
 from ..data.prepare import tokenizer_fingerprint
-from ..data.schema import TokenRegion
 from ..models.chunked_head import (
+    cross_entropy_hidden_gradient,
     decoder_and_lm_head,
     forward_hidden,
     gather_hidden_positions,
@@ -54,8 +54,8 @@ from ..utils.training import (
     global_clip_grad_list_,
     zeros_like_parameters,
 )
-from .cache import SparseTeacherCache
-from .losses import dual_source_hidden_gradients
+from .merge import merge_adapter_states, merge_config_values, normalize_merge_method
+from .weights import phase2_token_weights
 
 LOGGER = logging.getLogger(__name__)
 
@@ -93,77 +93,24 @@ def _validate_stage2_config(config: dict[str, Any]) -> None:
         raise ValueError("stage2.learning_rate must be positive")
     if float(config["stage2"]["max_grad_norm"]) <= 0.0:
         raise ValueError("stage2.max_grad_norm must be positive")
-    hard = float(config["stage2"]["hard_loss_weight"])
-    kd = float(config["stage2"]["kd_loss_weight"])
-    if hard < 0.0 or kd < 0.0 or hard + kd == 0.0:
-        raise ValueError(
-            "Stage-2 source weights must be non-negative and not both zero"
-        )
-    if float(config["cache"]["temperature"]) <= 0.0:
-        raise ValueError("cache.temperature must be positive")
-    epsilon = float(config["cache"]["clamp_epsilon"])
-    if not (0.0 < epsilon < 1.0):
-        raise ValueError("cache.clamp_epsilon must be in (0, 1)")
+    normalize_merge_method(str(config["stage2"]["merge_method"]))
+    if float(config["stage2"].get("merge_scaling", 1.0)) <= 0.0:
+        raise ValueError("stage2.merge_scaling must be positive")
+    density = float(config["stage2"].get("ties_density", 0.2))
+    if not 0.0 < density <= 1.0:
+        raise ValueError("stage2.ties_density must be in (0, 1]")
+    drop = float(config["stage2"].get("dare_drop_prob", 0.5))
+    if not 0.0 <= drop < 1.0:
+        raise ValueError("stage2.dare_drop_prob must be in [0, 1)")
+    reduction = config["stage2"].get("tsv_reduction")
+    if reduction is not None and not 0.0 < float(reduction) <= 1.0:
+        raise ValueError("stage2.tsv_reduction must be in (0, 1] when set")
+    if float(config["stage2"]["lambda_uncertainty"]) < 0.0:
+        raise ValueError("stage2.lambda_uncertainty must be non-negative")
+    if float(config["stage2"]["lambda_disagreement"]) < 0.0:
+        raise ValueError("stage2.lambda_disagreement must be non-negative")
     if int(config["runtime"]["lm_head_chunk_tokens"]) <= 0:
         raise ValueError("runtime.lm_head_chunk_tokens must be positive")
-
-
-def _hard_weights_for_batch(
-    batch: dict[str, Any], signals: dict[str, dict[str, Any]]
-) -> torch.Tensor:
-    rows: list[torch.Tensor] = []
-    labels = batch["labels"][:, 1:]
-    regions = batch["region_ids"][:, 1:]
-    steps = batch["step_ids"][:, 1:]
-    for row, sample_id in enumerate(batch["sample_ids"]):
-        valid = labels[row].ne(-100)
-        importance = torch.tensor(
-            signals[sample_id]["importance"], device=labels.device, dtype=torch.float32
-        )
-        if not torch.isfinite(importance).all() or (importance <= 0).any():
-            raise ValueError(
-                f"Hard importance weights must be finite and positive for {sample_id}"
-            )
-        current_regions = regions[row, valid]
-        current_steps = steps[row, valid]
-        current = torch.ones(
-            current_regions.shape, device=labels.device, dtype=torch.float32
-        )
-        weighted = current_regions.eq(int(TokenRegion.REASONING)) | current_regions.eq(
-            int(TokenRegion.DELIMITER)
-        )
-        if weighted.any():
-            selected_steps = current_steps[weighted]
-            if (
-                selected_steps.min().item() < 0
-                or selected_steps.max().item() >= importance.numel()
-            ):
-                raise RuntimeError(f"Invalid step id in prepared record {sample_id}")
-            current[weighted] = importance[selected_steps]
-        rows.append(current)
-    return torch.cat(rows)
-
-
-def _cache_for_batch(
-    batch: dict[str, Any], cache: SparseTeacherCache, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    top_ids, probabilities, tail = [], [], []
-    labels = batch["labels"][:, 1:]
-    for row, sample_id in enumerate(batch["sample_ids"]):
-        expected_positions = labels[row].ne(-100).nonzero(as_tuple=True)[0].cpu() + 1
-        value = cache.get(sample_id)
-        if not torch.equal(value["token_positions"].long(), expected_positions.long()):
-            raise RuntimeError(
-                f"Sparse cache token positions do not match prepared record {sample_id}"
-            )
-        top_ids.append(value["top_ids"])
-        probabilities.append(value["top_probabilities"])
-        tail.append(value["tail_mass"])
-    return (
-        torch.cat(top_ids).to(device, non_blocking=True),
-        torch.cat(probabilities).to(device, non_blocking=True),
-        torch.cat(tail).to(device, non_blocking=True),
-    )
 
 
 def _save_checkpoint(
@@ -246,7 +193,6 @@ def train_stage2(
     prepared_dir = Path(config["paths"]["prepared"])
     stage1_dir = Path(config["paths"]["stage1"])
     supervision_dir = Path(config["paths"]["supervision"])
-    cache_dir = Path(config["paths"]["cache"])
     output_dir = Path(config["paths"]["output"])
     output_dir.mkdir(parents=True, exist_ok=True)
     config_snapshot = output_dir / "config.yaml"
@@ -256,7 +202,6 @@ def train_stage2(
     prepared_manifest = read_json(prepared_dir / "manifest.json")
     stage1_manifest = read_json(stage1_dir / "manifest.json")
     supervision_manifest = read_json(supervision_dir / "manifest.json")
-    cache_manifest = read_json(cache_dir / "manifest.json")
     require_file_sha256(
         prepared_dir, prepared_manifest, "data_file", "data_file_sha256"
     )
@@ -275,35 +220,17 @@ def train_stage2(
         "config_file",
         "config_file_sha256",
     )
-    require_file_sha256(cache_dir, cache_manifest, "index_file", "index_file_sha256")
-    require_file_sha256(cache_dir, cache_manifest, "config_file", "config_file_sha256")
     signal_paths = [supervision_dir / name for name in supervision_manifest["shards"]]
     if files_fingerprint(signal_paths) != supervision_manifest["signals_fingerprint"]:
         raise RuntimeError("Supervision shard content does not match its manifest")
-    cache_paths = [cache_dir / name for name in cache_manifest["shards"]]
-    if files_fingerprint(cache_paths) != cache_manifest["cache_files_fingerprint"]:
-        raise RuntimeError("Teacher-cache shard content does not match its manifest")
-    if cache_manifest["prepared_manifest_fingerprint"] != fingerprint(
+    if supervision_manifest["prepared_manifest_fingerprint"] != fingerprint(
         prepared_manifest
     ):
-        raise RuntimeError("Teacher cache/prepared dataset mismatch")
-    if cache_manifest["stage1_manifest_fingerprint"] != fingerprint(stage1_manifest):
-        raise RuntimeError("Teacher cache/Stage-1 mismatch")
-    if cache_manifest["supervision_manifest_fingerprint"] != fingerprint(
-        supervision_manifest
+        raise RuntimeError("Supervision/prepared dataset mismatch")
+    if supervision_manifest["stage1_manifest_fingerprint"] != fingerprint(
+        stage1_manifest
     ):
-        raise RuntimeError("Teacher cache/supervision mismatch")
-    if (
-        cache_manifest["teacher_weighting_fingerprint"]
-        != supervision_manifest["signals_fingerprint"]
-    ):
-        raise RuntimeError("Teacher cache was compiled with different teacher weights")
-    if float(cache_manifest["temperature"]) != float(config["cache"]["temperature"]):
-        raise RuntimeError(
-            "Teacher cache temperature differs from Stage-2 configuration"
-        )
-    if int(cache_manifest["top_k"]) != int(config["cache"]["top_k"]):
-        raise RuntimeError("Teacher cache K differs from Stage-2 configuration")
+        raise RuntimeError("Supervision/Stage-1 mismatch")
 
     tokenizer = load_tokenizer(config["model"])
     if tokenizer_fingerprint(tokenizer) != prepared_manifest["tokenizer_fingerprint"]:
@@ -322,9 +249,6 @@ def train_stage2(
     )
     if len(signals) != len(dataset):
         raise RuntimeError("Supervision records do not cover the Stage-2 dataset")
-    cache = SparseTeacherCache(cache_dir)
-    if len(cache.index) != len(dataset):
-        raise RuntimeError("Sparse teacher cache does not cover the Stage-2 dataset")
     sampler = DistributedSampler(
         dataset,
         num_replicas=distributed.world_size,
@@ -374,12 +298,26 @@ def train_stage2(
     epochs = int(config["stage2"]["epochs"])
     total_steps = math.ceil(epochs * len(dataloader) / accumulation_steps)
 
+    merge_kwargs = merge_config_values(config)
+    adapter_names = list(stage1_manifest["adapter_names"])
+    stage1_bundle = load_adapter_bundle(stage1_dir / stage1_manifest["adapter_bundle"])
+    missing_experts = [name for name in adapter_names if name not in stage1_bundle]
+    if missing_experts:
+        raise RuntimeError(f"Stage-1 bundle is missing adapters: {missing_experts}")
+    if distributed.is_main:
+        LOGGER.info(
+            "Merging %d Stage-1 experts with method=%s",
+            len(adapter_names),
+            merge_kwargs["method"],
+        )
+    merged_state = merge_adapter_states(
+        [stage1_bundle[name] for name in adapter_names],
+        **merge_kwargs,
+    )
     model = create_student_model(
         config["model"], config["lora"], distributed.device, int(config["seed"])
     )
-    medoid_name = str(supervision_manifest["functional_medoid_adapter"])
-    stage1_bundle = load_adapter_bundle(stage1_dir / stage1_manifest["adapter_bundle"])
-    load_adapter_state(model, "student", stage1_bundle[medoid_name])
+    load_adapter_state(model, "student", merged_state)
     parameters = list(adapter_parameter_map(model, "student").values())
     optimizer_config = config["optimizer"]
     optimizer = torch.optim.AdamW(
@@ -406,7 +344,6 @@ def train_stage2(
             "prepared_manifest_fingerprint": fingerprint(prepared_manifest),
             "stage1_manifest_fingerprint": fingerprint(stage1_manifest),
             "supervision_manifest_fingerprint": fingerprint(supervision_manifest),
-            "cache_manifest_fingerprint": fingerprint(cache_manifest),
             "world_size": distributed.world_size,
         }
     )
@@ -435,15 +372,13 @@ def train_stage2(
         truncate=not bool(resume),
     )
     chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
+    lambda_u = float(config["stage2"]["lambda_uncertainty"])
+    lambda_d = float(config["stage2"]["lambda_disagreement"])
     model.train()
 
-    # Keep partial accumulation across epoch boundaries. This implements the
-    # optimizer-step schedule on the complete 3-epoch sample stream, yielding
-    # ceil(3,000 / 8) = 375 canonical updates.
-    hard_buffer = zeros_like_parameters(parameters)
-    kd_buffer = zeros_like_parameters(parameters)
-    hard_weight_count = kd_token_count = 0.0
-    hard_loss_total = kd_loss_total = 0.0
+    gradient_buffer = zeros_like_parameters(parameters)
+    nll_total = 0.0
+    weight_total = 0.0
     accumulated = 0
 
     for epoch in range(start_epoch, epochs):
@@ -453,10 +388,9 @@ def train_stage2(
                 continue
             batch = _batch_to_device(raw_batch, distributed.device)
             views = shifted_token_views(batch)
-            top_ids, teacher_probabilities, teacher_tail = _cache_for_batch(
-                batch, cache, distributed.device
+            token_weights, segment_weight = phase2_token_weights(
+                batch, signals, lambda_u, lambda_d
             )
-            hard_weights = _hard_weights_for_batch(batch, signals)
             rng_seed = derived_seed(
                 config["seed"], "stage2", global_step, accumulated, distributed.rank
             )
@@ -470,44 +404,26 @@ def train_stage2(
                 views["response_hidden_indices"],
             )
             _, head = decoder_and_lm_head(model)
-            hard_dhidden, kd_dhidden, hard_sum, kd_sum, hard_count, kd_count = (
-                dual_source_hidden_gradients(
-                    response_hidden,
-                    head,
-                    views["response_targets"],
-                    hard_weights,
-                    top_ids,
-                    teacher_probabilities,
-                    teacher_tail,
-                    float(config["cache"]["temperature"]),
-                    float(config["cache"]["clamp_epsilon"]),
-                    chunk_tokens,
-                )
+            hidden_gradient, nll_sum, _ = cross_entropy_hidden_gradient(
+                response_hidden,
+                head,
+                views["response_targets"],
+                chunk_tokens,
+                token_weights=token_weights,
             )
-            hard_gradients = torch.autograd.grad(
+            parameter_gradients = torch.autograd.grad(
                 response_hidden,
                 parameters,
-                grad_outputs=hard_dhidden,
-                retain_graph=True,
-                allow_unused=False,
-            )
-            kd_gradients = torch.autograd.grad(
-                response_hidden,
-                parameters,
-                grad_outputs=kd_dhidden,
+                grad_outputs=hidden_gradient,
                 retain_graph=False,
                 allow_unused=False,
             )
             add_gradients_(
-                hard_buffer, [value.detach().float() for value in hard_gradients]
+                gradient_buffer,
+                [value.detach().float() for value in parameter_gradients],
             )
-            add_gradients_(
-                kd_buffer, [value.detach().float() for value in kd_gradients]
-            )
-            hard_loss_total += hard_sum
-            kd_loss_total += kd_sum
-            hard_weight_count += hard_count
-            kd_token_count += kd_count
+            nll_total += float(nll_sum.item())
+            weight_total += float(segment_weight)
             accumulated += 1
             final_microbatch = epoch + 1 == epochs and batch_index + 1 == len(
                 dataloader
@@ -516,39 +432,23 @@ def train_stage2(
             if not boundary:
                 continue
 
-            all_reduce_grad_lists([hard_buffer, kd_buffer])
+            all_reduce_grad_lists([gradient_buffer])
             counts = torch.tensor(
-                [hard_weight_count, kd_token_count],
+                [weight_total],
                 device=distributed.device,
                 dtype=torch.float64,
             )
             losses = torch.tensor(
-                [hard_loss_total, kd_loss_total],
+                [nll_total],
                 device=distributed.device,
                 dtype=torch.float64,
             )
             all_reduce_tensor(counts)
             all_reduce_tensor(losses)
-            hard_mean = float(losses[0].item() / max(counts[0].item(), 1.0))
-            kd_mean = float(losses[1].item() / max(counts[1].item(), 1.0))
-            last_source_metrics = {
-                "hard_loss": hard_mean,
-                "kd_loss": kd_mean,
-                "total_loss": (
-                    float(config["stage2"]["hard_loss_weight"]) * hard_mean
-                    + float(config["stage2"]["kd_loss_weight"]) * kd_mean
-                ),
-            }
-            hard_scale = float(config["stage2"]["hard_loss_weight"]) / max(
-                float(counts[0].item()), 1.0
-            )
-            kd_scale = float(config["stage2"]["kd_loss_weight"]) / max(
-                float(counts[1].item()), 1.0
-            )
-            final_gradients = [
-                hard.float() * hard_scale + kd.float() * kd_scale
-                for hard, kd in zip(hard_buffer, kd_buffer, strict=True)
-            ]
+            nll_mean = float(losses[0].item() / max(counts[0].item(), 1.0))
+            last_source_metrics = {"nll": nll_mean, "total_loss": nll_mean}
+            scale = 1.0 / max(float(counts[0].item()), 1.0)
+            final_gradients = [value.float() * scale for value in gradient_buffer]
             preclip_norm = global_clip_grad_list_(
                 final_gradients, float(config["stage2"]["max_grad_norm"])
             )
@@ -566,6 +466,7 @@ def train_stage2(
                     step=global_step,
                     epoch=epoch,
                     **last_source_metrics,
+                    merge_method=merge_kwargs["method"],
                     learning_rate=optimizer.param_groups[0]["lr"],
                     preclip_gradient_norm=preclip_norm,
                 )
@@ -586,10 +487,9 @@ def train_stage2(
                     distributed.world_size,
                     last_source_metrics,
                 )
-            hard_buffer = zeros_like_parameters(parameters)
-            kd_buffer = zeros_like_parameters(parameters)
-            hard_weight_count = kd_token_count = 0.0
-            hard_loss_total = kd_loss_total = 0.0
+            gradient_buffer = zeros_like_parameters(parameters)
+            nll_total = 0.0
+            weight_total = 0.0
             accumulated = 0
         start_batch = 0
         barrier()
@@ -618,13 +518,13 @@ def train_stage2(
             "training_checkpoint": "checkpoint.pt",
             "training_checkpoint_sha256": file_sha256(output_dir / "checkpoint.pt"),
             "student_adapter": "student",
-            "parent_medoid_adapter": medoid_name,
+            "merge_method": merge_kwargs["method"],
+            "merged_adapters": adapter_names,
             "adapter_bundle": str(bundle_path.relative_to(output_dir)),
             "adapter_bundle_sha256": file_sha256(bundle_path),
             "prepared_manifest_fingerprint": fingerprint(prepared_manifest),
             "stage1_manifest_fingerprint": fingerprint(stage1_manifest),
             "supervision_manifest_fingerprint": fingerprint(supervision_manifest),
-            "cache_manifest_fingerprint": fingerprint(cache_manifest),
             "config": public_config,
             "config_fingerprint": config_hash,
             "config_file": config_snapshot.name,

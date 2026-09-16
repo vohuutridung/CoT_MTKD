@@ -11,21 +11,19 @@ lora:
   alpha: 16
   dropout: 0.05
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
-cache:
-  temperature: 2.0
-  top_k: 32
-  probability_dtype: bfloat16
-  clamp_epsilon: 1.0e-8
-  tokens_per_shard: 10000
-  audit_samples: 2
 stage2:
   epochs: 1
   learning_rate: 2.0e-5
   micro_batch_size: 1
   global_batch_size: 2
   gradient_accumulation_steps: null
-  hard_loss_weight: 1.0
-  kd_loss_weight: 1.0
+  merge_method: ta
+  merge_scaling: 1.0
+  ties_density: 0.2
+  dare_drop_prob: 0.5
+  tsv_reduction: null
+  lambda_uncertainty: 0.5
+  lambda_disagreement: 0.5
   max_grad_norm: 1.0
   checkpoint_every_steps: 2
   log_every_steps: 1
@@ -47,5 +45,4 @@ paths:
   prepared: artifacts/smoke/prepared
   stage1: artifacts/smoke/stage1
   supervision: artifacts/smoke/supervision
-  cache: artifacts/smoke/teacher_cache
   output: artifacts/smoke/stage2

@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from cot_mtkd.stage1.dpp import step_dpp_loss
+from cot_mtkd.stage1.dpp import normalized_support_features, step_dpp_loss
 
 
 class DPPTest(unittest.TestCase):
@@ -39,6 +39,40 @@ class DPPTest(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(raw.grad)
         self.assertTrue(torch.isfinite(raw.grad).all())
+
+    def test_features_are_l2_of_full_vocab_softmax_slice(self) -> None:
+        torch.manual_seed(4)
+        logits = torch.tensor(
+            [
+                [[2.0, 0.5, -1.0, 3.0], [0.0, 1.0, 4.0, -2.0]],
+                [[1.0, 1.0, 1.0, 0.0], [5.0, -3.0, 0.5, 0.5]],
+            ]
+        )
+        candidate_ids = torch.tensor([[0, 2], [1, 3]])
+        mask = torch.tensor([[True, True], [True, False]])
+        log_p = torch.stack(
+            [
+                torch.log_softmax(logits[0], dim=-1).gather(-1, candidate_ids),
+                torch.log_softmax(logits[1], dim=-1).gather(-1, candidate_ids),
+            ]
+        )
+        index = candidate_ids.unsqueeze(0).expand(logits.shape[0], -1, -1)
+        features = normalized_support_features(log_p, mask)
+        probabilities = torch.softmax(logits, dim=-1).gather(-1, index)
+        probabilities = probabilities.masked_fill(~mask.unsqueeze(0), 0.0)
+        expected = probabilities / probabilities.norm(dim=-1, keepdim=True).clamp_min(
+            1.0e-12
+        )
+        self.assertTrue(torch.allclose(features, expected, atol=1e-6, rtol=1e-5))
+        candidate_only = torch.softmax(
+            logits.gather(-1, index).masked_fill(~mask.unsqueeze(0), -torch.inf),
+            dim=-1,
+        )
+        self.assertFalse(
+            torch.allclose(
+                probabilities[0, 0], candidate_only[0, 0], atol=1e-4, rtol=1e-4
+            )
+        )
 
 
 if __name__ == "__main__":

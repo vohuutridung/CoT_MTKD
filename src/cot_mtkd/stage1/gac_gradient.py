@@ -78,6 +78,13 @@ def stable_gac_gradients(
     dpp_weight: float,
     rbf_weight: float,
 ) -> tuple[list[list[torch.Tensor]], GACDiagnostics]:
+    """Legacy unused combiner with a repulsion-norm cap.
+
+    Stage-1 training uses `phase1_data_gradients` (SFT + λ_div DPP), clips
+    that data gradient, steps AdamW, then applies `apply_grassmann_force_`.
+    This function is kept for backward-compatible tests and is not on the
+    training path.
+    """
     count = len(sft_gradients)
     if not (
         len(dpp_gradients)

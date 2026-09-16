@@ -21,8 +21,8 @@ from ..models.chunked_head import (
     decoder_and_lm_head,
     forward_hidden,
     gather_hidden_positions,
-    gather_support_logits,
-    support_vjp_hidden_gradient,
+    gather_support_log_probabilities,
+    support_logprob_vjp_hidden_gradient,
 )
 from ..models.multi_adapter import (
     adapter_parameter_groups,
@@ -176,16 +176,16 @@ def probe_stage1_dpp(
     support_mask = support_mask_cpu.to(device, non_blocking=True)
     eligible = support_mask.any(dim=-1)
     if eligible.any():
-        support_logits = torch.stack(
+        support_log_probabilities = torch.stack(
             [
-                gather_support_logits(
+                gather_support_log_probabilities(
                     hidden, head, support_ids_cpu, chunk_tokens, output_device=device
                 )
                 for hidden in hidden_by_expert
             ],
             dim=0,
         ).detach().requires_grad_(True)
-        features = normalized_support_features(support_logits, support_mask)
+        features = normalized_support_features(support_log_probabilities, support_mask)
         loss, metrics = step_dpp_loss(
             features[:, eligible],
             views["reasoning_batch_indices"][eligible],
@@ -194,7 +194,7 @@ def probe_stage1_dpp(
             maximum_jitter=float(config["dpp"]["max_jitter"]),
             reduction="sum",
         )
-        gradients = torch.autograd.grad(loss, support_logits)[0].detach()
+        gradients = torch.autograd.grad(loss, support_log_probabilities)[0].detach()
     else:
         loss = torch.zeros((), device=device)
         metrics = DPPMetrics(0, 0, 0, float(config["dpp"]["jitter"]))
@@ -259,7 +259,7 @@ def replay_expert_gradients(
         response_regions = views["regions"][views["valid"]]
         response_reasoning = response_regions.eq(int(TokenRegion.REASONING))
         reasoning_hidden = response_hidden[response_reasoning]
-        dpp_hidden_gradient = support_vjp_hidden_gradient(
+        dpp_hidden_gradient = support_logprob_vjp_hidden_gradient(
             reasoning_hidden,
             head,
             probe.support_ids,

@@ -1,6 +1,7 @@
 # GAC-CoT-MTKD
 
-Train five LoRA experts and distill them into one student adapter.
+Train five LoRA experts, merge them into one student adapter, then distill
+with council-weighted step NLL.
 
 ## Setup
 
@@ -10,44 +11,50 @@ Train five LoRA experts and distill them into one student adapter.
 
 ## Run
 
-Run the complete pipeline:
+Complete pipeline (`prepare` → `stage1` → `supervision` → `stage2` → `evaluate`):
 
 ```bash
 ./project_commands.sh all
 ```
 
-Run setup, tests, and the complete pipeline:
+Setup, tests, then that pipeline:
 
 ```bash
 ./project_commands.sh full
 ```
 
-Phase 1 trains each expert on length-normalized reasoning-step NLL with an
-independent Bernoulli dropout mask per step and expert. The final answer has
-its own always-on loss block. Each optimizer update also applies an outward
-Grassmann force computed from the LoRA A-row and B-column subspaces. Diversity
-loss uses token-wise DPP on the dynamic Top-k of the full-vocabulary council
-distribution, after removing the ground-truth token. The proposal leaves the
-loss weights and dropout probability open; their defaults are in
-`configs/stage1/qwen25_7b_m5.yaml`. Its `kneedle` probe settings remain for
-Phase-2 signal construction and do not cap Phase-1 council Top-k.
+Tiny 0.5B smoke of `full`:
 
-Run each stage separately:
+```bash
+./project_commands.sh smoke
+```
+
+Each step:
 
 ```bash
 ./project_commands.sh prepare
 ./project_commands.sh stage1
 ./project_commands.sh publish-stage1
 ./project_commands.sh supervision
-./project_commands.sh cache
 ./project_commands.sh stage2
 ./project_commands.sh evaluate
 ```
 
-Run tests:
+`cache` is optional and is **not** part of `all` / `full` / `smoke`. Stage 2
+does not read teacher-cache artifacts.
+
+```bash
+./project_commands.sh cache
+```
+
+Tests (no model download):
 
 ```bash
 ./project_commands.sh test
+```
+
+```bash
+./project_commands.sh help
 ```
 
 ## Multi-GPU
@@ -56,43 +63,66 @@ Run tests:
 NPROC_PER_NODE=8 ./project_commands.sh all
 ```
 
-## Resume training
+## Resume
 
 ```bash
 STAGE1_RESUME=artifacts/stage1/main/checkpoint.pt ./project_commands.sh stage1
 STAGE2_RESUME=artifacts/stage2/main/checkpoint.pt ./project_commands.sh stage2
 ```
 
-## Useful overrides
+## Stage 2 merge ablation
+
+Default method is `ta`. Override with `STAGE2_MERGE_METHOD` or `--merge-method`:
+`ta`, `ties`, `dare_ties`, `tsv`, `iso_c`.
+
+```bash
+STAGE2_MERGE_METHOD=ties ./project_commands.sh stage2
+STAGE2_MERGE_METHOD=dare_ties ./project_commands.sh stage2
+STAGE2_MERGE_METHOD=tsv ./project_commands.sh stage2
+STAGE2_MERGE_METHOD=iso_c ./project_commands.sh stage2
+```
+
+Write each run to its own directory:
+
+```bash
+STAGE2_MERGE_METHOD=ties ./project_commands.sh stage2
+# or
+python -m cot_mtkd.cli.train_stage2 \
+  --config configs/stage2/qwen25_7b.yaml \
+  --merge-method tsv \
+  --set paths.output=artifacts/stage2/tsv
+```
+
+## Config overrides
 
 ```bash
 DATA_CONFIG=configs/data/s1k_1_1.yaml ./project_commands.sh prepare
 STAGE1_CONFIG=configs/stage1/qwen25_7b_m5.yaml ./project_commands.sh stage1
 SIGNALS_CONFIG=configs/signals/main.yaml ./project_commands.sh supervision
-STAGE2_CONFIG=configs/stage2/qwen25_7b_top512_tail.yaml ./project_commands.sh stage2
+STAGE2_CONFIG=configs/stage2/qwen25_7b.yaml ./project_commands.sh stage2
+CACHE_CONFIG=configs/cache/qwen25_7b_top512_tail.yaml ./project_commands.sh cache
 EVAL_CONFIG=configs/eval/p_align.yaml ./project_commands.sh evaluate
 HF_HUB_OFFLINE=1 ./project_commands.sh all
 ```
 
-Outputs are written under `artifacts/`. Default paths are listed in
-`configs/pipeline.yaml`.
+Defaults live in `configs/pipeline.yaml`. Artifacts go under `artifacts/`.
+Method notes: `docs/stage1.md`, `docs/stage2.md`.
 
 ## Publish Stage-1 LoRA experts
 
-Set `HF_REPO_ID` before running Stage 1 to publish its completed PEFT experts
-automatically. Authenticate with `HF_TOKEN` or `hf auth login`. The publisher
-uploads only each expert's `adapter_config.json` and
-`adapter_model.safetensors`, plus a model card, to one Hugging Face model repo.
-It verifies the files at the new commit and can run again after a completed
-training resume.
+Set `HF_REPO_ID` before Stage 1 to publish automatically, or run:
 
 ```bash
 export HF_TOKEN=hf_xxx
 export HF_REPO_ID=username/repo-name
-bash scripts/25_publish_stage1.sh
+./project_commands.sh publish-stage1
 ```
 
-New repositories are private by default. Set `HF_REPO_PRIVATE=false` or use
-`--public` with `cot-mtkd-publish-stage1` to create a public repository.
-For an existing repository, Hugging Face keeps its current visibility.
-Use `STAGE1_CONFIG` or `--stage1-dir` when publishing a non-default run.
+Authenticate with `HF_TOKEN` or `hf auth login`. The publisher uploads each
+expert's `adapter_config.json` and `adapter_model.safetensors`, plus a model
+card, then verifies the new commit. It can run again after a completed
+training resume.
+
+New repositories are private by default. Set `HF_REPO_PRIVATE=false` or pass
+`--public` to `cot-mtkd-publish-stage1`. Existing repos keep their visibility.
+Use `STAGE1_CONFIG` or `--stage1-dir` for a non-default run.

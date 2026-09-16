@@ -65,8 +65,8 @@ Mỗi $\phi_m$ gồm các cặp ma trận hạng thấp $(A_m^{(\ell)}, B_m^{(\e
 Quá trình huấn luyện gồm hai phase:
 
 \begin{itemize}
-\item \textbf{Phase 1 -- Diversity Training:} Huấn luyện $M$ LoRA experts nhằm tạo ra các reasoning state khác biệt (sử dụng phạt trực giao và DPP trên Top-$k$ động).
-\item \textbf{Phase 2 -- Merging \& Uncertainty-Guided Distillation:} Đóng băng $\theta_{base}$ và $\Phi$. Bước thứ nhất sử dụng các kỹ thuật Model Merging để khởi tạo một adapter LoRA student $\tilde\theta$ duy nhất từ $M$ experts. Bước thứ hai chưng cất tri thức vào student này bằng hàm mục tiêu NLL có trọng số step dựa trên tín hiệu uncertainty và disagreement của hội đồng.
+\item \textbf{Phase 1 -- Diversity Training:} Huấn luyện $M$ LoRA experts nhằm tạo ra các reasoning state khác biệt (sử dụng \emph{lực đẩy Grassmannian} --- Grassmannian repulsive force --- và DPP trên Top-$k$ động).
+\item \textbf{Phase 2 -- Merging \& Uncertainty-Guided Distillation:} Đóng băng $\theta_{base}$ và $\Phi$. Bước thứ nhất khởi tạo một adapter LoRA student $\tilde\theta$ duy nhất bằng \emph{trung bình task-vector} $\Delta W_m = s B_m A_m$ rồi nén hạng $r$ bằng truncated SVD. Bước thứ hai tối ưu student này bằng NLL có trọng số step trên reasoning, cộng NLL luôn-on của đáp án và token định dạng. Phase 2 \emph{không} dùng KL teacher--student.
 \end{itemize}
 
 \section{Ký hiệu và Phân rã Chuỗi Suy luận}
@@ -204,7 +204,7 @@ Gradient trong \eqref{eq:repforce} được tính bằng lan truyền ngược t
 
 \begin{proposition}
 \label{prop:bound}
-Với mọi cặp expert $(p,q)$, khoảng cách Grassmann tổng hợp thỏa $0 \le d_{Grass}(\phi_p,\phi_q)^2 \le r\pi^2/2$, do mỗi góc chính $\theta_j \in [0,\pi/2]$. Suy ra trọng số kernel $K(\phi_p,\phi_q) \in \left[\exp\!\left(-\frac{r\pi^2}{2h}\right),\ 1\right]$ luôn bị chặn dưới bởi một hằng số dương và giảm đơn điệu theo $d_{Grass}^2$. Do đó lực đẩy $F_{rep}$ được điều tiết mượt mà theo mức độ trùng lặp không gian con hiện tại, không cần một ngưỡng cắt cứng để vô hiệu hóa hàm phạt khi hai expert đã đủ trực giao.
+Với mọi cặp expert $(p,q)$, khoảng cách Grassmann tổng hợp thỏa $0 \le d_{Grass}(\phi_p,\phi_q)^2 \le r\pi^2/2$, do mỗi góc chính $\theta_j \in [0,\pi/2]$. Suy ra trọng số kernel $K(\phi_p,\phi_q) \in \left[\exp\!\left(-\frac{r\pi^2}{2h}\right),\ 1\right]$ luôn bị chặn dưới bởi một hằng số dương và giảm đơn điệu theo $d_{Grass}^2$. Do đó lực đẩy $F_{rep}$ được điều tiết mượt mà theo mức độ trùng lặp không gian con hiện tại, không cần một ngưỡng cắt cứng để vô hiệu hóa lực đẩy khi hai expert đã đủ trực giao.
 \end{proposition}
 
 \paragraph{Chi phí tính toán.} Với mỗi mô-đun $\ell$ và mỗi cặp expert $(p,q)$, chi phí chủ yếu nằm ở phân rã QR cỡ $d\times r$ (thời gian $O(dr^2)$) và SVD của ma trận $r\times r$ (thời gian $O(r^3)$), với $r$ thường chỉ nằm trong khoảng $8$–$64$. Tổng chi phí trên một bước huấn luyện là $O(|\mathcal{M}|\, M^2 (dr^2 + r^3))$, không đáng kể so với chi phí forward/backward qua $\theta_{base}$ vốn đã chiếm ưu thế trong huấn luyện LoRA.
@@ -227,26 +227,44 @@ k = \argmax_j \left( (1 - x_j) - y_j \right).
 \end{equation}
 Gọi tập hợp $k$ token có thứ hạng cao nhất tương ứng với điểm khuỷu này là $\mathcal{V}_k$.
 
-\paragraph{Không gian ứng viên và Hàm phạt DPP.}
-Để bảo đảm tính chính xác, token đáp án đúng $y^*$ (ground-truth) được loại khỏi $\mathcal{V}_k$, tạo thành tập ứng viên phân kỳ $\mathcal{C} = \mathcal{V}_k \setminus \{y^*\}$. 
+\paragraph{Không gian ứng viên và DPP.}
+Để bảo đảm tính chính xác, token đáp án đúng $y^*$ (ground-truth) được loại khỏi $\mathcal{V}_k$ \emph{sau} khi đã xác định khuỷu, tạo thành tập ứng viên phân kỳ $\mathcal{C} = \mathcal{V}_k \setminus \{y^*\}$.
 
-Với mỗi expert $m$, ta trích xuất xác suất tương ứng trên không gian $\mathcal{C}$ và chuẩn hóa $L_2$ để thu được vector đặc trưng đại diện cho hướng dự đoán:
+Với mỗi expert $m$, trước hết lấy softmax trên \emph{toàn bộ} từ vựng,
 \begin{equation}
-\tilde{v}^{(m)} = \frac{v^{(m)}}{\|v^{(m)}\|_2 + \epsilon}, \qquad \text{với } v^{(m)} = \left[ \hat{p}_{i,t}^{(m)}(c) \right]_{c \in \mathcal{C}}.
+\label{eq:dppfullsoftmax}
+\hat{p}^{(m)} = \operatorname{softmax}\!\left(z^{(m)}\right),
 \end{equation}
+rồi mới cắt lên tập ứng viên
+\begin{equation}
+\label{eq:dppcslice}
+\hat{p}^{(m)}_{\mathcal{C}}
+=
+\left[\hat{p}^{(m)}\right]_{\mathcal{C}}
+=
+\left[\operatorname{softmax}\!\left(z^{(m)}\right)\right]_{\mathcal{C}}.
+\end{equation}
+Mẫu số của softmax là toàn bộ vocabulary; phương pháp \emph{không} lấy softmax lại chỉ trên $\mathcal{C}$. Vector đặc trưng là chuẩn hóa $L_2$ của lát cắt đó:
+\begin{equation}
+\label{eq:dppfeature}
+\tilde{v}^{(m)}
+=
+\frac{\hat{p}^{(m)}_{\mathcal{C}}}{\|\hat{p}^{(m)}_{\mathcal{C}}\|_2 + \epsilon}.
+\end{equation}
+Hiện thực hóa ổn định tương đương dùng $\log \hat{p}^{(m)}_c = z^{(m)}_c - \operatorname{logsumexp}(z^{(m)}_{\mathrm{full}})$ rồi $\hat{p}^{(m)}_{\mathcal{C}} = \exp(\log \hat{p}^{(m)}_{\mathcal{C}})$.
 
-Sự phân hóa giữa các expert được đo bằng thể tích của khối đa diện chăng bởi $M$ vector này trong không gian ứng viên. Thể tích này được tính thông qua định thức của ma trận Gram $G \in \mathbb{R}^{M \times M}$, trong đó $G_{p,q} = (\tilde{v}^{(p)})^\top \tilde{v}^{(q)}$. Hàm mất mát DPP tại token $t$ cực tiểu hóa âm log-định thức:
+Sự phân hóa giữa các expert được đo bằng thể tích của khối đa diện chăng bởi $M$ vector này trong không gian ứng viên. Thể tích này được tính thông qua định thức của ma trận Gram $G \in \mathbb{R}^{M \times M}$, trong đó $G_{p,q} = (\tilde{v}^{(p)})^{\top} \tilde{v}^{(q)}$. Hàm mất mát DPP tại token $t$ cực tiểu hóa âm log-định thức:
 \begin{equation}
 l_{DPP, i, t} = -\log \det(G + \alpha I),
 \end{equation}
 với $\alpha$ là hằng số rất nhỏ (ví dụ $1e-5$) để đảm bảo tính xác định dương chặt.
 
-Hàm phạt đa dạng hóa trên toàn chuỗi là trung bình của $l_{DPP}$ đối với các token có tập ứng viên hợp lệ ($|\mathcal{C}| > 0$):
+Hàm phạt đa dạng hóa trên một sample là trung bình theo reasoning step của trung bình theo token (chỉ các token có $|\mathcal{C}|>0$); loss trên batch là trung bình các sample:
 \begin{equation}
 \label{eq:dppsteploss}
 \mathcal{L}_{DPP\_div} = \frac{1}{S}\sum_{i=1}^{S} \left( \frac{1}{T_i} \sum_{t=1}^{T_i} l_{DPP, i, t} \right).
 \end{equation}
-Cách tiếp cận này ép các expert phải bất đồng trên những suy luận hợp lý nhất (information-rich region) thay vì nhiễu loạn ngẫu nhiên, tạo ra nguồn epistemic uncertainty cực kỳ chất lượng cho Phase 2.
+Cách tiếp cận này ép các expert phải bất đồng trên những suy luận hợp lý nhất (information-rich region) thay vì nhiễu loạn ngẫu nhiên, tạo ra nguồn epistemic uncertainty cực kỳ chất lượng cho Phase 2. DPP được tính trên một lượt probe \texttt{no-grad} (không dùng mask dropout SFT), sau đó cotangent được đưa về tham số LoRA bằng VJP trên $\log\hat{p}_{\mathcal{C}}$ --- tức qua $\operatorname{softmax}$ đầy đủ, không qua softmax thu hẹp trên $\mathcal{C}$.
 
 \subsection{Hàm mục tiêu và Quy tắc Cập nhật Phase 1}
 \label{sec:phase1obj}
@@ -312,7 +330,7 @@ trong đó $F_{rep}$ là lực đẩy Grassmann ở \eqref{eq:repforce} và $\et
 \section{Phase 2: Uncertainty-Guided Merging và Weighted Distillation}
 \label{sec:phase2}
 
-Sau Phase 1, hội đồng expert $\Phi$ được dùng để đo lường các tín hiệu uncertainty và disagreement nhằm tính trọng số cho từng reasoning step. Tiếp đó, $M$ expert được gộp (merge) thẳng thành một student duy nhất $\tilde\theta$ và chưng cất (distill) tri thức thông qua NLL loss có trọng số.
+Sau Phase 1, hội đồng expert $\Phi$ được dùng để đo lường các tín hiệu uncertainty và disagreement nhằm tính trọng số cho từng reasoning step. Tiếp đó, $M$ expert được gộp thành một student duy nhất $\tilde\theta$ theo \eqref{eq:merge} và tối ưu bằng NLL có trọng số reasoning cộng NLL luôn-on của đáp án/định dạng, không dùng KL.
 
 \subsection{Uncertainty của Expert Council}
 \label{sec:signals}
@@ -352,7 +370,15 @@ V_i
 \right].
 \end{equation}
 
-Đại lượng này đo lường chính xác lượng phân kỳ Jensen-Shannon trung bình giữa các expert. Về mặt lý thuyết thông tin, đây là mutual information giữa biến dự đoán và chỉ số expert. $V_i$ nhận giá trị lớn khi các expert tự tin nhưng phân kỳ về đáp án.
+Đại lượng $V_i$ trùng với trung bình KL tới mixture,
+\begin{equation}
+V_i
+=
+\frac{1}{T_i}\sum_{t=1}^{T_i}
+\frac{1}{M}\sum_{m=1}^{M}
+\KL\!\left(\hat{p}_{i,t}^{(m)}\,\Vert\,\bar{p}_{i,t}\right).
+\end{equation}
+Hiện thực hóa tính $V_i$ theo dạng KL này; \eqref{eq:V} là đồng nhất thức.
 
 \paragraph{Relative Disagreement.}
 Từ định nghĩa của $U_i$ và $V_i$, ta thu được một phân rã chính xác của uncertainty toàn phần:
@@ -366,20 +392,22 @@ Từ định nghĩa của $U_i$ và $V_i$, ta thu được một phân rã chín
 U_i + V_i .
 \end{equation}
 
-Đây là phân rã uncertainty quen thuộc: $U_i$ là uncertainty \emph{dữ liệu} (aleatoric), $V_i$ là uncertainty \emph{tri thức} (epistemic). 
-Để chuẩn hóa $V_i$ (vì trần của nó thay đổi theo từng step), ta xét tỉ số chênh của phần dư địa uncertainty đến từ disagreement:
+Đây là phân rã uncertainty quen thuộc: $U_i$ là uncertainty \emph{dữ liệu} (aleatoric), $V_i$ là uncertainty \emph{tri thức} (epistemic).
+Để chuẩn hóa $V_i$ (vì trần của nó thay đổi theo từng step), ta xét tỉ số chênh của phần dư địa uncertainty đến từ disagreement, với mẫu số được kẹp để tránh chia cho $0$:
 
 \begin{equation}
 \label{eq:rho}
-\rho_i \;:=\; \frac{V_i}{U_i} \;\in\; [0,\infty),
+\rho_i \;:=\; \frac{V_i}{\max(U_i,\,\varepsilon_U)} \;\in\; [0,\infty),
+\qquad
+\varepsilon_U = 10^{-6}.
 \end{equation}
 
-tức lượng epistemic uncertainty tính trên một đơn vị aleatoric uncertainty. $\rho_i$ đo phần disagreement vượt trên mức mà độ khó nội tại của step đã giải thích được.
+tức lượng epistemic uncertainty tính trên một đơn vị aleatoric uncertainty. $\rho_i$ đo phần disagreement vượt trên mức mà độ khó nội tại của step đã giải thích được. $\varepsilon_U$ là hằng số ổn định số, không phải một siêu tham số học được.
 
 \subsection{Step Weighting}
 \label{sec:weighting}
 
-Hai tín hiệu được chuẩn hóa z-score trong phạm vi từng mẫu, với $\mu$ và $\sigma$ lấy trên $S$ step của chính mẫu đó:
+$U_i$ và $\rho_i$ được chuẩn hóa z-score \emph{trong phạm vi từng mẫu} trước khi đưa vào hàm trọng số phi tuyến, với $\mu$ và $\sigma$ lấy trên $S$ step của chính mẫu đó:
 
 \begin{equation}
 \label{eq:zscore}
@@ -387,67 +415,138 @@ Hai tín hiệu được chuẩn hóa z-score trong phạm vi từng mẫu, vớ
 \qquad
 \hat{\rho}_i = \frac{\rho_i - \mu_\rho}{\sigma_\rho}.
 \end{equation}
+Nếu $S\le 1$ hoặc $\sigma=0$ thì z-score tương ứng bằng $0$.
 
 Trọng số của reasoning step là
 
 \begin{equation}
 \label{eq:w}
-w_i = 1 + \lambda_U \tanh(\hat{U}_i) + \lambda_D \tanh(\hat{\rho}_i).
+w_i = 1 + \lambda_U \tanh(\hat{U}_i) + \lambda_D \tanh(\hat{\rho}_i),
+\qquad
+w_i \leftarrow \max(w_i,\,\varepsilon_w),
 \end{equation}
-
-Các step có uncertainty cao hoặc mức disagreement tương đối cao nhận trọng số lớn hơn; những step mà toàn hội đồng đều tự tin và đồng thuận nhận trọng số nhỏ hơn. Hàm tanh chặn $w_i$ trong khoảng $[1-\lambda_U-\lambda_D,\; 1+\lambda_U+\lambda_D]$.
+với $\varepsilon_w = 10^{-6}$. Các step có uncertainty cao hoặc mức disagreement tương đối cao nhận trọng số lớn hơn; những step mà toàn hội đồng đều tự tin và đồng thuận nhận trọng số nhỏ hơn. Hàm tanh chặn $w_i$ trong khoảng $[1-\lambda_U-\lambda_D,\; 1+\lambda_U+\lambda_D]$ trước khi kẹp dưới. $\lambda_U$ và $\lambda_D$ là siêu tham số (không suy ra analytic); cấu hình mặc định dùng
+\begin{equation}
+\label{eq:lambdadefault}
+\lambda_U = 0.5,\qquad \lambda_D = 0.5.
+\end{equation}
 
 \subsection{Khởi tạo Student thông qua Model Merging}
 \label{sec:merging}
 
-Trong quá trình chưng cất (distillation), thay vì khởi tạo student $\tilde\theta$ từ nhiễu ngẫu nhiên, ta tận dụng trực tiếp tri thức của $M$ experts đã được phân hóa mạnh mẽ ở Phase 1 bằng cách hợp nhất (merge) chúng lại. Điều này cung cấp một điểm xuất phát tối ưu hơn cho quá trình huấn luyện tiếp theo.
+Thay vì khởi tạo student $\tilde\theta$ từ nhiễu ngẫu nhiên, ta hợp nhất $M$ expert Phase 1 thành \emph{một} adapter LoRA hạng $r$. Merge không cộng $A_m$ và $B_m$ riêng rẽ. Toán tử chuẩn gồm ba bước.
 
-Tuy nhiên, do các cơ chế phân hóa ở Phase 1 chủ động đẩy các expert ra những vùng tham số khác nhau, việc cộng gộp trực tiếp dễ gây ra hiện tượng can nhiễu (interference), khiến các thành phần trọng số triệt tiêu hoặc làm nhiễu lẫn nhau. Để giải quyết vấn đề này, phương pháp đề xuất thử nghiệm các kỹ thuật Model Merging khác nhau nhằm tìm ra chiến lược khởi tạo tốt nhất:
-
-\begin{itemize}
-    \item \textbf{TA (Task Arithmetic):} Cộng trực tiếp các tensor trọng số của expert (không xử lý interference).
-    \item \textbf{TIES:} Loại bỏ các tham số dư thừa (trim) và giải quyết xung đột dấu (sign consensus).
-    \item \textbf{DARE-TIES:} Lược bỏ ngẫu nhiên (random sparsify) kết hợp rescale trước khi áp dụng TIES.
-    \item \textbf{TSV:} Trực giao hóa các hướng kỳ dị (orthogonalize singular directions) thông qua phân tích SVD.
-    \item \textbf{Iso-C:} Điều chỉnh phổ kỳ dị (singular spectrum) của trọng số đã hợp nhất để duy trì tính đẳng hướng.
-\end{itemize}
-
-Student $\tilde\theta$ được khởi tạo bằng một hàm merge $\mathcal{F}_{merge}$:
+\paragraph{Bước 1 --- Tái tạo task vector.}
+Với mỗi expert $m$ và mỗi mô-đun $\ell$,
 \begin{equation}
-\tilde\theta = \mathcal{F}_{merge}(\phi_1, \phi_2, \dots, \phi_M), \qquad \mathcal{F}_{merge} \in \{\text{TA, TIES, DARE-TIES, TSV, Iso-C}\}.
+\label{eq:deltaw}
+\Delta W_m^{(\ell)} = s\, B_m^{(\ell)} A_m^{(\ell)}, \qquad s=\alpha/r.
 \end{equation}
+
+\paragraph{Bước 2 --- Trung bình các expert.}
+\begin{equation}
+\label{eq:deltawbar}
+\overline{\Delta W}^{(\ell)}
+=
+\frac{1}{M}\sum_{m=1}^{M} \Delta W_m^{(\ell)}.
+\end{equation}
+
+\paragraph{Bước 3 --- Nén hạng $r$ bằng truncated SVD.}
+\begin{equation}
+\label{eq:merge}
+\Delta W_{\mathrm{merge}}^{(\ell)}
+=
+\operatorname{TruncSVD}_{r}\!\left(
+\overline{\Delta W}^{(\ell)}
+\right)
+=
+\operatorname{TruncSVD}_{r}\!\left(
+\frac{1}{M}\sum_{m=1}^{M}\Delta W_m^{(\ell)}
+\right).
+\end{equation}
+Đây là \emph{mean task-vector aggregation} rồi \emph{rank-$r$ truncated-SVD compression}, không phải tổng thô $\sum_m\Delta W_m$ và không phải cộng trực tiếp các nhân tử LoRA.
+
+Cho $\overline{\Delta W}/s = U\Sigma V^{\top}$. Giữ $r$ thành phần hàng đầu và tách lại thành LoRA hiệu dụng sao cho $s\, B_{\mathrm{eff}} A_{\mathrm{eff}} \approx \Delta W_{\mathrm{merge}}$:
+\begin{equation}
+\label{eq:loraeff}
+B_{\mathrm{eff}} = U_r \Sigma_r,
+\qquad
+A_{\mathrm{eff}} = V_r^{\top}.
+\end{equation}
+(Một phân rã tương đương $B_{\mathrm{eff}} = U_r\Sigma_r^{1/2}/\sqrt{s}$, $A_{\mathrm{eff}} = \Sigma_r^{1/2} V_r^{\top}/\sqrt{s}$ cho cùng $\Delta W$.) Sau merge,
+\begin{equation}
+\label{eq:winferenceinit}
+W_{\mathrm{init}}^{(\ell)} = W_{\mathrm{base}}^{(\ell)} + \Delta W_{\mathrm{merge}}^{(\ell)}.
+\end{equation}
+Chỉ còn một LoRA hiệu dụng; student $\tilde\theta = \{(A_{\mathrm{eff}}^{(\ell)}, B_{\mathrm{eff}}^{(\ell)})\}_{\ell}$ được train tiếp ở Mục~\ref{sec:sft}.
+
+Các biến thể TIES, DARE-TIES, TSV và Iso-C vẫn có trong mã nguồn như ablation: chúng thay bước trung bình bằng một aggregator khác trên cùng các $\Delta W_m$, rồi vẫn nén về hạng $r$ như \eqref{eq:loraeff}. Toán tử mặc định và toán tử được dùng trong lập luận chính là \eqref{eq:merge}.
 
 \subsection{Hàm mục tiêu Weighted Distillation}
 \label{sec:sft}
 
-Sau khi student $\tilde\theta$ được khởi tạo, quá trình chưng cất tri thức từ hội đồng được thực hiện thông qua việc tối ưu $\tilde\theta$ trực tiếp trên tập dữ liệu gốc, nhưng sử dụng hàm mất mát NLL có trọng số step. 
+Sau khi student $\tilde\theta$ được khởi tạo, Phase 2 tối ưu $\tilde\theta$ trên dữ liệu gốc bằng NLL có trọng số step. Phase 2 \emph{không} thêm KL teacher--student: không có số hạng $\KL(p_T\Vert p_S)$. Đây là \emph{selective step reweighting} của NLL student, không phải distillation phân phối cổ điển.
 
-Dù không sử dụng hàm mất mát phân phối trung gian (như KL divergence) theo chuẩn Knowledge Distillation truyền thống, quá trình này vẫn mang bản chất của sự chưng cất tri thức (distillation). Lý do là mô hình student đang học cách mô phỏng lại ``sự chú ý'' và mức độ đánh giá (meta-knowledge) của hội đồng expert đối với từng reasoning step thông qua tín hiệu trọng số $w_i$.
-
-Số hạng NLL tái sử dụng nguyên trọng số $w_i$ đã tính ở \eqref{eq:w}, áp lên NLL của chính $\tilde\theta$ (ký hiệu $\mathcal{L}_i^{(\tilde\theta)}$), chuẩn hóa trên tổng trọng số của chuỗi suy luận:
-
+Trọng số $w_i$ chỉ tác động lên reasoning steps. Khối đáp án và khối định dạng luôn-on, mỗi khối có trọng số $1$ và NLL chuẩn hóa độ dài riêng:
+\begin{equation}
+\mathcal{L}_{\mathrm{ans}}^{(\tilde\theta)}
+=
+-\frac{1}{T_{\mathrm{ans}}}\sum_{t\in\mathrm{answer}}
+\log p_{\tilde\theta}(y_t\mid y_{<t},x),
+\qquad
+\mathcal{L}_{\mathrm{fixed}}^{(\tilde\theta)}
+=
+-\frac{1}{T_{\mathrm{fixed}}}\sum_{t\in\mathrm{format}}
+\log p_{\tilde\theta}(y_t\mid y_{<t},x),
+\end{equation}
+khi sample có token thuộc khối đó. Gọi $\mathcal{R}$ là tập reasoning step của sample. Thành phần reasoning có trọng số là
 \begin{equation}
 \label{eq:nllstudent}
-\widetilde{\mathcal{L}}_{NLL} = \frac{\sum_{i=1}^{S} w_i\, \mathcal{L}_i^{(\tilde\theta)}}{\sum_{i=1}^{S} w_i}.
+\mathcal{L}_{\mathrm{reasoning}}^{(w)}
+=
+\frac{\sum_{i\in\mathcal{R}} w_i\, \mathcal{L}_i^{(\tilde\theta)}}{\sum_{i\in\mathcal{R}} w_i}.
 \end{equation}
-
-Hàm mục tiêu đầy đủ cho Phase 2 đơn thuần là tối ưu hóa hàm NLL có trọng số này:
-
+Hàm mục tiêu Phase 2 \emph{không} dừng ở \eqref{eq:nllstudent}. Answer và format vẫn được huấn luyện, nhưng không nhân $w_i$. Trên một sample (và khi gộp batch: cộng tử số và mẫu số), hiện thực hóa dùng một lần chuẩn hóa chung: mỗi reasoning step đóng góp $w_i$ đơn vị, mỗi khối always-on đóng góp $1$ đơn vị,
 \begin{equation}
 \label{eq:phase2loss}
-\mathcal{L}_{Phase2} = \widetilde{\mathcal{L}}_{NLL}.
+\mathcal{L}_{Phase2}
+=
+\frac{
+\sum_{i\in\mathcal{R}} w_i\, \mathcal{L}_i^{(\tilde\theta)}
++
+\mathcal{L}_{\mathrm{ans}}^{(\tilde\theta)}
++
+\mathcal{L}_{\mathrm{fixed}}^{(\tilde\theta)}
+}{
+\sum_{i\in\mathcal{R}} w_i
++
+\mathbf{1}_{\mathrm{ans}}
++
+\mathbf{1}_{\mathrm{fixed}}
+}.
 \end{equation}
+Đây không phải tổng vô hướng $\mathcal{L}_{\mathrm{reasoning}}^{(w)}+\mathcal{L}_{\mathrm{ans}}+\mathcal{L}_{\mathrm{fixed}}$, vì tổng đó sẽ đếm cả khối reasoning bằng $1$ thay vì $\sum_i w_i$.
+
+Tóm lại,
+\begin{equation}
+\label{eq:distill}
+\mathcal{L}_{\mathrm{distill}} = \mathcal{L}_{Phase2}
+\end{equation}
+là NLL student đã reweight, không có KL.
 
 \subsection{Suy luận}
 \label{sec:inference}
 
-Kết thúc quá trình huấn luyện Phase 2, student $\tilde\theta$ đóng vai trò là một adapter LoRA độc lập duy nhất. Tham số của nó có thể được gộp tĩnh (merged tĩnh) vào base model theo đúng cách cộng tính:
-
+Kết thúc Phase 2, student $\tilde\theta$ là một adapter LoRA hạng $r$ duy nhất. Tham số được gộp tĩnh vào base model:
 \begin{equation}
 \label{eq:weffstudent}
-W_{eff}^{(\ell)} = W_{base}^{(\ell)} + s\,\tilde B^{(\ell)} \tilde A^{(\ell)}, \qquad \ell \in \mathcal M.
+W_{\mathrm{eff}}^{(\ell)}
+=
+W_{\mathrm{base}}^{(\ell)} + \Delta W_{\mathrm{merge}}^{(\ell)}
+=
+W_{\mathrm{base}}^{(\ell)} + s\,\tilde B^{(\ell)} \tilde A^{(\ell)},
+\qquad \ell \in \mathcal M.
 \end{equation}
-
-Việc sinh văn bản từ $\tilde\theta$ trong quá trình inference đạt hiệu quả tính toán tối đa vì số lượng tham số tại thời điểm suy luận bằng đúng base model cộng với một adapter LoRA hạng $r$ duy nhất, loại bỏ hoàn toàn hệ thống multi-adapter.
+Số lượng tham số lúc sinh văn bản bằng base model cộng một LoRA hạng $r$; không giữ multi-adapter.
 
 \end{document}

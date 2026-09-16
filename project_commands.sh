@@ -16,9 +16,9 @@ Commands:
   prepare       Download/read and preprocess s1K-1.1.
   stage1        Train the five GAC-CoT LoRA experts.
   publish-stage1 Publish completed Stage-1 LoRA experts to Hugging Face.
-  supervision  Build PAG, importance, teacher features, weights, and medoid.
-  cache         Compile Top-512 plus tail-bucket teacher targets.
-  stage2        Train the single medoid-initialized student adapter.
+  supervision  Build PAG, importance, council U/V/ρ, teacher weights, and medoid.
+  cache         Optional Top-512 plus tail-bucket teacher targets (not used by Stage 2).
+  stage2        Merge Stage-1 experts and train the weighted-NLL student.
   evaluate      Generate and grade the P-ALIGN benchmark suite.
   smoke         Tiny Qwen2.5-0.5B-Instruct run of setup/tests/full pipeline.
   test          Run local unit tests without downloading a model.
@@ -28,8 +28,8 @@ Commands:
 
 Environment overrides:
   NPROC_PER_NODE, PYTHON_BIN, DATA_CONFIG, STAGE1_CONFIG,
-  SIGNALS_CONFIG, STAGE2_CONFIG, EVAL_CONFIG, STAGE1_RESUME,
-  STAGE2_RESUME, HF_HUB_OFFLINE.
+  SIGNALS_CONFIG, STAGE2_CONFIG, CACHE_CONFIG, EVAL_CONFIG, STAGE1_RESUME,
+  STAGE2_RESUME, STAGE2_MERGE_METHOD, HF_HUB_OFFLINE.
   HF_REPO_ID, HF_REPO_PRIVATE, HF_TOKEN (or Hugging Face CLI login).
 EOF
 }
@@ -52,7 +52,6 @@ case "$command" in
     run_step 10_prepare_data.sh
     run_step 20_train_stage1.sh
     run_step 30_build_supervision.sh
-    run_step 40_build_teacher_cache.sh
     run_step 50_train_stage2.sh
     run_step 60_evaluate.sh
     ;;

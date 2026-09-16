@@ -10,6 +10,6 @@ configs:
   data: configs/data/s1k_1_1.yaml
   stage1: configs/stage1/qwen25_7b_m5.yaml
   signals: configs/signals/main.yaml
-  stage2: configs/stage2/qwen25_7b_top512_tail.yaml
+  stage2: configs/stage2/qwen25_7b.yaml
   evaluation: configs/eval/p_align.yaml
 

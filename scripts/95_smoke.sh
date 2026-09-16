@@ -3,7 +3,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 # Tiny Qwen2.5-0.5B-Instruct inputs, then the real README `full` command:
-# setup -> test -> prepare -> stage1 -> supervision -> cache -> stage2 -> evaluate.
+# setup -> test -> prepare -> stage1 -> supervision -> stage2 -> evaluate.
 
 SMOKE_PREPARED="${SMOKE_PREPARED:-artifacts/prepared/s1k_1_1/data.jsonl}"
 SMOKE_RECORDS="${SMOKE_RECORDS:-8}"

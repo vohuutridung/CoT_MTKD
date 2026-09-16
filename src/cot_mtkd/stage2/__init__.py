@@ -1,1 +1,1 @@
-"""Sparse-target compilation and dual-source student training."""
+"""Council-weighted reasoning distillation via model merging."""

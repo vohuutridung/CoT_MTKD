@@ -412,31 +412,17 @@ Candidate IDs được **detach**, do đó không backprop qua:
 
 ## 6.3 Feature DPP trên support
 
-Gọi:
+Gọi $z^{(m)}_t$ là logits đầy đủ của expert $m$ tại token $t$. DPP **không** softmax lại trên support:
 
 $$
-\ell_{m,t}[\mathcal{S}_t]
-\in
-\mathbb{R}^{|\mathcal{S}_t|}
-$$
-
-là logits của expert $m$ trên support.
-
-Các vị trí ngoài mask được padding bằng $-\infty$, tương ứng feature bằng $0$.
-
-Soft-positive feature:
-
-$$
-u_{m,t,j}
+\hat p^{(m)}_t = \operatorname{softmax}(z^{(m)}_t),
+\qquad
+\hat p^{(m)}_{t,\mathcal{S}_t}
 =
-\exp
-\left(
-\ell_{m,t}(v_j)
--
-\max_{j' \in \mathcal{S}_t}
-\ell_{m,t}(v_{j'})
-\right)
+\left[\hat p^{(m)}_t\right]_{\mathcal{S}_t}
 $$
+
+tức $\log \hat p_c = z_c - \operatorname{logsumexp}(z_{\mathrm{full}})$. Các vị trí padding của mask là $0$ sau khi lấy xác suất.
 
 L2-normalization:
 
@@ -444,9 +430,9 @@ $$
 z_{m,t}
 =
 \frac{
-u_{m,t}
+\hat p^{(m)}_{t,\mathcal{S}_t}
 }{
-\|u_{m,t}\|_2
+\|\hat p^{(m)}_{t,\mathcal{S}_t}\|_2
 }
 $$
 
@@ -581,7 +567,7 @@ $$
 
 ## 6.6 Gradient path
 
-Probe tính:
+Probe tính
 
 $$
 \frac{
@@ -589,21 +575,21 @@ $$
 \mathcal{L}_{\mathrm{DPP}}
 }{
 \partial
-\ell_m[\mathcal{S}]
+\log \hat p_m[\mathcal{S}]
 }
 $$
 
-trên support logits.
+với $\log \hat p_c = z_c - \operatorname{logsumexp}(z_{\mathrm{full}})$.
 
 Candidate IDs và support membership được detach.
 
 Replay expert $m$ sử dụng:
 
 ```text
-support_vjp_hidden_gradient
+support_logprob_vjp_hidden_gradient
 ```
 
-để đưa gradient từ support logits về hidden representation, sau đó dùng autograd để truyền gradient xuống LoRA parameters.
+để đưa cotangent đó về hidden representation (VJP đi qua softmax đầy đủ), sau đó autograd xuống LoRA.
 
 Điều này tương đương:
 
@@ -883,7 +869,7 @@ G_t
 Z_tZ_t^\top
 $$
 
-và $Z_t$ là L2-normalized soft-features trên council Top-$k_t$ sau khi loại $y_t$.
+và $Z_t$ là L2-normalized $\operatorname{softmax}(z_{\mathrm{full}})[\mathcal{S}_t]$ trên council Top-$k_t$ sau khi loại $y_t$.
 
 Potential:
 
@@ -1056,9 +1042,8 @@ Hoặc publish thủ công:
 
 | Stage         | Phụ thuộc Stage 1                                              |
 | ------------- | -------------------------------------------------------------- |
-| `supervision` | Load 5 adapters → PAG / importance / teacher features / medoid |
-| `cache`       | Teacher Top-512 + tail targets từ council experts              |
-| `stage2`      | Student LoRA khởi tạo từ **medoid** expert; distill mixture    |
+| `supervision` | Load 5 adapters → $U_i$ / $V_i$ / PAG / teacher features |
+| `stage2`      | Merge experts (TA/TIES/…) → student; weighted NLL        |
 
 Stage 1 chỉ sinh một **hội đồng experts đa dạng**.
 
@@ -1075,8 +1060,8 @@ Distillation vào một student adapter diễn ra ở Stage 2.
 | `src/cot_mtkd/stage1/kneedle.py`      | Council full-vocabulary Kneedle → support       |
 | `src/cot_mtkd/stage1/dpp.py`          | Normalized features, $-\log\det$, reduction     |
 | `src/cot_mtkd/stage1/grassmann.py`    | $d^2$, kernel, $F_{\mathrm{rep}}$               |
-| `src/cot_mtkd/stage1/gac_gradient.py` | Ghép $g_{\mathrm{data}}$; apply Grassmann force |
-| `src/cot_mtkd/models/chunked_head.py` | Chunked CE / support logits / VJP               |
+| `src/cot_mtkd/stage1/gac_gradient.py` | $g_{\mathrm{data}}$; Grassmann force. `stable_gac_gradients` là legacy, không vào vòng train |
+| `src/cot_mtkd/models/chunked_head.py` | Chunked CE / full-vocab log $p_{\mathcal C}$ / VJP |
 
 ---
 
@@ -1101,9 +1086,9 @@ for each optimizer step:
 
         support[t] = support[t] - {ground_truth[t]}
 
-        compute DPP loss on support[t]
+        compute DPP on L2(softmax(z_full)[support[t]])
 
-        compute dL_DPP / d logits_m[support[t]]
+        compute dL_DPP / d log p_m[support[t]]
 
     # ---------------------------------------------------------
     # 2. Replay
@@ -1227,4 +1212,4 @@ $$
 
 được áp dụng trực tiếp lên LoRA parameters sau AdamW.
 
-Kết quả cuối cùng là một council gồm **5 LoRA experts** vừa fit tốt CoT, vừa đa dạng ở token space, vừa được tách trong parameter subspace để sử dụng cho supervision, cache và Stage 2 distillation.
+Kết quả cuối cùng là một council gồm **5 LoRA experts** vừa fit tốt CoT, vừa đa dạng ở token space, vừa được tách trong parameter subspace để đo $U_i,V_i$ và merge thành student ở Stage 2.

@@ -1,6 +1,6 @@
 # Cấu hình huấn luyện (7B)
 
-Nguồn: `configs/stage1/qwen25_7b_m5.yaml`, `configs/stage2/qwen25_7b_top512_tail.yaml`, `configs/data/s1k_1_1.yaml`.
+Nguồn: `configs/stage1/qwen25_7b_m5.yaml`, `configs/stage2/qwen25_7b.yaml`, `configs/data/s1k_1_1.yaml`.
 
 Model: `Qwen/Qwen2.5-7B-Instruct` · seed `42` · dtype `bfloat16`.
 
@@ -32,12 +32,12 @@ LoRA này dùng chung cho 5 expert Stage 1 và student Stage 2.
 | Max Sequence Length | 32,768 | 32,768 |
 | Learning Rate (LR) | **5.00e-05** | **2.00e-05** |
 | Max grad norm | 1.0 | 1.0 |
-| Số expert | 5 | 1 (init từ medoid) |
+| Số expert | 5 | 1 (init từ merge) |
 | Step dropout | 0.20 | — |
 | Diversity weight (DPP) | 0.2 | — |
 | Repulsion weight (Grassmann) | 1.0 | — |
-| Hard loss weight | — | 1.0 |
-| KD loss weight | — | 1.0 |
+| Merge method | — | `ta` (ablate: ties, dare_ties, tsv, iso_c) |
+| $\lambda_U$ / $\lambda_D$ | — | 0.5 / 0.5 |
 
 Effective batch = `micro_batch_size × world_size × accumulation` = 1 × 1 × 8 = **8**.
 

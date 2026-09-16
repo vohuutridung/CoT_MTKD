@@ -10,7 +10,7 @@ from ..models.chunked_head import (
     decoder_and_lm_head,
     forward_hidden,
     full_vocab_probe,
-    gather_support_logits,
+    gather_support_log_probabilities,
 )
 from ..models.multi_adapter import set_active_adapter
 from ..stage1.dpp import marginal_log_uniqueness, normalized_support_features
@@ -23,6 +23,8 @@ class PredictiveSignals:
     agreement: torch.Tensor
     uniqueness: torch.Tensor
     js_disagreement: torch.Tensor
+    mean_uncertainty: torch.Tensor
+    relative_disagreement: torch.Tensor
     token_counts: torch.Tensor
     answer_competence: torch.Tensor
     answer_agreement: torch.Tensor
@@ -65,12 +67,13 @@ def _stream_full_vocab_statistics(
     chunk_tokens: int,
     feature_temperature: float,
     medoid_temperature: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     expert_count = len(hidden_by_expert)
     token_count = hidden_by_expert[0].shape[0]
     nll = torch.empty((expert_count, token_count), dtype=torch.float32)
     agreement_kl = torch.empty((expert_count, token_count), dtype=torch.float32)
     js = torch.empty(token_count, dtype=torch.float32)
+    mean_entropy = torch.empty(token_count, dtype=torch.float32)
     medoid_sum = torch.zeros(expert_count, dtype=torch.float64)
     device = next(head.parameters()).device
     dtype = next(head.parameters()).dtype
@@ -103,6 +106,13 @@ def _stream_full_vocab_statistics(
                 .clamp_min(0.0)
             )
             js[start:end] = js_chunk.cpu()
+            entropy = torch.stack(
+                [
+                    -(prob * logprob).sum(dim=-1)
+                    for prob, logprob in zip(p1, logp1, strict=True)
+                ]
+            ).mean(dim=0)
+            mean_entropy[start:end] = entropy.cpu()
             for expert in range(expert_count):
                 leave_one_out = (sum_probabilities - p1[expert]) / (expert_count - 1)
                 kl = (
@@ -130,7 +140,7 @@ def _stream_full_vocab_statistics(
                     .double()
                     .cpu()
                 )
-    return nll, agreement_kl, js, medoid_sum
+    return nll, agreement_kl, js, mean_entropy, medoid_sum
 
 
 def _dpp_uniqueness(
@@ -176,15 +186,17 @@ def _dpp_uniqueness(
     )
     support, support_mask = build_union_support(torch.stack(ids_by_expert), selected_k)
     device = next(head.parameters()).device
-    logits = torch.stack(
+    log_probabilities = torch.stack(
         [
-            gather_support_logits(
+            gather_support_log_probabilities(
                 hidden, head, support, chunk_tokens, output_device=device
             )
             for hidden in hidden_by_expert
         ]
     )
-    features = normalized_support_features(logits, support_mask.to(device))
+    features = normalized_support_features(
+        log_probabilities, support_mask.to(device)
+    )
     uniqueness: list[torch.Tensor] = []
     step_ids_device = step_ids.to(device)
     for step in steps:
@@ -211,7 +223,7 @@ def score_predictive_signals(
         model, adapter_names, record, valid, device
     )
     _, head = decoder_and_lm_head(model)
-    nll, agreement_kl, js, medoid_sum = _stream_full_vocab_statistics(
+    nll, agreement_kl, js, mean_entropy, medoid_sum = _stream_full_vocab_statistics(
         hidden_by_expert,
         head,
         targets,
@@ -237,12 +249,14 @@ def score_predictive_signals(
     competence_rows: list[torch.Tensor] = []
     agreement_rows: list[torch.Tensor] = []
     js_rows: list[torch.Tensor] = []
+    uncertainty_rows: list[torch.Tensor] = []
     token_counts: list[int] = []
     for step in unique_steps:
         mask = reasoning_mask & steps_cpu.eq(step)
         competence_rows.append(-nll[:, mask].mean(dim=-1))
         agreement_rows.append(-agreement_kl[:, mask].mean(dim=-1))
         js_rows.append(js[mask].mean())
+        uncertainty_rows.append(mean_entropy[mask].mean())
         token_counts.append(int(mask.sum().item()))
     competence = (
         torch.stack(competence_rows)
@@ -259,11 +273,20 @@ def score_predictive_signals(
         answer_mask = regions_cpu.eq(int(TokenRegion.ANSWER_MARKER)) | regions_cpu.eq(
             int(TokenRegion.EOS)
         )
+    disagreement = torch.stack(js_rows) if js_rows else torch.empty(0)
+    mean_uncertainty = (
+        torch.stack(uncertainty_rows) if uncertainty_rows else torch.empty(0)
+    )
+    relative = torch.empty(0)
+    if mean_uncertainty.numel():
+        relative = disagreement.clamp_min(0.0) / mean_uncertainty.clamp_min(1.0e-6)
     return PredictiveSignals(
         competence=competence,
         agreement=agreement,
         uniqueness=uniqueness,
-        js_disagreement=torch.stack(js_rows) if js_rows else torch.empty(0),
+        js_disagreement=disagreement,
+        mean_uncertainty=mean_uncertainty,
+        relative_disagreement=relative,
         token_counts=torch.tensor(token_counts, dtype=torch.float32),
         answer_competence=-nll[:, answer_mask].mean(dim=-1),
         answer_agreement=-agreement_kl[:, answer_mask].mean(dim=-1),

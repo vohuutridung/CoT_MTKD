@@ -220,6 +220,9 @@ def build_supervision(
                 "group_gain": _as_list(importance_parts["group_gain"]),
                 "gain_consensus": _as_list(importance_parts["gain_consensus"]),
                 "js_disagreement": _as_list(predictive.js_disagreement),
+                "mean_uncertainty": _as_list(predictive.mean_uncertainty),
+                "disagreement": _as_list(predictive.js_disagreement),
+                "relative_disagreement": _as_list(predictive.relative_disagreement),
                 "standardized_group_gain": _as_list(
                     importance_parts["standardized_gain"]
                 ),

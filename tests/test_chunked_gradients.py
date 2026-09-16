@@ -7,10 +7,11 @@ import torch.nn.functional as F
 
 from cot_mtkd.models.chunked_head import (
     cross_entropy_hidden_gradient,
+    gather_support_log_probabilities,
+    support_logprob_vjp_hidden_gradient,
     support_vjp_hidden_gradient,
 )
-from cot_mtkd.stage2.losses import dual_source_hidden_gradients
-from cot_mtkd.stage2.tail_kl import sparse_topk_with_tail, tail_bucket_kl
+from cot_mtkd.stage1.dpp import normalized_support_features
 from cot_mtkd.utils.seed import deterministic_rng
 
 
@@ -36,6 +37,54 @@ class ChunkedGradientTest(unittest.TestCase):
         self.assertAlmostEqual(float(loss), float(dense_loss.detach()), places=5)
         self.assertEqual(count, self.hidden.shape[0])
 
+    def test_support_logprob_matches_full_vocab_softmax_slice(self) -> None:
+        support = torch.stack([torch.randperm(19)[:5] for _ in range(9)])
+        mask = torch.ones(9, 5, dtype=torch.bool)
+        mask[:, -1] = False
+        log_p = gather_support_log_probabilities(
+            self.hidden, self.head, support, chunk_tokens=4
+        )
+        dense = F.log_softmax(self.head(self.hidden).float(), dim=-1)
+        expected = dense.gather(-1, support)
+        self.assertTrue(torch.allclose(log_p, expected, atol=1e-6, rtol=1e-5))
+
+        candidate_softmax = F.softmax(
+            self.head(self.hidden).float().gather(-1, support).masked_fill(
+                ~mask, -torch.inf
+            ),
+            dim=-1,
+        )
+        self.assertFalse(
+            torch.allclose(
+                log_p.exp().masked_fill(~mask, 0.0),
+                candidate_softmax.masked_fill(~mask, 0.0),
+                atol=1e-5,
+            )
+        )
+
+        features = normalized_support_features(log_p.unsqueeze(0), mask)
+        full_slice = dense.exp().gather(-1, support).masked_fill(~mask, 0.0)
+        expected_features = full_slice / full_slice.norm(dim=-1, keepdim=True).clamp_min(
+            1.0e-12
+        )
+        self.assertTrue(
+            torch.allclose(features[0], expected_features, atol=1e-6, rtol=1e-5)
+        )
+
+    def test_support_logprob_vjp_matches_direct_autograd(self) -> None:
+        support = torch.stack([torch.randperm(19)[:5] for _ in range(9)])
+        cotangent = torch.randn(9, 5)
+        gradient = support_logprob_vjp_hidden_gradient(
+            self.hidden, self.head, support, cotangent, chunk_tokens=4
+        )
+        dense_hidden = self.hidden.detach().requires_grad_(True)
+        logits = self.head(dense_hidden).float()
+        log_p = logits.gather(-1, support) - torch.logsumexp(logits, dim=-1, keepdim=True)
+        dense_gradient = torch.autograd.grad((log_p * cotangent).sum(), dense_hidden)[0]
+        self.assertTrue(
+            torch.allclose(gradient, dense_gradient, atol=1.0e-6, rtol=1.0e-5)
+        )
+
     def test_support_vjp_matches_direct_autograd(self) -> None:
         support = torch.stack([torch.randperm(19)[:5] for _ in range(9)])
         cotangent = torch.randn(9, 5)
@@ -48,48 +97,52 @@ class ChunkedGradientTest(unittest.TestCase):
             (selected * cotangent).sum(), dense_hidden
         )[0]
         self.assertTrue(
-            torch.allclose(gradient, dense_gradient, atol=1.0e-6, rtol=1.0e-5)
+            torch.allclose(gradient, dense_gradient, atol=1.0e-6, rtol=1e-5)
         )
 
-    def test_dual_source_chunking_matches_dense_autograd(self) -> None:
-        hard_weights = torch.linspace(0.25, 1.75, self.hidden.shape[0])
-        teacher = torch.softmax(torch.randn(9, 19) / 2.0, dim=-1)
-        support, teacher_top, teacher_tail = sparse_topk_with_tail(teacher, top_k=6)
-        hard_grad, kd_grad, hard_sum, kd_sum, hard_count, kd_count = (
-            dual_source_hidden_gradients(
-                self.hidden,
-                self.head,
-                self.targets,
-                hard_weights,
-                support,
-                teacher_top,
-                teacher_tail,
-                temperature=2.0,
-                epsilon=1.0e-8,
-                chunk_tokens=3,
-            )
-        )
+    def test_two_pass_logprob_replay_matches_direct_parameter_gradient(self) -> None:
+        torch.manual_seed(29)
+        projection = torch.nn.Linear(6, 7)
+        dropout = torch.nn.Dropout(0.35)
+        inputs = torch.randn(8, 6)
+        support = torch.stack([torch.randperm(19)[:4] for _ in range(8)])
+        seed = 4242
+        mask = torch.ones(8, 4, dtype=torch.bool)
 
-        dense_hidden = self.hidden.detach().requires_grad_(True)
-        logits = self.head(dense_hidden).float()
-        dense_hard = (
-            F.cross_entropy(logits, self.targets, reduction="none") * hard_weights
-        ).sum()
-        dense_kd = tail_bucket_kl(
-            logits, support, teacher_top, teacher_tail, temperature=2.0
-        ).sum()
-        expected_hard = torch.autograd.grad(
-            dense_hard, dense_hidden, retain_graph=True
+        with deterministic_rng(seed, torch.device("cpu")), torch.no_grad():
+            probe_hidden = dropout(projection(inputs))
+        logits = self.head(probe_hidden).float()
+        log_p = (
+            logits.gather(-1, support) - torch.logsumexp(logits, dim=-1, keepdim=True)
+        ).detach().requires_grad_(True)
+        features = normalized_support_features(log_p.unsqueeze(0), mask)
+        probe_loss = features.pow(2).sum()
+        logprob_cotangent = torch.autograd.grad(probe_loss, log_p)[0]
+
+        with deterministic_rng(seed, torch.device("cpu")):
+            replay_hidden = dropout(projection(inputs))
+        hidden_cotangent = support_logprob_vjp_hidden_gradient(
+            replay_hidden, self.head, support, logprob_cotangent, chunk_tokens=3
+        )
+        replay_gradient = torch.autograd.grad(
+            replay_hidden, projection.weight, grad_outputs=hidden_cotangent
         )[0]
-        expected_kd = torch.autograd.grad(dense_kd, dense_hidden)[0]
+
+        with deterministic_rng(seed, torch.device("cpu")):
+            direct_hidden = dropout(projection(inputs))
+            direct_logits = self.head(direct_hidden).float()
+            direct_log_p = direct_logits.gather(-1, support) - torch.logsumexp(
+                direct_logits, dim=-1, keepdim=True
+            )
+            direct_features = normalized_support_features(
+                direct_log_p.unsqueeze(0), mask
+            )
+            direct_loss = direct_features.pow(2).sum()
+        direct_gradient = torch.autograd.grad(direct_loss, projection.weight)[0]
+        self.assertTrue(torch.equal(probe_hidden, replay_hidden))
         self.assertTrue(
-            torch.allclose(hard_grad, expected_hard, atol=1.0e-6, rtol=1.0e-5)
+            torch.allclose(replay_gradient, direct_gradient, atol=1.0e-6, rtol=1.0e-5)
         )
-        self.assertTrue(torch.allclose(kd_grad, expected_kd, atol=1.0e-6, rtol=1.0e-5))
-        self.assertAlmostEqual(hard_sum, float(dense_hard.detach()), places=5)
-        self.assertAlmostEqual(kd_sum, float(dense_kd.detach()), places=5)
-        self.assertAlmostEqual(hard_count, float(hard_weights.sum()), places=6)
-        self.assertEqual(kd_count, self.hidden.shape[0])
 
     def test_two_pass_rng_replay_matches_direct_parameter_gradient(self) -> None:
         torch.manual_seed(29)

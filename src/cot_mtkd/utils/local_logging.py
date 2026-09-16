@@ -43,6 +43,7 @@ class JsonlLogger:
             "learning_rate",
             "mean_selected_k",
             "mean_grassmann_distance",
+            "nll",
             "hard_loss",
             "kd_loss",
             "total_loss",

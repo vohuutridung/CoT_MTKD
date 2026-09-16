@@ -1,1 +1,1 @@
-"""Offline group supervision and functional-medoid scoring."""
+"""Offline council uncertainty, disagreement, and teacher-signal construction."""
