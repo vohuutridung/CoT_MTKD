@@ -13,7 +13,7 @@ lora:
   dropout: 0.05
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 stage1:
-  num_experts: 5
+  num_experts: 3
   epochs: 3
   learning_rate: 5.0e-5
   micro_batch_size: 1
@@ -29,7 +29,7 @@ stage1:
   resume_from: null
 kneedle:
   probe_k: 512
-  min_k: 5
+  min_k: 3
   max_k: 128
 dpp:
   jitter: 1.0e-4

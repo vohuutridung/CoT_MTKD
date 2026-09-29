@@ -8,7 +8,7 @@ paths:
   evaluation: artifacts/evaluation/p_align
 configs:
   data: configs/data/s1k_1_1.yaml
-  stage1: configs/stage1/qwen25_7b_m5.yaml
+  stage1: configs/stage1/qwen25_7b_m3.yaml
   signals: configs/signals/main.yaml
   stage2: configs/stage2/qwen25_7b_top512_tail.yaml
   evaluation: configs/eval/p_align.yaml

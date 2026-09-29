@@ -1,6 +1,6 @@
 # GAC-CoT-MTKD
 
-Train five LoRA experts and distill them into one student adapter.
+Train three LoRA experts and distill them into one student adapter.
 
 ## Setup
 
@@ -56,7 +56,7 @@ STAGE2_RESUME=artifacts/stage2/main/checkpoint.pt ./project_commands.sh stage2
 
 ```bash
 DATA_CONFIG=configs/data/s1k_1_1.yaml ./project_commands.sh prepare
-STAGE1_CONFIG=configs/stage1/qwen25_7b_m5.yaml ./project_commands.sh stage1
+STAGE1_CONFIG=configs/stage1/qwen25_7b_m3.yaml ./project_commands.sh stage1
 SIGNALS_CONFIG=configs/signals/main.yaml ./project_commands.sh supervision
 STAGE2_CONFIG=configs/stage2/qwen25_7b_top512_tail.yaml ./project_commands.sh stage2
 EVAL_CONFIG=configs/eval/p_align.yaml ./project_commands.sh evaluate

@@ -8,7 +8,7 @@ from .common import parsed_config
 
 
 def main() -> None:
-    config = parsed_config("Train five good-and-diverse GAC-CoT LoRA experts")
+    config = parsed_config("Train three good-and-diverse GAC-CoT LoRA experts")
     distributed = initialize_distributed()
     configure_logging(distributed.rank)
     seed_everything(

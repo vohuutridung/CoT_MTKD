@@ -14,7 +14,7 @@ Usage: ./project_commands.sh COMMAND
 Commands:
   setup         Create .venv and install the local project.
   prepare       Download/read and preprocess s1K-1.1.
-  stage1        Train the five GAC-CoT LoRA experts.
+  stage1        Train the three GAC-CoT LoRA experts.
   supervision  Build PAG, importance, teacher features, weights, and medoid.
   cache         Compile Top-512 plus tail-bucket teacher targets.
   stage2        Train the single medoid-initialized student adapter.
