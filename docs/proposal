@@ -18,6 +18,17 @@
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{tabularx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{float}
+
+\algrenewcommand\algorithmicrequire{\textbf{Đầu vào}}
+\algrenewcommand\algorithmicfor{\textbf{lặp}}
+\algrenewcommand\algorithmicend{\textbf{hết}}
+\algrenewcommand\algorithmicif{\textbf{nếu}}
+\algrenewcommand\algorithmicthen{\textbf{thì}}
+\algrenewcommand\algorithmicelse{\textbf{ngược lại}}
+\algrenewcommand\algorithmicdo{}
 
 \hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=blue}
 
@@ -302,13 +313,68 @@ với $\eta_t$ là learning rate hiện tại của AdamW và $F_{rep}$ tính t�
 \subsection{Thuật toán một bước huấn luyện}
 \label{sec:p1algo}
 
-\begin{enumerate}
-\item Lấy mẫu $d_{i,s,m}$ cho từng expert; dựng các mask trọng số của \eqref{eq:sftmean}.
-\item \emph{(Probe)} Với mỗi expert chạy forward \texttt{no-grad} trên batch, thu logits tại các vị trí được chọn; tính $\mathcal L_{DPP\_div}$ và cotangent theo $\log\hat p^{(m)}_{\mathcal C}$.
-\item Với mỗi expert: forward có graph, backward cho $\mathcal L_{\mathrm{SFT}}^{(m)}+\lambda_{div}\langle\text{cotangent},\log\hat p^{(m)}_{\mathcal C}\rangle$.
-\item Cắt gradient, gọi \texttt{AdamW.step()}.
-\item Nếu $t\bmod n_{rep}=0$: tính lực từ snapshot tham số (Gram theo nhóm shape $\to$ $d^2$ $\to$ $h,K$ $\to$ $F_{rep}$ theo \eqref{eq:forceclosed}) và lưu vào bộ đệm; luôn áp $\eta_t\lambda_{rep}F_{rep}$ (bộ đệm) lên tham số.
-\end{enumerate}
+Một bước optimizer $t$ gom $G$ microbatch (gradient accumulation; cửa sổ cuối của run có thể ngắn hơn $G$). Mỗi expert giữ một trạng thái AdamW riêng. Thủ tục dưới đây là chế độ probe: DPP và SFT không nằm trên cùng một computation graph. Khi $n_{dpp}=1$ (mặc định), mỗi expert forward đúng hai lần trên mỗi microbatch.
+
+\begin{algorithm}[H]
+\caption{Một bước optimizer của Phase 1}
+\label{alg:phase1step}
+\begin{algorithmic}[1]
+\Require $\phi_1^t,\dots,\phi_M^t$; cửa sổ microbatch $\{\mathcal B_b\}_{b=1}^{G}$; learning rate $\eta_t$ của bước này
+\State $G_{\mathrm{SFT}}^{(m)}\leftarrow 0$,\;
+       $G_{\mathrm{DPP}}^{(m)}\leftarrow 0$,\;
+       $N_{\mathrm{SFT}}^{(m)}\leftarrow 0$,\;
+       $N_{\mathrm{DPP}}\leftarrow 0$
+\For{microbatch $\mathcal B_b$, $b=1,\dots,G$}
+    \If{$n_{dpp}>1$ và $t\bmod n_{dpp}\neq 0$}
+        \State Bỏ probe. Cotangent DPP bằng $0$; microbatch này chỉ còn forward của SFT
+    \Else
+        \For{expert $m=1,\dots,M$}
+            \State Forward \texttt{no-grad}, không áp dropout. Giữ hidden tại các token reasoning
+        \EndFor
+        \State Nếu $\pi_{dpp}<1$ (mặc định tắt), giữ ngẫu nhiên một phần các vị trí đó
+        \State Tính $\bar p$ theo \eqref{eq:pbar}, khuỷu Kneedle, rồi $\mathcal C=\mathcal V_k\setminus\{y^*\}$
+        \State $\log\hat p^{(m)}_c=z^{(m)}_c-\operatorname{logsumexp}(z^{(m)})$; dựng $\tilde v^{(m)}$ như Mục~\ref{sec:outputdiv}
+        \State Tính \eqref{eq:dppsteploss} trên các token có $|\mathcal C|>0$, cộng theo sample
+        \State $c^{(m)}\leftarrow \partial\mathcal L_{\mathrm{DPP}}/\partial\log\hat p^{(m)}_{\mathcal C}$, rồi tách khỏi graph
+    \EndIf
+    \For{expert $m=1,\dots,M$}
+        \State Forward có graph, cùng seed với probe của expert $m$ trên $\mathcal B_b$
+        \State Lấy $d_{i,s,m}$ theo \eqref{eq:graddropout} và trọng số token của \eqref{eq:sftmean}
+        \State Cộng gradient theo $\phi_m$ của tử số \eqref{eq:sftmean} vào $G_{\mathrm{SFT}}^{(m)}$
+        \State $N_{\mathrm{SFT}}^{(m)}$ tăng thêm số step reasoning được giữ, cộng khối đáp án và khối định dạng
+        \State Cộng VJP của $\langle c^{(m)},\log\hat p^{(m)}_{\mathcal C}\rangle$ vào $G_{\mathrm{DPP}}^{(m)}$
+    \EndFor
+    \State $N_{\mathrm{DPP}}$ tăng thêm số sample trong $\mathcal B_b$ có ít nhất một token $|\mathcal C|>0$
+\EndFor
+\State All-reduce mọi tổng gradient và mọi mẫu số giữa các rank
+\State $g_{\mathrm{SFT}}^{(m)}\leftarrow G_{\mathrm{SFT}}^{(m)}/\max(N_{\mathrm{SFT}}^{(m)},1)$
+\State $g_{\mathrm{DPP}}^{(m)}\leftarrow G_{\mathrm{DPP}}^{(m)}/\max(N_{\mathrm{DPP}},1)$
+\State $g_m\leftarrow g_{\mathrm{SFT}}^{(m)}+\lambda_{div}\,g_{\mathrm{DPP}}^{(m)}$
+\State Cắt $g_m$ theo chuẩn $\ell_2$ toàn cục về \texttt{max\_grad\_norm}. Không cắt $F_{rep}$
+\If{chưa có bộ đệm lực, hoặc $t\bmod n_{rep}=0$}
+    \State Chụp $(A_m^{(\ell)},B_m^{(\ell)})$ của cả $M$ expert, trước mọi \texttt{AdamW.step}
+    \State Gom các mô-đun cùng $(d_{in},d_{out})$. Gram và nghịch đảo ở fp32, dưới \texttt{no-grad}
+    \State Ridge $\tilde C_{pp}$, rồi $f_{pq}$, $d^2$, $h$ và $K$ (stop-gradient) như Mục~\ref{sec:rep}
+    \If{$t<t_B$ hoặc $\min_m\|B_m\|_F\le \tau_B$}
+        \State Chỉ phía $A$ đi vào \eqref{eq:grasstotal} và vào lực. Phía $B$ bằng $0$
+    \Else
+        \State Cộng phía $B$: tính lực trên $X=B^\top$, rồi chuyển vị về dạng của $B$
+    \EndIf
+    \State Ghi $F_{rep}(\phi_m^t)$ theo \eqref{eq:forceclosed} vào bộ đệm
+\Else
+    \State Giữ $F_{rep}$ đang có trong bộ đệm
+\EndIf
+\For{expert $m=1,\dots,M$}
+    \State $\phi_m\leftarrow\mathrm{AdamW}(\phi_m^t,g_m)$
+    \State $\phi_m\leftarrow \phi_m+\eta_t\lambda_{rep}F_{rep}$
+\EndFor
+\State Tiến lịch cosine warmup. Bước sau dùng learning rate mới
+\end{algorithmic}
+\end{algorithm}
+
+Ba chỗ cần đọc cùng \eqref{eq:phase1update}. Mẫu số của \eqref{eq:sftmean} và của \eqref{eq:dppsteploss} chỉ được chia sau khi cộng hết cửa sổ $G$ và all-reduce, nên $g_m$ là gradient của trung bình toàn cục, không phải trung bình của các gradient microbatch. $F_{rep}$ lấy từ một snapshot chung, chụp trước khi expert nào bước AdamW, nên lực đối xứng trên từng cặp. Khi $n_{rep}>1$, snapshot đó là lần làm tươi gần nhất, còn hệ số nhân vẫn là $\eta_t$ của bước hiện tại. Probe không lưu graph và không dùng mask dropout. Replay mới lấy $d_{i,s,m}$ và đưa cotangent về tham số LoRA. Weight decay nằm trong AdamW. Lực cộng sau \texttt{AdamW.step}, không đi vào trạng thái optimizer và không bị cắt chuẩn.
+
+Cổng $B$ trong thủ tục này yêu cầu đồng thời $t\ge t_B$ và $\min_m\|B_m\|_F>\tau_B$. $\tau_B$ mặc định bằng $0$, nên khởi tạo $B=0$ vẫn tắt phía $B$ cho đến khi cả hai điều kiện đúng. $\pi_{dpp}<1$, $n_{dpp}>1$ và trần Top-$k$ là các tuỳ chọn tắt mặc định, vì chúng đổi nhẹ tập token mà DPP nhìn thấy.
 
 \subsection{Siêu tham số, chẩn đoán và ablation}
 \label{sec:p1ablation}
