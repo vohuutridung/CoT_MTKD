@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm.auto import tqdm
 
 from ..data.collator import LongCoTCollator, shifted_token_views
 from ..data.dataset import JsonlRecordDataset, load_jsonl_files
@@ -396,7 +397,14 @@ def train_stage2(
 
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
-        for batch_index, raw_batch in enumerate(dataloader):
+        progress = tqdm(
+            dataloader,
+            desc=f"Stage 2 epoch {epoch + 1}/{epochs}",
+            disable=not distributed.is_main,
+            dynamic_ncols=True,
+            unit="batch",
+        )
+        for batch_index, raw_batch in enumerate(progress):
             if epoch == start_epoch and batch_index < start_batch:
                 continue
             batch = _batch_to_device(raw_batch, distributed.device)
@@ -470,6 +478,12 @@ def train_stage2(
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            if distributed.is_main:
+                progress.set_postfix(
+                    step=global_step,
+                    nll=f"{nll_mean:.3f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                )
             if (
                 distributed.is_main
                 and global_step % int(config["stage2"]["log_every_steps"]) == 0
@@ -525,6 +539,7 @@ def train_stage2(
             nll_total = 0.0
             weight_total = 0.0
             accumulated = 0
+        progress.close()
         start_batch = 0
         barrier()
 

@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm.auto import tqdm
 
 from ..data.collator import LongCoTCollator, shifted_token_views
 from ..data.dataset import JsonlRecordDataset
@@ -706,7 +707,14 @@ def train_stage1(
 
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
-        for batch_index, raw_batch in enumerate(dataloader):
+        progress = tqdm(
+            dataloader,
+            desc=f"Stage 1 epoch {epoch + 1}/{epochs}",
+            disable=not distributed.is_main,
+            dynamic_ncols=True,
+            unit="batch",
+        )
+        for batch_index, raw_batch in enumerate(progress):
             if epoch == start_epoch and batch_index < start_batch:
                 continue
             batch = _batch_to_device(raw_batch, distributed.device)
@@ -882,6 +890,21 @@ def train_stage1(
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            if distributed.is_main:
+                sft_nll = float(
+                    sum(
+                        losses[expert].item() / max(counts[expert].item(), 1.0)
+                        for expert in range(len(adapter_names))
+                    )
+                    / max(len(adapter_names), 1)
+                )
+                dpp_loss = float(losses[-1].item() / max(counts[-1].item(), 1.0))
+                progress.set_postfix(
+                    step=global_step,
+                    sft=f"{sft_nll:.3f}",
+                    dpp=f"{dpp_loss:.3f}",
+                    lr=f"{optimizers[0].param_groups[0]['lr']:.2e}",
+                )
 
             if (
                 distributed.is_main
@@ -899,14 +922,8 @@ def train_stage1(
                     "stage1_step",
                     step=global_step,
                     epoch=epoch,
-                    sft_nll=float(
-                        sum(
-                            losses[expert].item() / max(counts[expert].item(), 1.0)
-                            for expert in range(len(adapter_names))
-                        )
-                        / max(len(adapter_names), 1)
-                    ),
-                    dpp_loss=float(losses[-1].item() / max(counts[-1].item(), 1.0)),
+                    sft_nll=sft_nll,
+                    dpp_loss=dpp_loss,
                     dropped_reasoning_steps=int(probe_statistics[4].item()),
                     learning_rate=optimizers[0].param_groups[0]["lr"],
                     grassmann_bandwidth=force_cache.bandwidth,
@@ -995,6 +1012,7 @@ def train_stage1(
             selected_k_sum = 0.0
             support_selection_count = valid_candidate_count = cholesky_fallbacks = 0
             dropped_step_count = 0
+        progress.close()
         start_batch = 0
         barrier()
 
