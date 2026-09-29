@@ -7,6 +7,7 @@ def council_kneedle_candidates(
     council_probabilities: torch.Tensor,
     targets: torch.Tensor,
     epsilon: float = 1.0e-12,
+    k_max: int | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
     """Full-vocabulary Kneedle on the mean expert distribution at each token.
 
@@ -16,11 +17,21 @@ def council_kneedle_candidates(
     if council_probabilities.ndim != 2 or targets.shape != council_probabilities.shape[:1]:
         raise ValueError("Council probabilities and targets have incompatible shapes")
     vocab_size = council_probabilities.shape[-1]
-    probabilities, ids = torch.sort(council_probabilities.float(), dim=-1, descending=True)
-    ranks = torch.arange(1, vocab_size + 1, device=probabilities.device, dtype=torch.float32)
+    if k_max is None or int(k_max) >= vocab_size:
+        probabilities, ids = torch.sort(
+            council_probabilities.float(), dim=-1, descending=True
+        )
+        kept = vocab_size
+        minimum = probabilities[:, -1:]
+    else:
+        kept = max(1, int(k_max))
+        probabilities, ids = torch.topk(
+            council_probabilities.float(), k=kept, dim=-1, largest=True, sorted=True
+        )
+        minimum = probabilities[:, -1:]
+    ranks = torch.arange(1, kept + 1, device=probabilities.device, dtype=torch.float32)
     x = ranks / vocab_size
     maximum = probabilities[:, :1]
-    minimum = probabilities[:, -1:]
     y = (probabilities - minimum) / (maximum - minimum).clamp_min(epsilon)
     elbow = ((1.0 - x) - y).argmax(dim=-1) + 1
     candidates = []

@@ -65,7 +65,7 @@ Mỗi $\phi_m$ gồm các cặp ma trận hạng thấp $(A_m^{(\ell)}, B_m^{(\e
 Quá trình huấn luyện gồm hai phase:
 
 \begin{itemize}
-\item \textbf{Phase 1 -- Diversity Training:} Huấn luyện $M$ LoRA experts nhằm tạo ra các reasoning state khác biệt (sử dụng \emph{lực đẩy Grassmannian} --- Grassmannian repulsive force --- và DPP trên Top-$k$ động).
+\item \textbf{Phase 1 -- Diversity Training:} Huấn luyện $M$ LoRA experts nhằm tạo ra các reasoning state khác biệt (sử dụng lực đẩy kernel trên khoảng cách chiếu giữa các không gian con và DPP trên Top-$k$ động).
 \item \textbf{Phase 2 -- Merging \& Uncertainty-Guided Distillation:} Đóng băng $\theta_{base}$ và $\Phi$. Bước thứ nhất khởi tạo một adapter LoRA student $\tilde\theta$ duy nhất bằng \emph{trung bình task-vector} $\Delta W_m = s B_m A_m$ rồi nén hạng $r$ bằng truncated SVD. Bước thứ hai tối ưu student này bằng NLL có trọng số step trên reasoning, cộng NLL luôn-on của đáp án và token định dạng. Phase 2 \emph{không} dùng KL teacher--student.
 \end{itemize}
 
@@ -126,206 +126,211 @@ Ký hiệu $\hat{p}_{i,t}^{(m)}$ là phân phối dự đoán đầy đủ của
 \section{Phase 1: Diversity Training}
 \label{sec:phase1}
 
-Phase 1 huấn luyện $M$ experts sao cho chúng vừa chính xác vừa khác biệt. Tính khác biệt là điều kiện tiên quyết: nếu các expert hội tụ về cùng một nghiệm thì mọi tín hiệu đo ở Phase 2 đều triệt tiêu.
+Phase 1 huấn luyện $M$ expert sao cho chúng vừa chính xác vừa khác biệt. Tính khác biệt là điều kiện tiên quyết: nếu các expert hội tụ về cùng một nghiệm thì mọi tín hiệu đo ở Phase 2 ($V_i$, $\rho_i$) đều triệt tiêu.
 
-Ba cơ chế dưới đây tác động lần lượt lên dữ liệu, lên tham số, và lên phân phối đầu ra.
+Ba cơ chế tác động lần lượt lên \emph{dữ liệu} (Mục~\ref{sec:gdrop}), \emph{không gian tham số} (Mục~\ref{sec:rep}) và \emph{phân phối đầu ra} (Mục~\ref{sec:outputdiv}); Mục~\ref{sec:phase1obj} gộp chúng vào quy tắc cập nhật.
 
 \subsection{Step-level Gradient Dropout}
+\label{sec:gdrop}
 
 Với mỗi sample $i$, reasoning step $s$ và expert $m$, biến giữ lại
 \begin{equation}
 \label{eq:graddropout}
-d_{i,s,m} \sim \mathrm{Bernoulli}(1-p_{drop})
+d_{i,s,m}\sim\mathrm{Bernoulli}(1-p_{drop})
 \end{equation}
-được lấy độc lập theo bộ ba $(i,s,m)$. Step bị loại ($d_{i,s,m}=0$) có trọng số token bằng $0$ và \emph{không} xuất hiện ở tử số lẫn mẫu số của $\mathcal{L}_{\mathrm{SFT}}^{(m)}$ ở \eqref{eq:sftmean}. Khối đáp án và khối định dạng luôn được giữ. Mỗi expert do đó chỉ quan sát một tập con ngẫu nhiên của tín hiệu huấn luyện, và các tập con này khác nhau giữa các expert. Dropout này không áp vào DPP hay lực đẩy Grassmann.
+được lấy độc lập theo bộ ba $(i,s,m)$. Step bị loại ($d_{i,s,m}=0$) có trọng số bằng $0$ và không xuất hiện ở tử số lẫn mẫu số của $\mathcal L_{\mathrm{SFT}}^{(m)}$ ở \eqref{eq:sftmean}. Khối đáp án và khối định dạng luôn được giữ. Dropout chỉ thay đổi \emph{trọng số của loss}, không thay đổi forward pass; mỗi expert vì vậy chỉ quan sát một tập con ngẫu nhiên của tín hiệu huấn luyện, và các tập con này khác nhau giữa các expert. Dropout không áp vào DPP hay lực đẩy.
 
-\subsection{Phân hóa trong không gian tham số qua Lực đẩy Kernel Grassmannian}
+\subsection{Phân hóa trong không gian tham số: Lực đẩy Kernel trên khoảng cách chiếu}
 \label{sec:rep}
 
-Thay vì tối thiểu hóa một hàm phạt trực giao \emph{tĩnh} trong suốt quá trình huấn luyện, phương pháp coi $M$ expert như $M$ hạt (particle) tương tác với nhau theo tinh thần Stein Variational Gradient Descent (SVGD): bên cạnh gradient tối thiểu hóa NLL của riêng mình, mỗi expert còn chịu thêm một \emph{lực đẩy động} tách nó ra khỏi những expert đang ``gần'' nó trong không gian tham số. Điểm khác biệt so với SVGD nguyên bản nằm ở thước đo khoảng cách: thay vì khoảng cách Euclid thô trên toàn bộ tham số, phương pháp khai thác trực tiếp cấu trúc hạng thấp của LoRA và đo khoảng cách trên \emph{đa tạp Grassmann} — không gian của các không gian con chiều $r$ — nơi hai adapter được coi là ``gần nhau'' nếu không gian hàng của $A$ (hoặc không gian cột của $B$) mà chúng khai thác trùng lặp nhiều, bất kể độ lớn tuyệt đối của các ma trận.
+Phương pháp coi $M$ expert như $M$ hạt tương tác theo tinh thần Stein Variational Gradient Descent (SVGD): ngoài gradient NLL của riêng mình, mỗi expert chịu thêm một lực đẩy động tách nó khỏi các expert ``gần'' nó. Khoảng cách được đo trên các \emph{không gian con} mà LoRA khai thác, không đo trên tham số thô: hai adapter là gần nhau nếu không gian hàng của $A$ (hoặc không gian cột của $B$) của chúng trùng lặp nhiều, bất kể độ lớn hay cơ sở nội tại.
 
-\paragraph{Cơ sở trực chuẩn của từng expert.}
-Với mỗi expert $m$ và mô-đun $\ell$, gọi $Q_{A,m}^{(\ell)} \in \mathbb{R}^{d_{in}\times r}$ là cơ sở trực chuẩn của không gian hàng của $A_m^{(\ell)}$, thu được qua phân rã QR rút gọn
+\paragraph{Không gian con và phép chiếu.}
+Với expert $m$ và mô-đun $\ell$, gọi $\mathcal U_{A,m}^{(\ell)}=\mathrm{row}(A_m^{(\ell)})\subset\mathbb R^{d_{in}}$ và $\mathcal U_{B,m}^{(\ell)}=\mathrm{col}(B_m^{(\ell)})\subset\mathbb R^{d_{out}}$, mỗi không gian có chiều $r$. Để dùng chung một công thức, đặt $X_m^{(\ell,A)}:=A_m^{(\ell)}\in\mathbb R^{r\times d_{in}}$ và $X_m^{(\ell,B)}:=(B_m^{(\ell)})^{\top}\in\mathbb R^{r\times d_{out}}$; khi đó mỗi không gian con là không gian hàng của một ma trận $X_m\in\mathbb R^{r\times d}$ hạng đầy đủ. Ma trận Gram và phép chiếu trực giao lên không gian hàng:
 \begin{equation}
-\label{eq:qrA}
-\left(A_m^{(\ell)}\right)^{\top} = Q_{A,m}^{(\ell)}\, R_{A,m}^{(\ell)},
-\end{equation}
-và tương tự $Q_{B,m}^{(\ell)} \in \mathbb{R}^{d_{out}\times r}$ là cơ sở trực chuẩn của không gian cột của $B_m^{(\ell)}$:
-\begin{equation}
-\label{eq:qrB}
-B_m^{(\ell)} = Q_{B,m}^{(\ell)}\, R_{B,m}^{(\ell)}.
-\end{equation}
-Cả hai phép phân rã được thực hiện lại tại mỗi bước huấn luyện (differentiable QR), nên $Q_{A,m}^{(\ell)}, Q_{B,m}^{(\ell)}$ là hàm khả vi của $\phi_m$.
-
-\paragraph{Góc chính và khoảng cách Grassmann.}
-Với cặp expert $(p,q)$, góc chính (principal angles) giữa hai không gian hàng của $A$ trên mô-đun $\ell$ được xác định qua SVD:
-\begin{equation}
-\label{eq:principalangle}
-\left(Q_{A,p}^{(\ell)}\right)^{\top} Q_{A,q}^{(\ell)} = U_{pq}^{(\ell)}\, \Sigma_{pq}^{(\ell)}\, \left(V_{pq}^{(\ell)}\right)^{\top},
+\label{eq:gram}
+C_{pq}=X_pX_q^{\top}\in\mathbb R^{r\times r},
 \qquad
-\Sigma_{pq}^{(\ell)} = \mathrm{diag}(\sigma_1,\dots,\sigma_r),
+P_p=X_p^{\top}C_{pp}^{-1}X_p .
 \end{equation}
-với $\sigma_j = \cos\theta_j \in [0,1]$. Để tránh đạo hàm của $\arccos$ bùng nổ tại $\sigma_j \to 1$ (hai không gian trùng nhau — chính là tình huống điển hình khi các expert mới được khởi tạo giống nhau), các giá trị kỳ dị được cắt về $[-1+\epsilon,\, 1-\epsilon]$ trước khi lấy $\theta_j = \arccos(\sigma_j)$. Khoảng cách Grassmann bình phương giữa hai không gian hàng của $A$ trên mô-đun $\ell$ là
+
+\paragraph{Khoảng cách chiếu.}
+Với $r$ góc chính $\theta_1,\dots,\theta_r\in[0,\pi/2]$ giữa hai không gian con, khoảng cách chiếu bình phương là
 \begin{equation}
-\label{eq:grassA}
-d_A^{(\ell)}(p,q)^2 = \sum_{j=1}^{r}\theta_j^2,
+\label{eq:projdist}
+d_{X}(p,q)^2=\sum_{j=1}^{r}\sin^2\theta_j=r-f_{pq},
+\qquad
+f_{pq}=\operatorname{tr}(P_pP_q)=\operatorname{tr}\!\big(C_{pp}^{-1}C_{pq}C_{qq}^{-1}C_{qp}\big).
 \end{equation}
-và một cách tương tự (dùng $Q_{B,p}^{(\ell)}, Q_{B,q}^{(\ell)}$) ta thu được $d_B^{(\ell)}(p,q)^2$ cho không gian cột của $B$. Khoảng cách tổng hợp giữa hai expert, trung bình trên toàn bộ mô-đun đích $\mathcal{M}$, là
+Ở đây $f_{pq}=\|Q_p^\top Q_q\|_F^2$ với $Q$ là cơ sở trực chuẩn bất kỳ của không gian con, tức phần ``năng lượng'' của không gian này nằm trong không gian kia: bằng $r$ khi trùng nhau và bằng $0$ khi trực giao hoàn toàn. Vậy $d_X^2$ đo \emph{lượng chồng lấn còn thiếu}. Khoảng cách tổng hợp giữa hai expert, trung bình trên các mô-đun đích $\mathcal M$:
 \begin{equation}
 \label{eq:grasstotal}
-d_{Grass}(\phi_p,\phi_q)^2
-=
-\frac{1}{|\mathcal{M}|}
-\sum_{\ell\in\mathcal{M}}
-\left[
-d_A^{(\ell)}(p,q)^2 + d_B^{(\ell)}(p,q)^2
-\right].
+d(\phi_p,\phi_q)^2=\frac1{|\mathcal M|}\sum_{\ell\in\mathcal M}\Big[d_{A}^{(\ell)}(p,q)^2+d_{B}^{(\ell)}(p,q)^2\Big].
 \end{equation}
-Khác với khoảng cách Euclid trên tham số thô, $d_{Grass}$ bất biến trước phép nhân $A_m^{(\ell)}, B_m^{(\ell)}$ với một ma trận khả nghịch $r\times r$ bất kỳ (tức bất biến trước mọi phép đổi cơ sở nội tại của adapter, vốn không mang ý nghĩa hình học) và bị chặn trên do mỗi $\theta_j \in [0,\pi/2]$, nên không phụ thuộc vào việc chuẩn hóa độ lớn tham số qua các bước huấn luyện — đây chính là hình thức hóa lại đúng ý tưởng trực giao hai không gian con ở phiên bản trước, chỉ khác là bây giờ nó là một \emph{khoảng cách} thay vì một \emph{hàm phạt}.
-
-\paragraph{Kernel Grassmann và lực đẩy.}
-Tương tự SVGD, ta định nghĩa kernel Gauss trên khoảng cách Grassmann:
-\begin{equation}
-\label{eq:grasskernel}
-K(\phi_p,\phi_q) = \exp\!\left(-\frac{d_{Grass}(\phi_p,\phi_q)^2}{h}\right),
-\end{equation}
-với băng thông $h$ chọn theo heuristic trung vị tại mỗi bước huấn luyện, $h = \mathrm{med}^2/\ln M$, trong đó $\mathrm{med}$ là trung vị của $\{d_{Grass}(\phi_p,\phi_q)\}_{1\le p<q\le M}$. Hai expert có không gian con trùng lặp nhiều (khoảng cách Grassmann nhỏ) nhận giá trị kernel cao, tức bị coi là ``gần nhau'' và cần lực đẩy mạnh; hai expert đã gần trực giao nhận kernel nhỏ và lực đẩy tự động suy yếu, không cần một ngưỡng cứng để ``tắt'' như hàm phạt tĩnh trước đây.
-
-Lực đẩy tác động lên expert $m$ được định nghĩa là tổng có trọng số kernel của hướng làm \emph{tăng} khoảng cách Grassmann tới các expert còn lại:
-\begin{equation}
-\label{eq:repforce}
-F_{rep}(\phi_m)
-=
-\frac{1}{M}\sum_{m'=1}^{M}
-K(\phi_m,\phi_{m'})\;
-\nabla_{\phi_m}\, d_{Grass}(\phi_m,\phi_{m'})^2 .
-\end{equation}
-Gradient trong \eqref{eq:repforce} được tính bằng lan truyền ngược tự động qua toàn bộ chuỗi QR $\to$ SVD $\to$ $\arccos$ ở trên (các phép toán này đều khả vi trong các framework hiện đại); phương pháp không cần một công thức đóng cho đạo hàm trên đa tạp Grassmann. Vì $F_{rep}(\phi_m)$ được nhân với trọng số $K$, lực đẩy đạt cực đại ở đầu huấn luyện — khi các expert khởi tạo gần giống nhau và $K\approx 1$ — và tự suy giảm mượt mà khi các expert đã phân hóa đủ mạnh.
 
 \begin{proposition}
 \label{prop:bound}
-Với mọi cặp expert $(p,q)$, khoảng cách Grassmann tổng hợp thỏa $0 \le d_{Grass}(\phi_p,\phi_q)^2 \le r\pi^2/2$, do mỗi góc chính $\theta_j \in [0,\pi/2]$. Suy ra trọng số kernel $K(\phi_p,\phi_q) \in \left[\exp\!\left(-\frac{r\pi^2}{2h}\right),\ 1\right]$ luôn bị chặn dưới bởi một hằng số dương và giảm đơn điệu theo $d_{Grass}^2$. Do đó lực đẩy $F_{rep}$ được điều tiết mượt mà theo mức độ trùng lặp không gian con hiện tại, không cần một ngưỡng cắt cứng để vô hiệu hóa lực đẩy khi hai expert đã đủ trực giao.
+Với mọi cặp $(p,q)$:
+\begin{enumerate}
+\item[(i)] \textbf{Bị chặn.} $0\le d(\phi_p,\phi_q)^2\le 2r$, và $d_X^2=0$ khi và chỉ khi hai không gian con trùng nhau.
+\item[(ii)] \textbf{Bất biến đổi cơ sở.} $d_X$ không đổi khi thay $X_m\mapsto G_mX_m$ với $G_m\in GL_r$ bất kỳ.
+\item[(iii)] \textbf{Tương đương với khoảng cách geodesic.} Nếu $d_{Grass,X}^2=\sum_j\theta_j^2$ thì $d_X^2\le d_{Grass,X}^2\le\frac{\pi^2}{4}\,d_X^2$.
+\item[(iv)] \textbf{Kernel được điều tiết.} $K(\phi_p,\phi_q)=\exp(-d^2/h)\in[e^{-2r/h},\,1]$ và giảm đơn điệu theo $d^2$.
+\end{enumerate}
 \end{proposition}
+\begin{proof}
+(i) $\sin^2\theta_j\in[0,1]$. (ii) $P_p$ chỉ phụ thuộc không gian hàng của $X_p$. (iii) Với $\theta\in[0,\pi/2]$ ta có $\frac{2}{\pi}\theta\le\sin\theta\le\theta$. (iv) suy ra từ (i).
+\end{proof}
+Phần (iii) cho thấy metric mới tương đương (sai khác hằng số $\pi^2/4$) với khoảng cách geodesic của bản trước, và hai metric trùng nhau ở bậc hai khi các góc nhỏ, đúng vùng quan trọng ở đầu huấn luyện.
 
-\paragraph{Chi phí tính toán.} Với mỗi mô-đun $\ell$ và mỗi cặp expert $(p,q)$, chi phí chủ yếu nằm ở phân rã QR cỡ $d\times r$ (thời gian $O(dr^2)$) và SVD của ma trận $r\times r$ (thời gian $O(r^3)$), với $r$ thường chỉ nằm trong khoảng $8$–$64$. Tổng chi phí trên một bước huấn luyện là $O(|\mathcal{M}|\, M^2 (dr^2 + r^3))$, không đáng kể so với chi phí forward/backward qua $\theta_{base}$ vốn đã chiếm ưu thế trong huấn luyện LoRA.
+\paragraph{Kernel.}
+\begin{equation}
+\label{eq:grasskernel}
+K(\phi_p,\phi_q)=\exp\!\left(-\frac{d(\phi_p,\phi_q)^2}{h}\right),\qquad h=\frac{\mathrm{med}^2}{\ln M},
+\end{equation}
+với $\mathrm{med}$ là trung vị của $\{d(\phi_p,\phi_q)\}_{p<q}$. Cả $h$ và $K$ được tính lại mỗi lần cập nhật lực và được coi là hằng số (stop-gradient). Hai expert có không gian con trùng nhiều nhận $K\approx1$ và bị đẩy mạnh; hai expert đã gần trực giao nhận $K$ nhỏ và lực tự suy yếu, không cần ngưỡng cứng.
+
+\paragraph{Lực đẩy.}
+\begin{equation}
+\label{eq:repforce}
+F_{rep}(\phi_m)=\frac1M\sum_{m'\ne m}K(\phi_m,\phi_{m'})\,\nabla_{\phi_m}d(\phi_m,\phi_{m'})^2 ,
+\end{equation}
+trong đó $\phi_{m'}$ được coi là hằng số khi lấy gradient. Vì $\nabla_\phi K=-\frac{K}{h}\nabla_\phi d^2$, \eqref{eq:repforce} chính là số hạng lực đẩy của SVGD với kernel \eqref{eq:grasskernel}, sai khác hằng số $1/h$ được hấp thụ vào $\lambda_{rep}$.
+
+\begin{proposition}[Gradient dạng đóng]
+\label{prop:closedform}
+Với $T_{pq}=C_{pq}C_{qq}^{-1}$,
+\begin{equation}
+\label{eq:gradf}
+\nabla_{X_p}f_{pq}=2\,C_{pp}^{-1}\,T_{pq}\,\big(X_q-C_{qp}C_{pp}^{-1}X_p\big)
+=2\,C_{pp}^{-1}X_pP_q\,(I-P_p).
+\end{equation}
+Do đó, với mỗi cặp không gian con, $\nabla_{X_p}d_X^2=-\nabla_{X_p}f_{pq}$, và lực lên $X_p$ tại mô-đun $\ell$ (thừa số $1/|\mathcal M|$ đến từ \eqref{eq:grasstotal}) là
+\begin{equation}
+\label{eq:forceclosed}
+F^{(\ell)}_{X}(p)=-\frac{2}{M|\mathcal M|}\sum_{q\ne p}K_{pq}\;C_{pp}^{-1}\,T_{pq}\,\big(X_q-C_{qp}C_{pp}^{-1}X_p\big).
+\end{equation}
+Lực với $B$ nhận được bằng cách chuyển vị $F_X$ với $X=B^\top$.
+\end{proposition}
+\begin{proof}[Phác thảo]
+Vi phân $\delta P_p=\delta X^\top C^{-1}X+X^\top C^{-1}\delta X-X^\top C^{-1}(\delta X\,X^\top+X\,\delta X^\top)C^{-1}X$, thay vào $\delta f=\operatorname{tr}(\delta P_p\,P_q)$ với $P_q$ đối xứng và rút gọn.
+\end{proof}
+
+Một số tính chất có ý nghĩa thực hành:
+\begin{itemize}
+\item Thừa số $(I-P_p)$ trong \eqref{eq:gradf} khiến các hàng của lực nằm trong phần bù trực giao của $\mathrm{row}(X_p)$: lực chỉ \emph{xoay} không gian con ra xa $\mathcal U_q$ (đến bậc nhất), không co giãn nó.
+\item Nếu $\mathcal U_p=\mathcal U_q$ thì $X_q-C_{qp}C_{pp}^{-1}X_p=0$, tức lực bằng $0$ (điểm yên ngựa). Do đó các expert cần khởi tạo $A$ khác nhau (khác seed) hoặc được thêm nhiễu nhỏ; nếu khởi tạo giống hệt thì lực không phá được đối xứng.
+\item Chuẩn của lực tỉ lệ $\sim1/\sigma_{\min}(X_p)$, nên không bị chặn khi $\|X_p\|\to0$. Vì lực không đi qua trạng thái optimizer và không bị cắt ở \eqref{eq:phase1update}, cần theo dõi $\|F_{rep}\|$ và dùng ridge (bên dưới).
+\end{itemize}
+
+\paragraph{Ổn định số.}
+$C_{pp}$ được thay bằng $\tilde C_{pp}=C_{pp}+\big(\varepsilon_{rel}\,\tfrac{\operatorname{tr}C_{pp}}{r}+\varepsilon_{abs}\big)I$ (ridge tương đối, ví dụ $\varepsilon_{rel}=10^{-4}$, $\varepsilon_{abs}=10^{-8}$) trong mọi nghịch đảo. Gram và nghịch đảo tính ở fp32. Với khởi tạo LoRA chuẩn ($B=0$), $\mathrm{col}(B)$ chưa xác định; do đó phần $B$ của \eqref{eq:grasstotal} và của lực chỉ được bật từ bước $t_B$ (hoặc khi $\min_m\|B_m\|_F$ vượt ngưỡng), còn trước đó chỉ dùng phần $A$. Đây là một lựa chọn hiện thực hóa và được ghi trong báo cáo thí nghiệm.
+
+\paragraph{Cách tính và chi phí.}
+Mọi đại lượng chỉ phụ thuộc các Gram $C_{pq}$ cỡ $r\times r$. Với các mô-đun cùng shape (ví dụ q/k/v/o hoặc up/down qua các layer), xếp thành chiều batch $L$; mỗi nhóm tính $X_{all}\in\mathbb R^{L\times Mr\times d}$ và $G=X_{all}X_{all}^\top$ bằng một GEMM, rồi tách các khối $r\times r$. Chi phí mỗi nhóm là $O(L\,M^2r^2d)$ cho GEMM cộng $O(L\,M\,r^3)$ cho $M$ nghịch đảo và $O(L\,M^2r^3)$ cho các tích $r\times r$. Toàn bộ chạy dưới \texttt{no\_grad}, không lưu graph, không có QR/SVD. Với $d=4096$, $r=16$, $M=4$, mỗi mô-đun cần khoảng $2\times10^7$ FLOPs cho Gram, không đáng kể so với forward/backward qua $\theta_{base}$; nút thắt còn lại là số lần gọi kernel, được giải quyết bằng gộp theo shape. Lực có thể được cập nhật mỗi $n_{rep}$ bước (mặc định $1$) và tái dùng ở các bước giữa, vì các không gian con thay đổi chậm.
 
 \subsection{Phân hóa trong không gian đầu ra với Top-$k$ động và DPP}
 \label{sec:outputdiv}
 
-Trực giao trong không gian trọng số là điều kiện cần nhưng chưa đủ. Việc ép phân kỳ trên toàn bộ không gian từ vựng thường sinh ra nhiễu ở vùng ``đuôi dài'' (long-tail). Do đó, phương pháp kết hợp thuật toán Kneedle để chọn ngưỡng Top-$k$ động và Determinantal Point Processes (DPP) nhằm tối đa hóa sự đa dạng trên các dự đoán sai nhưng hợp lý.
+Trực giao trong không gian trọng số là điều kiện cần nhưng chưa đủ; ép phân kỳ trên toàn bộ từ vựng sinh nhiễu ở vùng đuôi dài. Vì vậy phương pháp chọn ngưỡng Top-$k$ động bằng Kneedle và dùng Determinantal Point Process (DPP) để tối đa hóa đa dạng trên các dự đoán sai nhưng hợp lý.
 
-\paragraph{Xác định vùng dự đoán mang thông tin (Dynamic Top-$k$).}
-Tại step $s_i$ và token $t$, tính phân phối đồng thuận $\bar{p}_{i,t} = \frac{1}{M}\sum_{m=1}^{M}\hat{p}_{i,t}^{(m)}$. Sắp xếp $\bar{p}_{i,t}$ giảm dần thành vector $\bar{p}^\downarrow$. Trục thứ hạng và giá trị được chuẩn hóa về cùng không gian $[0, 1]$:
+\paragraph{Vùng dự đoán mang thông tin (Dynamic Top-$k$).}
+Tại step $s_i$ và token $t$, tính $\bar p_{i,t}$ theo \eqref{eq:pbar}, sắp xếp giảm dần thành $\bar p^\downarrow$ và chuẩn hóa
 \begin{equation}
-x_j = \frac{j}{N}, \qquad y_j = \frac{\bar{p}^\downarrow_j - p_{min}}{p_{max} - p_{min}}, \qquad j \in \{1, \dots, N\},
+x_j=\frac jN,\qquad y_j=\frac{\bar p^\downarrow_j-p_{min}}{p_{max}-p_{min}},\qquad j\in\{1,\dots,N\},
 \end{equation}
-với $N$ là kích thước bộ từ vựng, $p_{max} = \bar{p}^\downarrow_1$ và $p_{min} = \bar{p}^\downarrow_N$. 
+với $N$ là kích thước từ vựng, $p_{max}=\bar p^\downarrow_1$, $p_{min}=\bar p^\downarrow_N$. Điểm khuỷu là điểm có khoảng cách cực đại tới đường chéo $y=1-x$:
+\begin{equation}
+k=\argmax_j\big((1-x_j)-y_j\big),
+\end{equation}
+và $\mathcal V_k$ là $k$ token hạng cao nhất. \emph{Tùy chọn hiệu năng:} thay sort toàn từ vựng bằng \texttt{topk} với $K_{max}$ cố định (64--256), chạy Kneedle trên $K_{max}$ giá trị đó và đặt $p_{min}:=\bar p^\downarrow_{K_{max}}$. Vì chuẩn hóa thay đổi nên đây là biến thể; mặc định tắt, và cần kiểm tra $k$ thu được ổn định.
 
-Điểm khuỷu $k$ phân tách vùng nhiều thông tin và vùng nhiễu được xác định bằng cách tìm điểm có khoảng cách vuông góc cực đại tới đường chéo $y = 1 - x$:
+\paragraph{Ứng viên và DPP.}
+Token đáp án đúng $y^*$ được loại khỏi $\mathcal V_k$ \emph{sau} khi xác định khuỷu: $\mathcal C=\mathcal V_k\setminus\{y^*\}$. Với mỗi expert, lấy softmax trên \emph{toàn bộ} từ vựng rồi cắt lên $\mathcal C$:
 \begin{equation}
-k = \argmax_j \left( (1 - x_j) - y_j \right).
+\hat p^{(m)}=\operatorname{softmax}\!\big(z^{(m)}\big),\qquad
+\hat p^{(m)}_{\mathcal C}=\big[\hat p^{(m)}\big]_{\mathcal C},\qquad
+\tilde v^{(m)}=\frac{\hat p^{(m)}_{\mathcal C}}{\|\hat p^{(m)}_{\mathcal C}\|_2+\epsilon}.
 \end{equation}
-Gọi tập hợp $k$ token có thứ hạng cao nhất tương ứng với điểm khuỷu này là $\mathcal{V}_k$.
-
-\paragraph{Không gian ứng viên và DPP.}
-Để bảo đảm tính chính xác, token đáp án đúng $y^*$ (ground-truth) được loại khỏi $\mathcal{V}_k$ \emph{sau} khi đã xác định khuỷu, tạo thành tập ứng viên phân kỳ $\mathcal{C} = \mathcal{V}_k \setminus \{y^*\}$.
-
-Với mỗi expert $m$, trước hết lấy softmax trên \emph{toàn bộ} từ vựng,
+Mẫu số của softmax là toàn bộ từ vựng; không softmax lại trên $\mathcal C$. Hiện thực ổn định dùng $\hat p^{(m)}_c=\exp\!\big(z^{(m)}_c-\operatorname{logsumexp}(z^{(m)})\big)$. Với $G_{p,q}=(\tilde v^{(p)})^\top\tilde v^{(q)}$,
 \begin{equation}
-\label{eq:dppfullsoftmax}
-\hat{p}^{(m)} = \operatorname{softmax}\!\left(z^{(m)}\right),
+l_{DPP,i,t}=-\log\det(G+\alpha I),\qquad \alpha=10^{-5},
 \end{equation}
-rồi mới cắt lên tập ứng viên
-\begin{equation}
-\label{eq:dppcslice}
-\hat{p}^{(m)}_{\mathcal{C}}
-=
-\left[\hat{p}^{(m)}\right]_{\mathcal{C}}
-=
-\left[\operatorname{softmax}\!\left(z^{(m)}\right)\right]_{\mathcal{C}}.
-\end{equation}
-Mẫu số của softmax là toàn bộ vocabulary; phương pháp \emph{không} lấy softmax lại chỉ trên $\mathcal{C}$. Vector đặc trưng là chuẩn hóa $L_2$ của lát cắt đó:
-\begin{equation}
-\label{eq:dppfeature}
-\tilde{v}^{(m)}
-=
-\frac{\hat{p}^{(m)}_{\mathcal{C}}}{\|\hat{p}^{(m)}_{\mathcal{C}}\|_2 + \epsilon}.
-\end{equation}
-Hiện thực hóa ổn định tương đương dùng $\log \hat{p}^{(m)}_c = z^{(m)}_c - \operatorname{logsumexp}(z^{(m)}_{\mathrm{full}})$ rồi $\hat{p}^{(m)}_{\mathcal{C}} = \exp(\log \hat{p}^{(m)}_{\mathcal{C}})$.
-
-Sự phân hóa giữa các expert được đo bằng thể tích của khối đa diện chăng bởi $M$ vector này trong không gian ứng viên. Thể tích này được tính thông qua định thức của ma trận Gram $G \in \mathbb{R}^{M \times M}$, trong đó $G_{p,q} = (\tilde{v}^{(p)})^{\top} \tilde{v}^{(q)}$. Hàm mất mát DPP tại token $t$ cực tiểu hóa âm log-định thức:
-\begin{equation}
-l_{DPP, i, t} = -\log \det(G + \alpha I),
-\end{equation}
-với $\alpha$ là hằng số rất nhỏ (ví dụ $1e-5$) để đảm bảo tính xác định dương chặt.
-
-Hàm phạt đa dạng hóa trên một sample là trung bình theo reasoning step của trung bình theo token (chỉ các token có $|\mathcal{C}|>0$); loss trên batch là trung bình các sample:
 \begin{equation}
 \label{eq:dppsteploss}
-\mathcal{L}_{DPP\_div} = \frac{1}{S}\sum_{i=1}^{S} \left( \frac{1}{T_i} \sum_{t=1}^{T_i} l_{DPP, i, t} \right).
+\mathcal L_{DPP\_div}=\frac1S\sum_{i=1}^S\Big(\frac1{T_i}\sum_{t=1}^{T_i}l_{DPP,i,t}\Big),
 \end{equation}
-Cách tiếp cận này ép các expert phải bất đồng trên những suy luận hợp lý nhất (information-rich region) thay vì nhiễu loạn ngẫu nhiên, tạo ra nguồn epistemic uncertainty cực kỳ chất lượng cho Phase 2. DPP được tính trên một lượt probe \texttt{no-grad} (không dùng mask dropout SFT), sau đó cotangent được đưa về tham số LoRA bằng VJP trên $\log\hat{p}_{\mathcal{C}}$ --- tức qua $\operatorname{softmax}$ đầy đủ, không qua softmax thu hẹp trên $\mathcal{C}$.
+trong đó chỉ các token có $|\mathcal C|>0$ được tính. $\det$ của ma trận $M\times M$ chỉ tốn $O(M^3)$ và Gram tốn $O(M^2|\mathcal C|)$, không phải điểm cần tối ưu.
+
+\paragraph{Hiện thực: probe và VJP.}
+DPP cần logits của \emph{tất cả} $M$ expert trên cùng một token, trong khi SFT của từng expert là độc lập. Để không giữ đồng thời $M$ computation graph, DPP được tính trên một lượt probe \texttt{no-grad} (không dùng mask dropout), thu được cotangent $\partial\mathcal L_{DPP\_div}/\partial\log\hat p^{(m)}_{\mathcal C}$, rồi mỗi expert đưa cotangent này về tham số LoRA bằng VJP trong lượt forward có graph của chính nó (qua softmax đầy đủ). Đổi lại, mỗi expert forward hai lần. Vì dropout ở Mục~\ref{sec:gdrop} chỉ đổi trọng số loss, hai lượt cho logits giống hệt nhau, và có hai chế độ tương đương về toán học:
+\begin{itemize}
+\item \textbf{probe} (mặc định): tiết kiệm bộ nhớ, forward gấp đôi;
+\item \textbf{joint}: một forward duy nhất, giữ $M$ graph cùng lúc (cần gradient checkpointing nếu thiếu VRAM).
+\end{itemize}
+Hai tùy chọn giảm chi phí khác, đổi nhẹ phương pháp và mặc định tắt: chỉ tính DPP trên một tập con vị trí token (tỉ lệ $\pi_{dpp}$, chọn ngẫu nhiên hoặc ưu tiên entropy cao) và tính DPP mỗi $n_{dpp}$ bước.
 
 \subsection{Hàm mục tiêu và Quy tắc Cập nhật Phase 1}
 \label{sec:phase1obj}
 
-Vì lực đẩy Grassmann ở Mục~\ref{sec:rep} tác động trực tiếp lên hướng cập nhật tham số chứ không phải lên một số hạng cộng thêm vào hàm mục tiêu, hàm mục tiêu dùng để tính gradient dữ liệu của Phase 1 chỉ còn gồm hai thành phần là loss thực sự. NLL chuẩn hóa độ dài của expert $m$ trên reasoning step $s$ của sample $i$ là
+NLL chuẩn hóa độ dài của expert $m$ trên step $s$ của sample $i$:
 \begin{equation}
 \label{eq:stepnll}
-\ell_{i,s}^{(m)}
-=
--\frac{1}{T_{i,s}}
-\sum_{t\in\mathrm{step}_{i,s}}
-\log p_{\phi_m}(y_t \mid y_{<t}, x_i).
+\ell_{i,s}^{(m)}=-\frac1{T_{i,s}}\sum_{t\in\mathrm{step}_{i,s}}\log p_{\phi_m}(y_t\mid y_{<t},x_i).
 \end{equation}
-Đáp án là một khối luôn-on, cũng chuẩn hóa theo độ dài:
-\begin{equation}
-\mathcal{L}_{\mathrm{ans}}^{(m)}
-=
--\frac{1}{T_{\mathrm{ans}}}
-\sum_{t\in\mathrm{answer}}
-\log p_{\phi_m}(y_t \mid y_{<t}, x),
-\end{equation}
-khi sample có đáp án. Token định dạng tạo thành khối luôn-on thứ hai $\mathcal{L}_{\mathrm{fixed}}^{(m)}$, chuẩn hóa độ dài riêng để không pha loãng NLL của đáp án. Trên một bước huấn luyện, các số hạng được cộng gộp trên toàn bộ sample trong batch (và gradient accumulation) rồi chia cho tổng số segment đóng góp của chính expert đó:
+Khối đáp án $\mathcal L_{\mathrm{ans}}^{(m)}$ và khối định dạng $\mathcal L_{\mathrm{fixed}}^{(m)}$ là các khối luôn-on, mỗi khối chuẩn hóa độ dài riêng. Trên một bước huấn luyện (gộp batch và gradient accumulation), cộng các số hạng rồi chia cho tổng số segment đóng góp của chính expert đó:
 \begin{equation}
 \label{eq:sftmean}
-\mathcal{L}_{\mathrm{SFT}}^{(m)}
-=
-\frac{
-\sum_{i,s} d_{i,s,m}\,\ell_{i,s}^{(m)}
-+
-\sum_{i}\mathcal{L}_{\mathrm{ans},i}^{(m)}
-+
-\sum_{i}\mathcal{L}_{\mathrm{fixed},i}^{(m)}
-}{
-\sum_{i,s} d_{i,s,m}
-+
-\sum_{i}\mathbf{1}_{\mathrm{ans},i}
-+
-\sum_{i}\mathbf{1}_{\mathrm{fixed},i}
-}.
+\mathcal L_{\mathrm{SFT}}^{(m)}=
+\frac{\sum_{i,s}d_{i,s,m}\ell_{i,s}^{(m)}+\sum_i\mathcal L_{\mathrm{ans},i}^{(m)}+\sum_i\mathcal L_{\mathrm{fixed},i}^{(m)}}
+{\sum_{i,s}d_{i,s,m}+\sum_i\mathbf 1_{\mathrm{ans},i}+\sum_i\mathbf 1_{\mathrm{fixed},i}}.
 \end{equation}
-Step bị loại không đóng góp vào tử số lẫn mẫu số; khối đáp án và khối định dạng luôn được giữ. Đây là một chuẩn hóa có chủ đích ở tầng hiện thực hóa, không đồng nhất với việc lấy tổng thô $\sum_s \ell_s$ trên mọi reasoning step. Mỗi reasoning step được giữ lại đóng góp đúng một đơn vị NLL đã chuẩn hóa độ dài, và hàm mục tiêu SFT là trung bình trên các segment đóng góp. Cách này giữ scale loss tương đương giữa các mẫu có số step được giữ khác nhau, đồng thời tránh pha loãng nhân tạo do đưa step đã drop vào mẫu số.
+Step bị loại không đóng góp vào tử số lẫn mẫu số. Mỗi reasoning step được giữ đóng góp đúng một đơn vị NLL chuẩn hóa độ dài, nên scale loss tương đương giữa các mẫu có số step được giữ khác nhau.
 
-Hàm mục tiêu data của Phase 1 là
+Hàm mục tiêu dữ liệu của Phase 1 chỉ gồm hai thành phần:
 \begin{equation}
 \label{eq:phase1}
-\mathcal{L}_{Phase1}^{(m)}
-=
-\mathcal{L}_{\mathrm{SFT}}^{(m)}
-+
-\lambda_{div}\,\mathcal{L}_{DPP\_div}.
+\mathcal L_{Phase1}^{(m)}=\mathcal L_{\mathrm{SFT}}^{(m)}+\lambda_{div}\,\mathcal L_{DPP\_div}.
 \end{equation}
-Gradient data $g_m = \nabla_{\phi_m}\mathcal{L}_{Phase1}^{(m)}$ được cắt theo chuẩn $\ell_2$ toàn cục ($\texttt{max\_grad\_norm}$) rồi đưa vào AdamW kèm lịch cosine warmup. Lực đẩy Grassmann không đi qua trạng thái optimizer và không bị cắt:
+Lực đẩy tác động trực tiếp lên hướng cập nhật tham số chứ không phải một số hạng của hàm mục tiêu. Gradient dữ liệu $g_m=\nabla_{\phi_m}\mathcal L_{Phase1}^{(m)}$ được cắt theo chuẩn $\ell_2$ toàn cục (\texttt{max\_grad\_norm}) rồi đưa vào AdamW với lịch cosine warmup; lực đẩy không đi qua optimizer và không bị cắt:
 \begin{equation}
 \label{eq:phase1update}
-\phi_m^{t+1}
-=
-\mathrm{AdamW}\!\bigl(\phi_m^{t},\, g_m\bigr)
-+
-\eta\,\lambda_{rep}\, F_{rep}\!\left(\phi_m^{t}\right),
+\phi_m^{t+1}=\mathrm{AdamW}\!\big(\phi_m^{t},g_m\big)+\eta_t\,\lambda_{rep}\,F_{rep}\!\big(\phi_m^{t}\big),
 \end{equation}
-trong đó $F_{rep}$ là lực đẩy Grassmann ở \eqref{eq:repforce} và $\eta$ là learning rate hiện tại của AdamW. Ba số hạng tương ứng đúng ba cơ chế đã trình bày: dropout tác động lên \emph{dữ liệu} quan sát bởi mỗi expert, lực đẩy Grassmann tác động lên \emph{không gian tham số}, và gradient DPP tác động lên \emph{phân phối đầu ra}. So với việc cộng gộp mọi thứ vào một hàm mục tiêu tĩnh duy nhất như phiên bản trước, cách viết tường minh này cho phép $\lambda_{rep}$ điều khiển trực tiếp cường độ của một trường lực tại từng bước — được tự động điều tiết theo hình học hiện tại của các expert (Mệnh đề~\ref{prop:bound}) — thay vì chỉ là trọng số của một hàm phạt được tối ưu gián tiếp qua nhiều bước gradient descent.
+với $\eta_t$ là learning rate hiện tại của AdamW và $F_{rep}$ tính từ tham số \emph{trước} bước cập nhật dữ liệu (cùng một snapshot cho cả $M$ expert, để lực đối xứng giữa các cặp). Ba số hạng ứng với ba cơ chế: dropout tác động lên dữ liệu, lực đẩy lên không gian tham số, và gradient DPP lên phân phối đầu ra.
+
+\subsection{Thuật toán một bước huấn luyện}
+\label{sec:p1algo}
+
+\begin{enumerate}
+\item Lấy mẫu $d_{i,s,m}$ cho từng expert; dựng các mask trọng số của \eqref{eq:sftmean}.
+\item \emph{(Probe)} Với mỗi expert chạy forward \texttt{no-grad} trên batch, thu logits tại các vị trí được chọn; tính $\mathcal L_{DPP\_div}$ và cotangent theo $\log\hat p^{(m)}_{\mathcal C}$.
+\item Với mỗi expert: forward có graph, backward cho $\mathcal L_{\mathrm{SFT}}^{(m)}+\lambda_{div}\langle\text{cotangent},\log\hat p^{(m)}_{\mathcal C}\rangle$.
+\item Cắt gradient, gọi \texttt{AdamW.step()}.
+\item Nếu $t\bmod n_{rep}=0$: tính lực từ snapshot tham số (Gram theo nhóm shape $\to$ $d^2$ $\to$ $h,K$ $\to$ $F_{rep}$ theo \eqref{eq:forceclosed}) và lưu vào bộ đệm; luôn áp $\eta_t\lambda_{rep}F_{rep}$ (bộ đệm) lên tham số.
+\end{enumerate}
+
+\subsection{Siêu tham số, chẩn đoán và ablation}
+\label{sec:p1ablation}
+
+Siêu tham số chính: $p_{drop}$, $\lambda_{div}$, $\lambda_{rep}$, $\varepsilon_{rel}$, $t_B$, $n_{rep}$. Thang của $d^2$ nay tối đa là $2r$ (trước đó $r\pi^2$), nên $\lambda_{rep}$ cần chỉnh lại, không giữ nguyên giá trị của bản geodesic.
+
+Các đại lượng cần ghi log: $\bar d^2$ và $\bar f_{pq}$ trung bình theo cặp; $\min/\max$ của $K$; $\|F_{rep}\|$ và tỉ số $\|\eta\lambda_{rep}F_{rep}\|/\|\Delta\phi\|_{AdamW}$; NLL từng expert; độ đa dạng DPP; $V_i$ trung bình tính trên tập validation.
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Cấu hình & Mục đích \\
+\midrule
+Không dropout, không lực, không DPP & Baseline: $M$ expert độc lập \\
+Chỉ dropout / chỉ lực / chỉ DPP & Đóng góp của từng cơ chế \\
+Lực geodesic (autodiff, bản cũ) vs. lực chiếu (dạng đóng) & Metric mới có đổi kết quả không; so thời gian mỗi bước \\
+Lực chiếu, $n_{rep}\in\{1,4,8\}$ & Độ nhạy với tần suất cập nhật lực \\
+Phần $B$ bật từ đầu vs. từ $t_B$ & Ảnh hưởng của cổng $B$ \\
+Probe vs. joint & Kiểm tra tương đương và so bộ nhớ/thời gian \\
+\bottomrule
+\end{tabularx}
+\end{center}
 
 \section{Phase 2: Uncertainty-Guided Merging và Weighted Distillation}
 \label{sec:phase2}

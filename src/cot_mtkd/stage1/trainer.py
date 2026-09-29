@@ -58,14 +58,15 @@ from ..utils.training import (
     cosine_warmup_lambda,
     divide_gradients_,
     global_clip_grad_list_,
+    vector_norm,
     zeros_like_parameters,
 )
 from .dpp import DPPMetrics, normalized_support_features, step_dpp_loss
 from .dropout import step_level_token_weights
 from .gac_gradient import apply_grassmann_force_, phase1_data_gradients
-from .grassmann import grassmann_repulsion_updates
 from .kneedle import council_kneedle_candidates, pad_candidate_support
 from .rbf import BandwidthEMA
+from .repulsion import compute_repulsion
 
 LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ class ProbeResult:
     mean_selected_k: float
     selection_count: int
     valid_candidate_count: int
+    reasoning_positions: torch.Tensor | None = None
 
 
 def _batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -124,6 +126,14 @@ def probe_stage1_dpp(
     token_count = int(views["reasoning_targets"].numel())
     if token_count == 0:
         return _empty_probe(device, len(adapter_names))
+    stage1 = config.get("stage1", {})
+    dpp_every = int(stage1.get("dpp_every", 1))
+    if dpp_every > 1 and int(global_step) % dpp_every != 0:
+        return _empty_probe(device, len(adapter_names))
+    if str(stage1.get("dpp_mode", "probe")) == "joint":
+        raise NotImplementedError(
+            "dpp_mode='joint' is not implemented in this training loop; use 'probe'"
+        )
     _, head = decoder_and_lm_head(model)
     probe_hidden_device = torch.device(
         config["runtime"].get("probe_hidden_device", "cpu")
@@ -146,6 +156,28 @@ def probe_stage1_dpp(
             ).to(probe_hidden_device)
         hidden_by_expert.append(selected_hidden)
 
+    targets = views["reasoning_targets"]
+    batch_index = views["reasoning_batch_indices"]
+    step_index = views["reasoning_step_ids"]
+    token_fraction = float(stage1.get("dpp_token_frac", 1.0))
+    positions = None
+    if token_fraction < 1.0:
+        keep = max(1, int(round(token_fraction * token_count)))
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(
+            derived_seed(base_seed, "dpp_token_frac", global_step, rng_stream)
+        )
+        positions = torch.randperm(token_count, generator=generator)[:keep].sort().values
+        hidden_by_expert = [
+            hidden.index_select(0, positions.to(hidden.device))
+            for hidden in hidden_by_expert
+        ]
+        targets = targets.index_select(0, positions.to(targets.device))
+        batch_index = batch_index.index_select(0, positions.to(batch_index.device))
+        step_index = step_index.index_select(0, positions.to(step_index.device))
+    k_max = stage1.get("dpp_topk_cap")
+    capped_k = None if k_max is None else int(k_max)
+
     candidates: list[torch.Tensor] = []
     selected_k: list[torch.Tensor] = []
 
@@ -158,7 +190,8 @@ def probe_stage1_dpp(
         council = torch.stack(probabilities).mean(dim=0)
         current, elbows = council_kneedle_candidates(
             council,
-            views["reasoning_targets"][start:end].to(council.device),
+            targets[start:end].to(council.device),
+            k_max=capped_k,
         )
         candidates.extend(current)
         selected_k.append(elbows)
@@ -166,7 +199,7 @@ def probe_stage1_dpp(
     chunked_probability_statistics(
         hidden_by_expert,
         head,
-        views["reasoning_targets"],
+        targets,
         int(config["runtime"]["council_chunk_tokens"]),
         1.0,
         select_council_candidates,
@@ -188,8 +221,8 @@ def probe_stage1_dpp(
         features = normalized_support_features(support_log_probabilities, support_mask)
         loss, metrics = step_dpp_loss(
             features[:, eligible],
-            views["reasoning_batch_indices"][eligible],
-            views["reasoning_step_ids"][eligible],
+            batch_index[eligible],
+            step_index[eligible],
             jitter=float(config["dpp"]["jitter"]),
             maximum_jitter=float(config["dpp"]["max_jitter"]),
             reduction="sum",
@@ -199,7 +232,9 @@ def probe_stage1_dpp(
         loss = torch.zeros((), device=device)
         metrics = DPPMetrics(0, 0, 0, float(config["dpp"]["jitter"]))
         gradients = torch.empty(
-            (len(adapter_names), token_count, 0), device=device, dtype=torch.float32
+            (len(adapter_names), int(targets.shape[0]), 0),
+            device=device,
+            dtype=torch.float32,
         )
     return ProbeResult(
         support_ids=support_ids,
@@ -209,8 +244,9 @@ def probe_stage1_dpp(
         dpp_sample_count=metrics.samples,
         dpp_metrics=metrics,
         mean_selected_k=float(torch.cat(selected_k).float().mean().item()),
-        selection_count=token_count,
+        selection_count=int(targets.shape[0]),
         valid_candidate_count=int(eligible.sum().item()),
+        reasoning_positions=positions,
     )
 
 
@@ -259,14 +295,29 @@ def replay_expert_gradients(
         response_regions = views["regions"][views["valid"]]
         response_reasoning = response_regions.eq(int(TokenRegion.REASONING))
         reasoning_hidden = response_hidden[response_reasoning]
+        if probe.reasoning_positions is None:
+            selected_hidden = reasoning_hidden
+        else:
+            selected_hidden = reasoning_hidden.index_select(
+                0, probe.reasoning_positions.to(reasoning_hidden.device)
+            )
         dpp_hidden_gradient = support_logprob_vjp_hidden_gradient(
-            reasoning_hidden,
+            selected_hidden,
             head,
             probe.support_ids,
             probe.dpp_logit_gradients[expert_index],
             chunk_tokens,
         )
-        dpp_full_hidden_gradient[response_reasoning] = dpp_hidden_gradient
+        if probe.reasoning_positions is None:
+            dpp_full_hidden_gradient[response_reasoning] = dpp_hidden_gradient
+        else:
+            scattered = torch.zeros_like(reasoning_hidden)
+            scattered.index_copy_(
+                0,
+                probe.reasoning_positions.to(scattered.device),
+                dpp_hidden_gradient,
+            )
+            dpp_full_hidden_gradient[response_reasoning] = scattered
 
     sft_parameter_gradients = torch.autograd.grad(
         response_hidden,
@@ -343,6 +394,34 @@ def _validate_stage1_config(config: dict[str, Any]) -> None:
         raise ValueError("stage1.diversity_weight must be non-negative")
     if float(config["stage1"]["repulsion_weight"]) < 0.0:
         raise ValueError("stage1.repulsion_weight must be non-negative")
+    if "lambda_rep" in config["stage1"] and float(config["stage1"]["lambda_rep"]) < 0.0:
+        raise ValueError("stage1.lambda_rep must be non-negative")
+    metric = str(config["stage1"].get("rep_metric", "projection_closed_form"))
+    if metric not in ("projection_closed_form", "geodesic_autograd"):
+        raise ValueError(
+            "stage1.rep_metric must be projection_closed_form or geodesic_autograd"
+        )
+    if int(config["stage1"].get("rep_every", 1)) < 1:
+        raise ValueError("stage1.rep_every must be a positive integer")
+    if float(config["stage1"].get("rep_eps_rel", 1.0e-4)) < 0.0:
+        raise ValueError("stage1.rep_eps_rel must be non-negative")
+    if float(config["stage1"].get("rep_eps_abs", 1.0e-8)) < 0.0:
+        raise ValueError("stage1.rep_eps_abs must be non-negative")
+    token_fraction = float(config["stage1"].get("dpp_token_frac", 1.0))
+    if not 0.0 < token_fraction <= 1.0:
+        raise ValueError("stage1.dpp_token_frac must be in (0, 1]")
+    if int(config["stage1"].get("dpp_every", 1)) < 1:
+        raise ValueError("stage1.dpp_every must be a positive integer")
+    dpp_mode = str(config["stage1"].get("dpp_mode", "probe"))
+    if dpp_mode == "joint":
+        raise NotImplementedError(
+            "stage1.dpp_mode='joint' is not implemented; the probe/VJP path is the supported mode"
+        )
+    if dpp_mode != "probe":
+        raise ValueError("stage1.dpp_mode must be 'probe' or 'joint'")
+    topk_cap = config["stage1"].get("dpp_topk_cap")
+    if topk_cap is not None and int(topk_cap) <= 0:
+        raise ValueError("stage1.dpp_topk_cap must be a positive integer when set")
     if not 0 <= float(config["stage1"]["step_drop_probability"]) < 1:
         raise ValueError("stage1.step_drop_probability must be in [0, 1)")
     if float(config["stage1"]["max_grad_norm"]) <= 0.0:
@@ -622,6 +701,8 @@ def train_stage1(
     selected_k_sum = 0.0
     support_selection_count = valid_candidate_count = cholesky_fallbacks = 0
     dropped_step_count = 0
+    force_cache = None
+    b_side_was_active = False
 
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
@@ -722,11 +803,36 @@ def train_stage1(
                 divide_gradients_(values, max(float(counts[-1].item()), 1.0))
 
             set_all_adapters_trainable(model, adapter_names)
-            repulsion, _kernel, distances, current_bandwidth = grassmann_repulsion_updates(
-                groups,
-                rank_epsilon=float(config["grassmann"]["rank_epsilon"]),
-                angle_epsilon=float(config["grassmann"]["angle_epsilon"]),
-                bandwidth_floor=float(config["grassmann"]["bandwidth_floor"]),
+            rep_every = int(config["stage1"].get("rep_every", 1))
+            if force_cache is None or global_step % rep_every == 0:
+                force_cache = compute_repulsion(
+                    groups,
+                    metric=str(config["stage1"].get("rep_metric", "projection_closed_form")),
+                    step=global_step,
+                    eps_rel=float(config["stage1"].get("rep_eps_rel", 1.0e-4)),
+                    eps_abs=float(config["stage1"].get("rep_eps_abs", 1.0e-8)),
+                    b_start_step=int(config["stage1"].get("rep_B_start_step", 200)),
+                    b_min_norm=float(config["stage1"].get("rep_B_min_norm", 0.0)),
+                    bandwidth_floor=float(config["grassmann"]["bandwidth_floor"]),
+                    rank_epsilon=float(config["grassmann"]["rank_epsilon"]),
+                    angle_epsilon=float(config["grassmann"]["angle_epsilon"]),
+                )
+                if (
+                    force_cache.b_active
+                    and not b_side_was_active
+                    and str(config["stage1"].get("rep_metric", "projection_closed_form"))
+                    == "projection_closed_form"
+                ):
+                    LOGGER.info(
+                        "Projection repulsion turned the B side on at step %d",
+                        global_step,
+                    )
+                b_side_was_active = force_cache.b_active
+            repulsion = force_cache.updates
+            lambda_rep = float(
+                config["stage1"]["lambda_rep"]
+                if "lambda_rep" in config["stage1"]
+                else config["stage1"]["repulsion_weight"]
             )
             final_gradients, diagnostics = phase1_data_gradients(
                 sft_buffers,
@@ -738,18 +844,41 @@ def train_stage1(
                 global_clip_grad_list_(values, float(config["stage1"]["max_grad_norm"]))
                 for values in final_gradients
             ]
+            adam_norms: list[float] = []
+            update_ratios: list[float] = []
             for parameters, gradients, force, optimizer, scheduler in zip(
                 parameter_lists, final_gradients, repulsion, optimizers, schedulers, strict=True
             ):
                 assign_gradients(parameters, gradients)
                 learning_rate = float(optimizer.param_groups[0]["lr"])
+                before = [parameter.detach().clone() for parameter in parameters]
                 optimizer.step()
+                adam_norm = float(
+                    vector_norm(
+                        [
+                            parameter.detach() - snapshot
+                            for parameter, snapshot in zip(parameters, before, strict=True)
+                        ]
+                    )
+                )
                 apply_grassmann_force_(
                     parameters,
                     force,
                     learning_rate,
-                    float(config["stage1"]["repulsion_weight"]),
+                    lambda_rep,
                 )
+                force_norm = float(vector_norm(force))
+                ratio = (learning_rate * lambda_rep * force_norm) / max(adam_norm, 1.0e-12)
+                adam_norms.append(adam_norm)
+                update_ratios.append(ratio)
+                if not math.isfinite(force_norm) or ratio > 10.0:
+                    LOGGER.warning(
+                        "Repulsion update is large or non-finite at step %d: "
+                        "||F||=%s adam_ratio=%s",
+                        global_step + 1,
+                        force_norm,
+                        ratio,
+                    )
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
             global_step += 1
@@ -758,11 +887,14 @@ def train_stage1(
                 distributed.is_main
                 and global_step % int(config["stage1"]["log_every_steps"]) == 0
             ):
-                off_diagonal = distances[
-                    torch.triu_indices(
-                        len(adapter_names), len(adapter_names), 1
-                    ).unbind()
-                ]
+                pair_index = torch.triu_indices(
+                    len(adapter_names),
+                    len(adapter_names),
+                    1,
+                    device=force_cache.distances.device,
+                )
+                off_diagonal = force_cache.distances[pair_index[0], pair_index[1]]
+                kernel_off = force_cache.kernel[pair_index[0], pair_index[1]]
                 metrics.log(
                     "stage1_step",
                     step=global_step,
@@ -777,9 +909,24 @@ def train_stage1(
                     dpp_loss=float(losses[-1].item() / max(counts[-1].item(), 1.0)),
                     dropped_reasoning_steps=int(probe_statistics[4].item()),
                     learning_rate=optimizers[0].param_groups[0]["lr"],
-                    grassmann_bandwidth=current_bandwidth,
+                    grassmann_bandwidth=force_cache.bandwidth,
                     mean_grassmann_distance=float(off_diagonal.sqrt().mean().item()),
                     min_grassmann_distance=float(off_diagonal.sqrt().min().item()),
+                    rep_mean_d2=float(off_diagonal.mean().item()),
+                    rep_min_d2=float(off_diagonal.min().item()),
+                    rep_max_d2=float(off_diagonal.max().item()),
+                    rep_mean_f=force_cache.mean_f,
+                    rep_min_f=force_cache.min_f,
+                    rep_max_f=force_cache.max_f,
+                    rep_k_min=float(kernel_off.min().item()),
+                    rep_k_max=float(kernel_off.max().item()),
+                    rep_b_active=force_cache.b_active,
+                    rep_seconds=force_cache.seconds,
+                    rep_force_norms=tuple(
+                        float(vector_norm(expert).item()) for expert in repulsion
+                    ),
+                    rep_update_ratios=tuple(update_ratios),
+                    rep_adam_norms=tuple(adam_norms),
                     mean_selected_k=float(
                         probe_statistics[0].item()
                         / max(probe_statistics[1].item(), 1.0)

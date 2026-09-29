@@ -607,6 +607,8 @@ với support được giữ cố định.
 
 # 7. Grassmann Repulsion
 
+Mặc định hiện tại là **khoảng cách chiếu** \(d^2=\sum\sin^2\theta_j\), lực dạng đóng từ Gram \(r\times r\), không QR/SVD/autograd (`stage1.rep_metric: projection_closed_form`, `src/cot_mtkd/stage1/repulsion.py`). Phần dưới đây mô tả đường **legacy** `geodesic_autograd` (QR → SVD → arccos), giữ lại để ablation. Phương trình chuẩn nằm ở Mục 4 của `docs/proposal`.
+
 ## 7.1 Cơ sở không gian con LoRA
 
 Với mỗi module LoRA:

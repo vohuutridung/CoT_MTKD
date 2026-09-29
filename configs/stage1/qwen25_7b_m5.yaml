@@ -22,6 +22,16 @@ stage1:
   step_drop_probability: 0.20
   diversity_weight: 0.2
   repulsion_weight: 1.0
+  rep_metric: projection_closed_form
+  rep_eps_rel: 1.0e-4
+  rep_eps_abs: 1.0e-8
+  rep_B_start_step: 200
+  rep_B_min_norm: 0.0
+  rep_every: 1
+  dpp_mode: probe
+  dpp_topk_cap: null
+  dpp_token_frac: 1.0
+  dpp_every: 1
   max_grad_norm: 1.0
   checkpoint_every_steps: 10
   log_every_steps: 1

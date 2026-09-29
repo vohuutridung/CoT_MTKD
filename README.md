@@ -110,6 +110,44 @@ HF_HUB_OFFLINE=1 ./project_commands.sh all
 Defaults live in `configs/pipeline.yaml`. Artifacts go under `artifacts/`.
 Method notes: `docs/stage1.md`, `docs/stage2.md`.
 
+## Phase 1 repulsion ablation
+
+Default force is the closed-form projection distance
+(`stage1.rep_metric: projection_closed_form`). The previous geodesic
+QR/SVD/autograd force remains available as `geodesic_autograd`.
+`stage1.repulsion_weight` is \(\lambda_{rep}\); set `stage1.lambda_rep` only
+when you want to override it. `dpp_topk_cap`, `dpp_token_frac < 1`, and
+`dpp_every > 1` change the DPP method and stay off by default.
+`dpp_mode: joint` is not implemented.
+
+Same seed and step budget, three runs:
+
+```bash
+# closed-form projection force (default)
+STAGE1_CONFIG=configs/stage1/qwen25_7b_m5.yaml ./project_commands.sh stage1
+
+# legacy geodesic force
+python -m cot_mtkd.cli.train_stage1 \
+  --config configs/stage1/qwen25_7b_m5.yaml \
+  --set stage1.rep_metric=geodesic_autograd \
+  --set paths.output=artifacts/stage1/geodesic
+
+# no repulsion
+python -m cot_mtkd.cli.train_stage1 \
+  --config configs/stage1/qwen25_7b_m5.yaml \
+  --set stage1.repulsion_weight=0 \
+  --set paths.output=artifacts/stage1/no_repulsion
+```
+
+Compare `rep_mean_d2`, per-expert `sft_nll`, and `rep_seconds` in each
+`metrics.jsonl`. This recipe does not claim which run is better.
+Timing only, without a training claim:
+
+```bash
+python scripts/bench_repulsion.py
+python scripts/bench_repulsion.py --full
+```
+
 ## Publish Stage-1 LoRA experts
 
 Set `HF_REPO_ID` before Stage 1 to publish automatically, or run:
