@@ -26,6 +26,7 @@ Run each stage separately:
 
 ```bash
 ./project_commands.sh prepare
+./project_commands.sh stage1-stress
 ./project_commands.sh stage1
 ./project_commands.sh supervision
 ./project_commands.sh cache
@@ -44,6 +45,23 @@ Run tests:
 ```bash
 NPROC_PER_NODE=8 ./project_commands.sh all
 ```
+
+## Phase 1 forward mode and H200 memory check
+
+Phase 1 uses one forward per expert by default. The existing two-pass replay
+remains available with `STAGE1_FORWARD_MODE=two_pass ./project_commands.sh stage1`.
+The first 10% of optimizer updates use SFT alone. During the 10–30% ramp,
+SFT and DPP use separate transformer VJPs; after 30%, they share one VJP.
+The combined path preserves the original global token and sample normalizers.
+
+After preparing the dataset and before full H200 training, run
+`./project_commands.sh stage1-stress` with exactly one H200 visible. It executes
+two ramp-path cases: the longest prepared real sample and a synthetic
+32,768-token extension of its reasoning. Each case exercises the ramp path,
+which retains both transformer VJPs and the separate gradient buffers. The report at
+`artifacts/stage1/stress_memory.json` records both peak allocated and reserved
+VRAM. A worst reserved peak below 110 GiB is marked ready for one-pass; 110–120
+GiB asks for review; 120 GiB or more recommends the two-pass fallback.
 
 ## Resume training
 

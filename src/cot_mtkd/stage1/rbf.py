@@ -99,10 +99,14 @@ class BandwidthEMA:
 
 
 def repulsion_updates(
-    groups: list[OrderedDict[str, torch.nn.Parameter]], scaling: float, bandwidth: float
+    groups: list[OrderedDict[str, torch.nn.Parameter]],
+    scaling: float,
+    bandwidth: float,
+    distances: torch.Tensor | None = None,
 ) -> tuple[list[list[torch.Tensor]], torch.Tensor, torch.Tensor]:
     """Return outward update directions `-grad(sum pairwise RBF)` for each expert."""
-    distances = effective_update_distances(groups, scaling)
+    if distances is None:
+        distances = effective_update_distances(groups, scaling)
     kernel = rbf_kernel(distances, bandwidth)
     count = len(groups)
     upper = torch.triu_indices(count, count, offset=1, device=kernel.device)

@@ -59,10 +59,11 @@ from ..utils.training import (
     divide_gradients_,
     global_clip_grad_list_,
     interaction_scale,
+    vector_norm,
     zeros_like_parameters,
 )
 from .dpp import DPPMetrics, normalized_support_features, step_dpp_loss
-from .gac_gradient import stable_gac_gradients
+from .gac_gradient import GACDiagnostics, stable_gac_gradients
 from .kneedle import build_union_support, capped_k_from_probe
 from .rbf import BandwidthEMA, effective_update_distances, repulsion_updates
 
@@ -120,6 +121,8 @@ def probe_stage1_dpp(
     base_seed: int,
     config: dict[str, Any],
     device: torch.device,
+    *,
+    reasoning_hidden_by_expert: list[torch.Tensor] | None = None,
 ) -> ProbeResult:
     views = shifted_token_views(batch)
     token_count = int(views["reasoning_targets"].numel())
@@ -136,20 +139,33 @@ def probe_stage1_dpp(
     maxima: list[torch.Tensor] = []
     chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
     probe_k = int(config["kneedle"]["probe_k"])
+    if reasoning_hidden_by_expert is not None and len(
+        reasoning_hidden_by_expert
+    ) != len(adapter_names):
+        raise ValueError(
+            "One-pass probe requires one reasoning hidden tensor per expert"
+        )
 
     model.train()
     for expert, adapter_name in enumerate(adapter_names):
-        set_active_adapter(model, adapter_name)
-        seed = derived_seed(base_seed, "stage1", global_step, rng_stream, expert)
-        with deterministic_rng(seed, device), torch.no_grad():
-            outputs = forward_hidden(
-                model, batch["input_ids"], batch["attention_mask"], use_cache=False
+        if reasoning_hidden_by_expert is None:
+            set_active_adapter(model, adapter_name)
+            seed = derived_seed(base_seed, "stage1", global_step, rng_stream, expert)
+            with deterministic_rng(seed, device), torch.no_grad():
+                outputs = forward_hidden(
+                    model, batch["input_ids"], batch["attention_mask"], use_cache=False
+                )
+                selected_hidden = gather_hidden_positions(
+                    outputs.last_hidden_state,
+                    views["reasoning_batch_indices"],
+                    views["reasoning_hidden_indices"],
+                ).to(probe_hidden_device)
+        else:
+            # Keep the decoder graph in the caller, but never build a graph
+            # through the full-vocabulary Top-k and support selection.
+            selected_hidden = (
+                reasoning_hidden_by_expert[expert].detach().to(probe_hidden_device)
             )
-            selected_hidden = gather_hidden_positions(
-                outputs.last_hidden_state,
-                views["reasoning_batch_indices"],
-                views["reasoning_hidden_indices"],
-            ).to(probe_hidden_device)
         values, ids, minimum, maximum = full_vocab_probe(
             selected_hidden,
             head,
@@ -242,6 +258,7 @@ def replay_expert_gradients(
     base_seed: int,
     chunk_tokens: int,
     device: torch.device,
+    combined_dpp_scale: float | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], float, int]:
     views = shifted_token_views(batch)
     set_active_adapter(model, adapter_name)
@@ -256,6 +273,29 @@ def replay_expert_gradients(
         views["response_batch_indices"],
         views["response_hidden_indices"],
     )
+    return _expert_gradients_from_hidden(
+        model,
+        response_hidden,
+        parameters,
+        batch,
+        probe,
+        expert_index,
+        chunk_tokens,
+        combined_dpp_scale,
+    )
+
+
+def _expert_gradients_from_hidden(
+    model: torch.nn.Module,
+    response_hidden: torch.Tensor,
+    parameters: list[torch.nn.Parameter],
+    batch: dict[str, Any],
+    probe: ProbeResult,
+    expert_index: int,
+    chunk_tokens: int,
+    combined_dpp_scale: float | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], float, int]:
+    views = shifted_token_views(batch)
     _, head = decoder_and_lm_head(model)
     sft_hidden_gradient, sft_loss_sum, sft_count = cross_entropy_hidden_gradient(
         response_hidden, head, views["response_targets"], chunk_tokens
@@ -274,11 +314,25 @@ def replay_expert_gradients(
         )
         dpp_full_hidden_gradient[response_reasoning] = dpp_hidden_gradient
 
+    if combined_dpp_scale is not None:
+        combined_parameter_gradients = torch.autograd.grad(
+            response_hidden,
+            parameters,
+            grad_outputs=sft_hidden_gradient
+            + float(combined_dpp_scale) * dpp_full_hidden_gradient,
+            allow_unused=False,
+        )
+        return (
+            [value.detach().float() for value in combined_parameter_gradients],
+            [],
+            float(sft_loss_sum.item()),
+            int(sft_count),
+        )
     sft_parameter_gradients = torch.autograd.grad(
         response_hidden,
         parameters,
         grad_outputs=sft_hidden_gradient,
-        retain_graph=True,
+        retain_graph=probe.support_ids.numel() > 0,
         allow_unused=False,
     )
     if probe.support_ids.numel() > 0:
@@ -296,6 +350,117 @@ def replay_expert_gradients(
         [value.detach().float() for value in dpp_parameter_gradients],
         float(sft_loss_sum.item()),
         int(sft_count),
+    )
+
+
+def one_pass_expert_gradients(
+    model: torch.nn.Module,
+    adapter_names: list[str],
+    parameter_lists: list[list[torch.nn.Parameter]],
+    batch: dict[str, Any],
+    global_step: int,
+    rng_stream: int,
+    base_seed: int,
+    config: dict[str, Any],
+    device: torch.device,
+    combined_dpp_scale: float | None = None,
+) -> tuple[
+    ProbeResult, list[tuple[list[torch.Tensor], list[torch.Tensor], float, int]]
+]:
+    """Forward each expert once, retaining its checkpointed graph until DPP is known."""
+    views = shifted_token_views(batch)
+    reasoning_in_response = views["regions"][views["valid"]].eq(
+        int(TokenRegion.REASONING)
+    )
+    response_hiddens: list[torch.Tensor] = []
+    reasoning_hiddens: list[torch.Tensor] = []
+    model.train()
+    for expert, adapter_name in enumerate(adapter_names):
+        set_active_adapter(model, adapter_name)
+        seed = derived_seed(base_seed, "stage1", global_step, rng_stream, expert)
+        with deterministic_rng(seed, device):
+            outputs = forward_hidden(
+                model, batch["input_ids"], batch["attention_mask"], use_cache=False
+            )
+        response_hidden = gather_hidden_positions(
+            outputs.last_hidden_state,
+            views["response_batch_indices"],
+            views["response_hidden_indices"],
+        )
+        response_hiddens.append(response_hidden)
+        reasoning_hiddens.append(response_hidden[reasoning_in_response])
+    probe = probe_stage1_dpp(
+        model,
+        adapter_names,
+        batch,
+        global_step,
+        rng_stream,
+        base_seed,
+        config,
+        device,
+        reasoning_hidden_by_expert=reasoning_hiddens,
+    )
+    del reasoning_hiddens
+    gradients = []
+    for expert, (adapter_name, parameters, response_hidden) in enumerate(
+        zip(adapter_names, parameter_lists, response_hiddens, strict=True)
+    ):
+        # Non-reentrant gradient checkpointing recomputes modules during backward.
+        # Restore the adapter used by this expert's original forward first.
+        set_active_adapter(model, adapter_name)
+        gradients.append(
+            _expert_gradients_from_hidden(
+                model,
+                response_hidden,
+                parameters,
+                batch,
+                probe,
+                expert,
+                int(config["runtime"]["lm_head_chunk_tokens"]),
+                combined_dpp_scale,
+            )
+        )
+    return probe, gradients
+
+
+def sft_only_expert_gradients(
+    model: torch.nn.Module,
+    adapter_name: str,
+    expert_index: int,
+    parameters: list[torch.nn.Parameter],
+    batch: dict[str, Any],
+    global_step: int,
+    rng_stream: int,
+    base_seed: int,
+    chunk_tokens: int,
+    device: torch.device,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], float, int]:
+    """Warm-up path: one expert forward and one SFT transformer VJP."""
+    views = shifted_token_views(batch)
+    set_active_adapter(model, adapter_name)
+    model.train()
+    seed = derived_seed(base_seed, "stage1", global_step, rng_stream, expert_index)
+    with deterministic_rng(seed, device):
+        outputs = forward_hidden(
+            model, batch["input_ids"], batch["attention_mask"], use_cache=False
+        )
+    response_hidden = gather_hidden_positions(
+        outputs.last_hidden_state,
+        views["response_batch_indices"],
+        views["response_hidden_indices"],
+    )
+    _, head = decoder_and_lm_head(model)
+    hidden_gradient, loss_sum, token_count = cross_entropy_hidden_gradient(
+        response_hidden, head, views["response_targets"], chunk_tokens
+    )
+    gradients = torch.autograd.grad(
+        response_hidden, parameters, grad_outputs=hidden_gradient, allow_unused=False
+    )
+    return (
+        [value.detach().float() for value in gradients],
+        [],
+        float(loss_sum.item()),
+        int(token_count),
     )
 
 
@@ -335,7 +500,17 @@ def _stable_config(config: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _run_compatible_config(config: dict[str, Any]) -> dict[str, Any]:
+    """A forward implementation switch does not change the training objective."""
+    value = _stable_config(config)
+    if isinstance(value.get("stage1"), dict):
+        value["stage1"].pop("forward_mode", None)
+    return value
+
+
 def _validate_stage1_config(config: dict[str, Any]) -> None:
+    if config["stage1"].get("forward_mode", "one_pass") not in {"one_pass", "two_pass"}:
+        raise ValueError("stage1.forward_mode must be one_pass or two_pass")
     if str(config["optimizer"].get("name", "")).lower() != "adamw":
         raise ValueError("Stage 1 currently implements optimizer.name: adamw")
     if str(config["scheduler"].get("name", "")).lower() != "cosine":
@@ -375,6 +550,58 @@ def _validate_stage1_config(config: dict[str, Any]) -> None:
         raise ValueError("rbf.bandwidth_floor must be positive")
     if int(config["runtime"]["lm_head_chunk_tokens"]) <= 0:
         raise ValueError("runtime.lm_head_chunk_tokens must be positive")
+
+
+def _planned_window_counts(
+    dataset: JsonlRecordDataset,
+    sampler: DistributedSampler,
+    epochs: int,
+    micro_batch: int,
+    accumulation_steps: int,
+) -> list[tuple[int, int]]:
+    """Count SFT tokens and DPP samples before a window's transformer VJPs.
+
+    A single full-phase VJP needs the global SFT-token/DPP-sample ratio. The
+    sampler order is deterministic, so these exact denominators can be planned
+    without holding any transformer graph across microbatches.
+    """
+    per_record: list[tuple[int, int]] = []
+    for index in range(len(dataset)):
+        record = dataset[index]
+        sft_tokens = sum(label != -100 for label in record.labels[1:])
+        reasoning_steps = [
+            step
+            for label, region, step in zip(
+                record.labels[1:],
+                record.region_ids[1:],
+                record.step_ids[1:],
+                strict=True,
+            )
+            if label != -100 and region == int(TokenRegion.REASONING)
+        ]
+        if any(step < 0 for step in reasoning_steps):
+            raise ValueError(
+                f"Prepared sample {record.sample_id} has an invalid reasoning step"
+            )
+        per_record.append((sft_tokens, int(bool(reasoning_steps))))
+    micro_counts: list[tuple[int, int]] = []
+    for epoch in range(epochs):
+        sampler.set_epoch(epoch)
+        indices = list(iter(sampler))
+        for start in range(0, len(indices), micro_batch):
+            group = [
+                per_record[index] for index in indices[start : start + micro_batch]
+            ]
+            micro_counts.append(
+                (sum(value[0] for value in group), sum(value[1] for value in group))
+            )
+    return [
+        (
+            sum(value[0] for value in micro_counts[start : start + accumulation_steps]),
+            sum(value[1] for value in micro_counts[start : start + accumulation_steps]),
+        )
+        for start in range(0, len(micro_counts), accumulation_steps)
+    ]
 
 
 def _save_training_checkpoint(
@@ -534,6 +761,11 @@ def train_stage1(
             )
     epochs = int(config["stage1"]["epochs"])
     total_steps = math.ceil(epochs * len(dataloader) / accumulation_steps)
+    planned_counts = _planned_window_counts(
+        dataset, sampler, epochs, micro_batch, accumulation_steps
+    )
+    if len(planned_counts) != total_steps:
+        raise RuntimeError("Planned optimizer windows do not match the dataloader")
 
     model, adapter_names = create_multi_adapter_model(
         config["model"],
@@ -560,7 +792,7 @@ def train_stage1(
         floor=float(config["rbf"]["bandwidth_floor"]),
     )
     public_config = _stable_config(config)
-    config_hash = fingerprint(_stable_config(config))
+    config_hash = fingerprint(_run_compatible_config(config))
     run_hash = fingerprint(
         {
             "config_fingerprint": config_hash,
@@ -598,13 +830,15 @@ def train_stage1(
         truncate=not bool(resume),
     )
     chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
+    forward_mode = config["stage1"].get("forward_mode", "one_pass")
     scaling = float(config["lora"]["alpha"]) / float(config["lora"]["rank"])
 
     # Accumulation deliberately crosses epoch boundaries. For the canonical
     # 1,000 x 3 run this produces ceil(3,000 / 32) = 94 optimizer updates,
     # instead of flushing three undersized batches at each epoch boundary.
     sft_buffers = [zeros_like_parameters(parameters) for parameters in parameter_lists]
-    dpp_buffers = [zeros_like_parameters(parameters) for parameters in parameter_lists]
+    dpp_buffers: list[list[torch.Tensor]] | None = None
+    full_window_counts: tuple[int, int] | None = None
     sft_token_count = 0
     dpp_sample_count = 0
     accumulated_microbatches = 0
@@ -619,30 +853,88 @@ def train_stage1(
             if epoch == start_epoch and batch_index < start_batch:
                 continue
             batch = _batch_to_device(raw_batch, distributed.device)
-            # The same stream id is used for the no-grad probe and replay so dropout
-            # masks match exactly, while distinct microbatches never reuse a mask.
+            # The same stream id preserves exact two-pass dropout replay, while
+            # distinct microbatches never reuse a mask.
             rng_stream = (
                 epoch * len(dataloader) + batch_index
             ) * distributed.world_size + distributed.rank
-            probe = probe_stage1_dpp(
-                model,
-                adapter_names,
-                batch,
-                global_step,
-                rng_stream,
-                int(config["seed"]),
-                config,
-                distributed.device,
+            progress = global_step / max(total_steps - 1, 1)
+            gamma = interaction_scale(
+                progress,
+                float(config["stage1"]["interaction_off_until"]),
+                float(config["stage1"]["interaction_ramp_until"]),
             )
-            selected_k_sum += probe.mean_selected_k * probe.selection_count
-            cap_hits += probe.cap_rate * probe.selection_count
-            saturation_hits += probe.probe_saturation_rate * probe.selection_count
-            support_selection_count += probe.selection_count
-            cholesky_fallbacks += probe.dpp_metrics.cholesky_fallbacks
-            for expert, (adapter_name, parameters) in enumerate(
-                zip(adapter_names, parameter_lists, strict=True)
-            ):
-                sft_gradient, dpp_gradient, sft_loss, token_count = (
+            phase = "sft" if gamma == 0.0 else "full" if gamma == 1.0 else "ramp"
+            combined_dpp_scale: float | None = None
+            if phase == "full":
+                if full_window_counts is None:
+                    local_counts = torch.tensor(
+                        planned_counts[global_step],
+                        device=distributed.device,
+                        dtype=torch.float64,
+                    )
+                    all_reduce_tensor(local_counts)
+                    full_window_counts = (
+                        int(local_counts[0].item()),
+                        int(local_counts[1].item()),
+                    )
+                if full_window_counts[0] <= 0:
+                    raise ValueError("A full-phase optimizer window has no SFT tokens")
+                combined_dpp_scale = (
+                    float(config["stage1"]["dpp_weight"])
+                    * full_window_counts[0]
+                    / full_window_counts[1]
+                    if full_window_counts[1] > 0
+                    else 0.0
+                )
+            elif phase == "ramp" and dpp_buffers is None:
+                dpp_buffers = [
+                    zeros_like_parameters(parameters) for parameters in parameter_lists
+                ]
+            if phase == "sft":
+                probe = _empty_probe(distributed.device, len(adapter_names))
+                expert_results = (
+                    sft_only_expert_gradients(
+                        model,
+                        adapter_name,
+                        expert,
+                        parameters,
+                        batch,
+                        global_step,
+                        rng_stream,
+                        int(config["seed"]),
+                        chunk_tokens,
+                        distributed.device,
+                    )
+                    for expert, (adapter_name, parameters) in enumerate(
+                        zip(adapter_names, parameter_lists, strict=True)
+                    )
+                )
+            elif forward_mode == "one_pass":
+                probe, expert_results = one_pass_expert_gradients(
+                    model,
+                    adapter_names,
+                    parameter_lists,
+                    batch,
+                    global_step,
+                    rng_stream,
+                    int(config["seed"]),
+                    config,
+                    distributed.device,
+                    combined_dpp_scale=combined_dpp_scale,
+                )
+            else:
+                probe = probe_stage1_dpp(
+                    model,
+                    adapter_names,
+                    batch,
+                    global_step,
+                    rng_stream,
+                    int(config["seed"]),
+                    config,
+                    distributed.device,
+                )
+                expert_results = (
                     replay_expert_gradients(
                         model,
                         adapter_name,
@@ -655,10 +947,27 @@ def train_stage1(
                         int(config["seed"]),
                         chunk_tokens,
                         distributed.device,
+                        combined_dpp_scale=combined_dpp_scale,
+                    )
+                    for expert, (adapter_name, parameters) in enumerate(
+                        zip(adapter_names, parameter_lists, strict=True)
                     )
                 )
+            selected_k_sum += probe.mean_selected_k * probe.selection_count
+            cap_hits += probe.cap_rate * probe.selection_count
+            saturation_hits += probe.probe_saturation_rate * probe.selection_count
+            support_selection_count += probe.selection_count
+            cholesky_fallbacks += probe.dpp_metrics.cholesky_fallbacks
+            for expert, (
+                sft_gradient,
+                dpp_gradient,
+                sft_loss,
+                token_count,
+            ) in enumerate(expert_results):
                 add_gradients_(sft_buffers[expert], sft_gradient)
-                add_gradients_(dpp_buffers[expert], dpp_gradient)
+                if phase == "ramp":
+                    assert dpp_buffers is not None
+                    add_gradients_(dpp_buffers[expert], dpp_gradient)
                 accumulated_sft_loss += sft_loss
                 sft_token_count += token_count if expert == 0 else 0
             accumulated_dpp_loss += probe.dpp_loss_sum
@@ -674,7 +983,9 @@ def train_stage1(
                 continue
 
             all_reduce_grad_lists(sft_buffers)
-            all_reduce_grad_lists(dpp_buffers)
+            if phase == "ramp":
+                assert dpp_buffers is not None
+                all_reduce_grad_lists(dpp_buffers)
             counts = torch.tensor(
                 [sft_token_count, dpp_sample_count],
                 device=distributed.device,
@@ -699,34 +1010,44 @@ def train_stage1(
                 dtype=torch.float64,
             )
             all_reduce_tensor(probe_statistics)
+            if (
+                phase == "full"
+                and (int(counts[0].item()), int(counts[1].item())) != full_window_counts
+            ):
+                raise RuntimeError(
+                    "Precomputed full-phase loss denominators do not match"
+                )
             for values in sft_buffers:
                 divide_gradients_(values, float(counts[0].item()))
-            for values in dpp_buffers:
-                divide_gradients_(values, float(counts[1].item()))
+            if phase == "ramp":
+                assert dpp_buffers is not None
+                for values in dpp_buffers:
+                    divide_gradients_(values, float(counts[1].item()))
 
-            set_all_adapters_trainable(model, adapter_names)
-            distance_for_bandwidth = effective_update_distances(
-                groups, scaling
-            ).detach()
-            current_bandwidth = bandwidth.update(distance_for_bandwidth)
-            repulsion, kernel, distances = repulsion_updates(
-                groups, scaling, current_bandwidth
-            )
-            progress = global_step / max(total_steps - 1, 1)
-            gamma = interaction_scale(
-                progress,
-                float(config["stage1"]["interaction_off_until"]),
-                float(config["stage1"]["interaction_ramp_until"]),
-            )
-            final_gradients, diagnostics = stable_gac_gradients(
-                sft_buffers,
-                dpp_buffers,
-                repulsion,
-                kernel,
-                gamma,
-                float(config["stage1"]["dpp_weight"]),
-                float(config["stage1"]["rbf_weight"]),
-            )
+            distances: torch.Tensor | None = None
+            current_bandwidth: float | None = None
+            if phase == "sft":
+                final_gradients = sft_buffers
+                task_norms = tuple(
+                    float(vector_norm(values).item()) for values in sft_buffers
+                )
+                diagnostics = GACDiagnostics(0.0, task_norms, (), (), (), task_norms)
+            else:
+                set_all_adapters_trainable(model, adapter_names)
+                distances_for_step = effective_update_distances(groups, scaling)
+                current_bandwidth = bandwidth.update(distances_for_step)
+                repulsion, kernel, distances = repulsion_updates(
+                    groups, scaling, current_bandwidth, distances=distances_for_step
+                )
+                final_gradients, diagnostics = stable_gac_gradients(
+                    sft_buffers,
+                    dpp_buffers if phase == "ramp" else None,
+                    repulsion,
+                    kernel,
+                    gamma,
+                    float(config["stage1"]["dpp_weight"]),
+                    float(config["stage1"]["rbf_weight"]),
+                )
             preclip_norms = [
                 global_clip_grad_list_(values, float(config["stage1"]["max_grad_norm"]))
                 for values in final_gradients
@@ -744,15 +1065,26 @@ def train_stage1(
                 distributed.is_main
                 and global_step % int(config["stage1"]["log_every_steps"]) == 0
             ):
-                off_diagonal = distances[
-                    torch.triu_indices(
-                        len(adapter_names), len(adapter_names), 1
-                    ).unbind()
-                ]
+                off_diagonal = (
+                    distances[
+                        torch.triu_indices(
+                            len(adapter_names), len(adapter_names), 1
+                        ).unbind()
+                    ]
+                    if distances is not None
+                    else None
+                )
                 metrics.log(
                     "stage1_step",
                     step=global_step,
                     epoch=epoch,
+                    forward_mode=forward_mode,
+                    interaction_phase=phase,
+                    task_gradient_kind=(
+                        "sft_plus_weighted_dpp" if phase == "full" else "sft"
+                    ),
+                    probe_computed=phase != "sft",
+                    rbf_computed=phase != "sft",
                     sft_nll=float(
                         losses[0].item()
                         / max(counts[0].item() * len(adapter_names), 1.0)
@@ -761,8 +1093,16 @@ def train_stage1(
                     interaction=gamma,
                     learning_rate=optimizers[0].param_groups[0]["lr"],
                     bandwidth=current_bandwidth,
-                    mean_delta_w_distance=float(off_diagonal.mean().item()),
-                    min_delta_w_distance=float(off_diagonal.min().item()),
+                    mean_delta_w_distance=(
+                        float(off_diagonal.mean().item())
+                        if off_diagonal is not None
+                        else None
+                    ),
+                    min_delta_w_distance=(
+                        float(off_diagonal.min().item())
+                        if off_diagonal is not None
+                        else None
+                    ),
                     mean_selected_k=float(
                         probe_statistics[0].item()
                         / max(probe_statistics[3].item(), 1.0)
@@ -803,9 +1143,8 @@ def train_stage1(
             sft_buffers = [
                 zeros_like_parameters(parameters) for parameters in parameter_lists
             ]
-            dpp_buffers = [
-                zeros_like_parameters(parameters) for parameters in parameter_lists
-            ]
+            dpp_buffers = None
+            full_window_counts = None
             sft_token_count = dpp_sample_count = accumulated_microbatches = 0
             accumulated_sft_loss = accumulated_dpp_loss = 0.0
             selected_k_sum = cap_hits = saturation_hits = 0.0

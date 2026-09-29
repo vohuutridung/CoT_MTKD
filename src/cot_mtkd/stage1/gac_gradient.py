@@ -19,20 +19,22 @@ class GACDiagnostics:
 
 def stable_gac_gradients(
     sft_gradients: list[list[torch.Tensor]],
-    dpp_gradients: list[list[torch.Tensor]],
+    dpp_gradients: list[list[torch.Tensor]] | None,
     repulsion: list[list[torch.Tensor]],
     kernel: torch.Tensor,
     interaction: float,
     dpp_weight: float,
     rbf_weight: float,
 ) -> tuple[list[list[torch.Tensor]], GACDiagnostics]:
+    """Mix separate SFT/DPP gradients or precombined full-phase task gradients.
+
+    With ``dpp_gradients=None``, ``sft_gradients`` already contains
+    ``g_SFT + dpp_weight * g_DPP`` after global loss normalization.
+    """
     count = len(sft_gradients)
     if not (
-        len(dpp_gradients)
-        == len(repulsion)
-        == count
-        == kernel.shape[0]
-        == kernel.shape[1]
+        len(repulsion) == count == kernel.shape[0] == kernel.shape[1]
+        and (dpp_gradients is None or len(dpp_gradients) == count)
     ):
         raise ValueError("Inconsistent expert dimensions in GAC inputs")
     weights = kernel.float() / kernel.float().sum(dim=0, keepdim=True).clamp_min(
@@ -47,10 +49,15 @@ def stable_gac_gradients(
             )
             for source in range(count):
                 task = sft_gradients[source][parameter_index].float()
-                diversity = dpp_gradients[source][parameter_index].float()
-                value.add_(
-                    task + dpp_weight * diversity, alpha=float(weights[source, target])
-                )
+                if dpp_gradients is None:
+                    # After the ramp, task already contains SFT + weighted DPP.
+                    value.add_(task, alpha=float(weights[source, target]))
+                else:
+                    diversity = dpp_gradients[source][parameter_index].float()
+                    value.add_(
+                        task + dpp_weight * diversity,
+                        alpha=float(weights[source, target]),
+                    )
             current.append(value)
         mixed_tasks.append(current)
 
@@ -80,7 +87,11 @@ def stable_gac_gradients(
     diagnostics = GACDiagnostics(
         interaction_scale=float(interaction),
         task_norms=tuple(float(vector_norm(values).item()) for values in sft_gradients),
-        dpp_norms=tuple(float(vector_norm(values).item()) for values in dpp_gradients),
+        dpp_norms=(
+            ()
+            if dpp_gradients is None
+            else tuple(float(vector_norm(values).item()) for values in dpp_gradients)
+        ),
         repulsion_norms_before_cap=tuple(repulsion_norms),
         repulsion_cap_factors=tuple(cap_factors),
         final_norms=tuple(float(vector_norm(values).item()) for values in final),

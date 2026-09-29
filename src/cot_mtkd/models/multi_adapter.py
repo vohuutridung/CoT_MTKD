@@ -127,9 +127,14 @@ def create_multi_adapter_model(
             adapter_name=names[0],
             autocast_adapter_dtype=False,
         )
+    base_dtype = next(base.parameters()).dtype
     for expert, name in enumerate(names[1:], start=1):
         with deterministic_rng(base_seed + expert, device):
             model.add_adapter(name, configuration)
+        # Some PEFT versions upcast added adapters to FP32 even when the first
+        # adapter inherited the BF16 base dtype.
+        for parameter in adapter_parameter_map(model, name).values():
+            parameter.data = parameter.data.to(dtype=base_dtype)
     model.to(device)
     set_active_adapter(model, names[0])
     return model, names

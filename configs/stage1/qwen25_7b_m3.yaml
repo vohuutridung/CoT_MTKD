@@ -14,6 +14,7 @@ lora:
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 stage1:
   num_experts: 3
+  forward_mode: one_pass
   epochs: 3
   learning_rate: 5.0e-5
   micro_batch_size: 1
@@ -47,7 +48,7 @@ scheduler:
   warmup_ratio: 0.10
   min_lr_ratio: 0.0
 runtime:
-  lm_head_chunk_tokens: 64
+  lm_head_chunk_tokens: 1024
   dataloader_workers: 0
   pin_memory: true
   probe_hidden_device: cpu

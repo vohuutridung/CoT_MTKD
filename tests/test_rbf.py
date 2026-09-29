@@ -30,6 +30,24 @@ class RBFTest(unittest.TestCase):
         actual = low_rank_squared_distance(a_i, b_i, a_j, b_j, scaling=1.0)
         self.assertTrue(torch.allclose(expected, actual, atol=1e-5, rtol=1e-5))
 
+    def test_low_rank_gradient_matches_materialized_update(self) -> None:
+        torch.manual_seed(19)
+        factors = [
+            torch.randn(3, 7, requires_grad=True),
+            torch.randn(5, 3, requires_grad=True),
+            torch.randn(3, 7, requires_grad=True),
+            torch.randn(5, 3, requires_grad=True),
+        ]
+        a_i, b_i, a_j, b_j = factors
+        scaling = 1.25
+        dense = ((b_i @ a_i) - (b_j @ a_j)).square().sum() * scaling**2
+        expected = torch.autograd.grad(dense, factors)
+        low_rank = low_rank_squared_distance(*factors, scaling=scaling)
+        actual = torch.autograd.grad(low_rank, factors)
+        self.assertTrue(torch.allclose(dense.detach(), low_rank.detach(), atol=1e-4))
+        for left, right in zip(expected, actual, strict=True):
+            self.assertTrue(torch.allclose(left, right, atol=1e-4, rtol=1e-5))
+
     def test_lora_gauge_invariance(self) -> None:
         torch.manual_seed(2)
         a, b = torch.randn(2, 3), torch.randn(4, 2)
@@ -50,6 +68,23 @@ class RBFTest(unittest.TestCase):
                     parameter.add_(delta, alpha=1.0e-3)
         after = float(effective_update_distances(groups, 1.0)[0, 1].detach())
         self.assertGreater(after, before)
+
+    def test_reusing_distances_preserves_repulsion(self) -> None:
+        groups = [
+            group(torch.tensor([[1.0]]), torch.tensor([[0.5]])),
+            group(torch.tensor([[1.0]]), torch.tensor([[0.8]])),
+            group(torch.tensor([[1.0]]), torch.tensor([[1.1]])),
+        ]
+        recomputed, kernel, distance = repulsion_updates(groups, 1.0, 0.1)
+        prepared = effective_update_distances(groups, 1.0)
+        reused, reused_kernel, reused_distance = repulsion_updates(
+            groups, 1.0, 0.1, distances=prepared
+        )
+        self.assertTrue(torch.equal(kernel, reused_kernel))
+        self.assertTrue(torch.equal(distance, reused_distance))
+        for old_group, new_group in zip(recomputed, reused, strict=True):
+            for old, new in zip(old_group, new_group, strict=True):
+                self.assertTrue(torch.equal(old, new))
 
 
 if __name__ == "__main__":
