@@ -275,7 +275,7 @@ Logged metric: `nll` (= `total_loss`).
 
 | Hạng mục | Default 7B |
 | --- | --- |
-| Init | merge $M=5$ expert (`merge_method=ta`) |
+| Init | merge $M=3$ expert (`merge_method=ta`) |
 | Epochs | 5 (scheduler horizon) |
 | Benchmark checkpoint | ~epoch 3 (step 1500) |
 | Micro batch | 1 |

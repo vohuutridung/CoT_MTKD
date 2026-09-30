@@ -17,7 +17,7 @@ scripts/20_train_stage1.sh
 Default config:
 
 ```text
-configs/stage1/qwen25_7b_m5.yaml
+configs/stage1/qwen25_7b_m3.yaml
 ```
 
 Output:
@@ -38,7 +38,7 @@ artifacts/stage1/main/
 
 ## 1. Mục tiêu
 
-Stage 1 huấn luyện **$M = 5$ LoRA experts** độc lập trên cùng base model:
+Stage 1 huấn luyện **$M = 3$ LoRA experts** độc lập trên cùng base model:
 
 ```text
 Qwen/Qwen2.5-7B-Instruct
@@ -94,7 +94,7 @@ Một optimizer step:
 
 | Ký hiệu                  | Ý nghĩa                                    |
 | ------------------------ | ------------------------------------------ |
-| $M$                      | Số experts (`num_experts = 5`)             |
+| $M$                      | Số experts (`num_experts = 3`)             |
 | $m \in {1,\ldots,M}$     | Chỉ số expert                              |
 | $i$                      | Sample trong batch                         |
 | $t$                      | Vị trí token (response / reasoning)        |
@@ -894,7 +894,7 @@ $$
 Từ:
 
 ```text
-configs/stage1/qwen25_7b_m5.yaml
+configs/stage1/qwen25_7b_m3.yaml
 ```
 
 | Nhóm                    | Giá trị                                   |
@@ -906,7 +906,7 @@ configs/stage1/qwen25_7b_m5.yaml
 | LoRA alpha              | $8$                                       |
 | LoRA dropout            | $0$                                       |
 | LoRA targets            | `q,k,v,o,gate,up,down`                    |
-| Experts                 | $M=5$                                     |
+| Experts                 | $M=3$                                     |
 | Epochs                  | $5$ (scheduler horizon)                   |
 | Benchmark checkpoint    | ~epoch $3$                                |
 | Learning rate           | $5\times10^{-5}$                          |
@@ -1058,7 +1058,7 @@ Hoặc publish thủ công:
 
 | Stage         | Phụ thuộc Stage 1                                              |
 | ------------- | -------------------------------------------------------------- |
-| `supervision` | Load 5 adapters → $U_i$ / $V_i$ / PAG / teacher features |
+| `supervision` | Load 3 adapters → $U_i$ / $V_i$ / PAG / teacher features |
 | `stage2`      | Merge experts (TA/TIES/…) → student; weighted NLL        |
 
 Stage 1 chỉ sinh một **hội đồng experts đa dạng**.
@@ -1228,4 +1228,4 @@ $$
 
 được áp dụng trực tiếp lên LoRA parameters sau AdamW.
 
-Kết quả cuối cùng là một council gồm **5 LoRA experts** vừa fit tốt CoT, vừa đa dạng ở token space, vừa được tách trong parameter subspace để đo $U_i,V_i$ và merge thành student ở Stage 2.
+Kết quả cuối cùng là một council gồm **3 LoRA experts** vừa fit tốt CoT, vừa đa dạng ở token space, vừa được tách trong parameter subspace để đo $U_i,V_i$ và merge thành student ở Stage 2.

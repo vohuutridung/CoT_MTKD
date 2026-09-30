@@ -29,7 +29,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--config",
-        default="configs/stage1/qwen25_7b_m5.yaml",
+        default="configs/stage1/qwen25_7b_m3.yaml",
         help="Stage-1 YAML config, used to locate its output directory",
     )
     parser.add_argument(

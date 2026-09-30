@@ -1,6 +1,6 @@
 # Cấu hình huấn luyện (7B)
 
-Nguồn: `configs/stage1/qwen25_7b_m5.yaml`, `configs/stage2/qwen25_7b.yaml`, `configs/data/s1k_1_1.yaml`.
+Nguồn: `configs/stage1/qwen25_7b_m3.yaml`, `configs/stage2/qwen25_7b.yaml`, `configs/data/s1k_1_1.yaml`.
 
 Model: `Qwen/Qwen2.5-7B-Instruct` · seed `42` · dtype `bfloat16`.
 
@@ -16,7 +16,7 @@ Model: `Qwen/Qwen2.5-7B-Instruct` · seed `42` · dtype `bfloat16`.
 | Target Modules | `["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]` |
 | Bias | none |
 
-LoRA này dùng chung cho 5 expert Stage 1 và student Stage 2.
+LoRA này dùng chung cho 3 expert Stage 1 và student Stage 2.
 
 ---
 
@@ -34,7 +34,7 @@ LoRA này dùng chung cho 5 expert Stage 1 và student Stage 2.
 | Max Sequence Length | 32,768 | 32,768 |
 | Learning Rate (LR) | **5.00e-05** | **5.00e-05** |
 | Max grad norm | 1.0 | 1.0 |
-| Số expert | 5 | 1 (init từ merge) |
+| Số expert | 3 | 1 (init từ merge) |
 | Step dropout | 0.20 | — |
 | Diversity weight (DPP) | 0.2 | — |
 | Repulsion weight (Grassmann) | 1.0 | — |

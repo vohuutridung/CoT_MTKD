@@ -99,7 +99,7 @@ python -m cot_mtkd.cli.train_stage2 \
 
 ```bash
 DATA_CONFIG=configs/data/s1k_1_1.yaml ./project_commands.sh prepare
-STAGE1_CONFIG=configs/stage1/qwen25_7b_m5.yaml ./project_commands.sh stage1
+STAGE1_CONFIG=configs/stage1/qwen25_7b_m3.yaml ./project_commands.sh stage1
 SIGNALS_CONFIG=configs/signals/main.yaml ./project_commands.sh supervision
 STAGE2_CONFIG=configs/stage2/qwen25_7b.yaml ./project_commands.sh stage2
 CACHE_CONFIG=configs/cache/qwen25_7b_top512_tail.yaml ./project_commands.sh cache
@@ -124,17 +124,17 @@ Same seed and step budget, three runs:
 
 ```bash
 # closed-form projection force (default)
-STAGE1_CONFIG=configs/stage1/qwen25_7b_m5.yaml ./project_commands.sh stage1
+STAGE1_CONFIG=configs/stage1/qwen25_7b_m3.yaml ./project_commands.sh stage1
 
 # legacy geodesic force
 python -m cot_mtkd.cli.train_stage1 \
-  --config configs/stage1/qwen25_7b_m5.yaml \
+  --config configs/stage1/qwen25_7b_m3.yaml \
   --set stage1.rep_metric=geodesic_autograd \
   --set paths.output=artifacts/stage1/geodesic
 
 # no repulsion
 python -m cot_mtkd.cli.train_stage1 \
-  --config configs/stage1/qwen25_7b_m5.yaml \
+  --config configs/stage1/qwen25_7b_m3.yaml \
   --set stage1.repulsion_weight=0 \
   --set paths.output=artifacts/stage1/no_repulsion
 ```
