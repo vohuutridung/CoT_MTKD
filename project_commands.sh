@@ -14,7 +14,8 @@ Usage: ./project_commands.sh COMMAND
 Commands:
   setup         Create .venv and install the local project.
   prepare       Download/read and preprocess s1K-1.1.
-  stage1        Train the five GAC-CoT LoRA experts.
+  stage1        Train the three GAC-CoT LoRA experts.
+  stage1-smoke  Run Stage 1 on Qwen2.5-0.5B with the Stage-1 hyperparameters.
   publish-stage1 Publish completed Stage-1 LoRA experts to Hugging Face.
   supervision  Build PAG, importance, council U/V/ρ, teacher weights, and medoid.
   cache         Optional Top-512 plus tail-bucket teacher targets (not used by Stage 2).
@@ -39,6 +40,7 @@ case "$command" in
   setup) run_step 00_setup.sh ;;
   prepare) run_step 10_prepare_data.sh ;;
   stage1) run_step 20_train_stage1.sh ;;
+  stage1-smoke) run_step 21_smoke_stage1_0p5b.sh ;;
   publish-stage1) bash "$PROJECT_ROOT/scripts/25_publish_stage1.sh" ;;
   supervision) run_step 30_build_supervision.sh ;;
   cache) run_step 40_build_teacher_cache.sh ;;
