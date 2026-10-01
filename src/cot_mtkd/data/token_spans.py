@@ -47,7 +47,38 @@ def assign_token_regions(
                 best = last_segment
         regions.append(int(best.region))
         steps.append(best.step_id)
+    _restore_missing_content_tokens(offsets, segments, regions, steps)
     return regions, steps
+
+
+def _restore_missing_content_tokens(
+    offsets: Sequence[tuple[int, int]],
+    segments: Sequence[CharacterSegment],
+    regions: list[int],
+    steps: list[int],
+) -> None:
+    # A short step (e.g. "|") can be merged by the tokenizer with its trailing
+    # delimiter ("|\n\n") into one token that overlaps the delimiter more, leaving
+    # the step without any content token. Give such a step its best-overlapping
+    # token so every step keeps at least one REASONING token.
+    covered = {
+        step
+        for region, step in zip(regions, steps)
+        if region == int(TokenRegion.REASONING)
+    }
+    for segment in segments:
+        if segment.region != TokenRegion.REASONING or segment.step_id in covered:
+            continue
+        candidates = [
+            index
+            for index, (start, end) in enumerate(offsets)
+            if end > start and segment.overlap(start, end) > 0
+        ]
+        if not candidates:
+            continue
+        index = max(candidates, key=lambda i: segment.overlap(*offsets[i]))
+        regions[index] = int(TokenRegion.REASONING)
+        steps[index] = segment.step_id
 
 
 def complete_step_truncate(
