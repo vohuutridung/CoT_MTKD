@@ -902,16 +902,16 @@ configs/stage1/qwen25_7b_m3.yaml
 | Model                   | `Qwen/Qwen2.5-7B-Instruct` (revision pin) |
 | Precision               | `bf16`                                    |
 | Attention               | FlashAttention-2                          |
-| LoRA rank               | $4$                                       |
-| LoRA alpha              | $8$                                       |
-| LoRA dropout            | $0$                                       |
+| LoRA rank               | $16$                                      |
+| LoRA alpha              | $16$ ($s=\alpha/r=1$, `use_rslora=false`) |
+| LoRA dropout            | $0.05$                                    |
 | LoRA targets            | `q,k,v,o,gate,up,down`                    |
 | Experts                 | $M=3$                                     |
-| Epochs                  | $5$ (scheduler horizon)                   |
-| Benchmark checkpoint    | ~epoch $3$                                |
+| Epochs                  | $3$ (scheduler horizon)                   |
+| Benchmark checkpoint    | epoch $3$ (trùng bước cuối)               |
 | Learning rate           | $5\times10^{-5}$                          |
 | Micro batch             | $1$                                       |
-| Global batch            | $2$                                       |
+| Global batch            | $32$ (`gradient_accumulation_steps=32`)   |
 | Step dropout            | $p_{\mathrm{drop}}=0.20$                  |
 | Diversity weight        | $\lambda_{\mathrm{div}}=0.2$              |
 | Repulsion weight        | $\lambda_{\mathrm{rep}}=1.0$              |
@@ -936,35 +936,35 @@ configs/stage1/qwen25_7b_m3.yaml
 Canonical dataset:
 
 ```text
-1000 samples × 5 epochs × global batch 2
+1000 samples × 3 epochs × global batch 32
 ```
 
 Tổng số samples được xử lý:
 
 $$
-1000 \times 5
+1000 \times 3
 =
-5000
+3000
 $$
 
 Số optimizer updates:
 
 $$
 \left\lceil
-\frac{5000}{2}
+\frac{3000}{32}
 \right\rceil
 =
-2500
+94
 $$
 
-Benchmark checkpoint (~epoch 3):
+Benchmark checkpoint (epoch 3, trùng bước cuối):
 
 $$
 \left\lceil
-\frac{1000 \times 3}{2}
+\frac{1000 \times 3}{32}
 \right\rceil
 =
-1500
+94
 $$
 
 **Accumulation không flush ở biên epoch.**

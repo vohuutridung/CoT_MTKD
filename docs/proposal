@@ -235,10 +235,10 @@ Một số tính chất có ý nghĩa thực hành:
 \end{itemize}
 
 \paragraph{Ổn định số.}
-$C_{pp}$ được thay bằng $\tilde C_{pp}=C_{pp}+\big(\varepsilon_{rel}\,\tfrac{\operatorname{tr}C_{pp}}{r}+\varepsilon_{abs}\big)I$ (ridge tương đối, ví dụ $\varepsilon_{rel}=10^{-4}$, $\varepsilon_{abs}=10^{-8}$) trong mọi nghịch đảo. Gram và nghịch đảo tính ở fp32. Với khởi tạo LoRA chuẩn ($B=0$), $\mathrm{col}(B)$ chưa xác định; do đó phần $B$ của \eqref{eq:grasstotal} và của lực chỉ được bật từ bước $t_B$ (hoặc khi $\min_m\|B_m\|_F$ vượt ngưỡng), còn trước đó chỉ dùng phần $A$. Đây là một lựa chọn hiện thực hóa và được ghi trong báo cáo thí nghiệm.
+$C_{pp}$ được thay bằng $\tilde C_{pp}=C_{pp}+\big(\varepsilon_{rel}\,\tfrac{\operatorname{tr}C_{pp}}{r}+\varepsilon_{abs}\big)I$ (ridge tương đối; cấu hình chạy dùng $\varepsilon_{rel}=10^{-4}$, $\varepsilon_{abs}=10^{-8}$) trong mọi nghịch đảo. Gram và nghịch đảo tính ở fp32. Với khởi tạo LoRA chuẩn ($B=0$), $\mathrm{col}(B)$ chưa xác định. Phía $B$ của \eqref{eq:grasstotal} và của lực chỉ bật khi đồng thời $t\ge t_B$ và $\min_m\|B_m\|_F>\tau_B$; trước đó chỉ dùng phía $A$.
 
 \paragraph{Cách tính và chi phí.}
-Mọi đại lượng chỉ phụ thuộc các Gram $C_{pq}$ cỡ $r\times r$. Với các mô-đun cùng shape (ví dụ q/k/v/o hoặc up/down qua các layer), xếp thành chiều batch $L$; mỗi nhóm tính $X_{all}\in\mathbb R^{L\times Mr\times d}$ và $G=X_{all}X_{all}^\top$ bằng một GEMM, rồi tách các khối $r\times r$. Chi phí mỗi nhóm là $O(L\,M^2r^2d)$ cho GEMM cộng $O(L\,M\,r^3)$ cho $M$ nghịch đảo và $O(L\,M^2r^3)$ cho các tích $r\times r$. Toàn bộ chạy dưới \texttt{no\_grad}, không lưu graph, không có QR/SVD. Với $d=4096$, $r=16$, $M=4$, mỗi mô-đun cần khoảng $2\times10^7$ FLOPs cho Gram, không đáng kể so với forward/backward qua $\theta_{base}$; nút thắt còn lại là số lần gọi kernel, được giải quyết bằng gộp theo shape. Lực có thể được cập nhật mỗi $n_{rep}$ bước (mặc định $1$) và tái dùng ở các bước giữa, vì các không gian con thay đổi chậm.
+Mọi đại lượng chỉ phụ thuộc các Gram $C_{pq}$ cỡ $r\times r$. Với các mô-đun cùng shape (ví dụ q/k/v/o hoặc up/down qua các layer), xếp thành chiều batch $L$; mỗi nhóm tính $X_{all}\in\mathbb R^{L\times Mr\times d}$ và $G=X_{all}X_{all}^\top$ bằng một GEMM, rồi tách các khối $r\times r$. Chi phí mỗi nhóm là $O(L\,M^2r^2d)$ cho GEMM cộng $O(L\,M\,r^3)$ cho $M$ nghịch đảo và $O(L\,M^2r^3)$ cho các tích $r\times r$. Toàn bộ chạy dưới \texttt{no\_grad}, không lưu graph, không có QR/SVD. Với $d=4096$, $r=16$, $M=4$, mỗi mô-đun cần khoảng $2\times10^7$ FLOPs cho Gram; đây là ví dụ đếm phép tính. Cấu hình chạy ở Mục~\ref{sec:p1config} dùng $r=16$, $M=3$. Chi phí này không đáng kể so với forward/backward qua $\theta_{base}$; nút thắt còn lại là số lần gọi kernel, được giải quyết bằng gộp theo shape. Lực có thể được cập nhật mỗi $n_{rep}$ bước (cấu hình chạy dùng $n_{rep}=1$) và tái dùng ở các bước giữa, vì các không gian con thay đổi chậm.
 
 \subsection{Phân hóa trong không gian đầu ra với Top-$k$ động và DPP}
 \label{sec:outputdiv}
@@ -376,10 +376,38 @@ Ba chỗ cần đọc cùng \eqref{eq:phase1update}. Mẫu số của \eqref{eq:
 
 Cổng $B$ trong thủ tục này yêu cầu đồng thời $t\ge t_B$ và $\min_m\|B_m\|_F>\tau_B$. $\tau_B$ mặc định bằng $0$, nên khởi tạo $B=0$ vẫn tắt phía $B$ cho đến khi cả hai điều kiện đúng. $\pi_{dpp}<1$, $n_{dpp}>1$ và trần Top-$k$ là các tuỳ chọn tắt mặc định, vì chúng đổi nhẹ tập token mà DPP nhìn thấy.
 
+\subsection{Cấu hình thí nghiệm}
+\label{sec:p1config}
+
+Các số dưới đây lấy từ \texttt{configs/stage1/qwen25\_7b\_m3.yaml}. Chúng là lựa chọn chạy, không suy ra từ các phương trình phía trên. $\lambda_{rep}=1$ vẫn là trọng số của bản geodesic. Trần của $d^2$ nay là $2r$ thay vì $r\pi^2$, nên hệ số này chưa được chỉnh lại bằng thí nghiệm.
+
+Base $\theta_{base}$ là Qwen2.5-7B-Instruct, đóng băng, dtype bfloat16. $M=3$ adapter LoRA với $r=16$, $\alpha=16$, nên $s=\alpha/r=1$ vì \texttt{use\_rslora}, \texttt{use\_dora} và \texttt{use\_qalora} đều tắt. Dropout LoRA bằng $0.05$; không học bias. Dropout này là dropout của adapter, khác với $p_{drop}$ của loss. Expert $m$ khởi tạo bằng seed $42+m$: $A$ khác nhau giữa các expert, $B=0$. Mô-đun đích là \texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj}, \texttt{o\_proj}, \texttt{gate\_proj}, \texttt{up\_proj}, \texttt{down\_proj}. Dữ liệu là s1K-1.1, 1000 mẫu. Chuỗi đưa vào loss là câu hỏi cộng thinking, không gồm attempt; độ dài tối đa $32768$. NLL không có label smoothing.
+
+Huấn luyện $3$ epoch, $\eta_{\max}=5\times 10^{-5}$. AdamW dùng $(\beta_1,\beta_2)=(0.9,\,0.999)$, $\varepsilon=10^{-8}$, weight decay $0$. Micro-batch bằng $1$, global batch bằng $32$, nên trên một GPU thì $G=32$ và số bước optimizer là $\lceil 1000\times 3/32\rceil=94$. Warmup chiếm $0.1$ số bước, tức $9$ bước, rồi cosine về $\eta_{\min}=0$. Gradient dữ liệu bị cắt ở chuẩn $\ell_2$ bằng $1$. Snapshot \texttt{benchmark/} ghi ở epoch $3$, trùng bước cuối.
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Ký hiệu & Giá trị đang chạy \\
+\midrule
+$M$ & $3$ \\
+$r$, $\alpha$, $s$ & $16$, $16$, $1$; dropout LoRA $0.05$; RSLoRA/DoRA/QALoRA tắt \\
+$p_{drop}$ & $0.20$ \\
+$\lambda_{div}$ & $0.2$ \\
+$\lambda_{rep}$ & $1.0$, chưa chỉnh theo thang $d^2$ mới \\
+$\varepsilon_{rel}$, $\varepsilon_{abs}$ & $10^{-4}$, $10^{-8}$ \\
+$t_B$, $\tau_B$, $n_{rep}$ & $200$, $0$, $1$ \\
+DPP & probe; $\alpha=10^{-5}$, jitter tăng tối đa $10^{-2}$ khi Cholesky thất bại; $\pi_{dpp}=1$, $n_{dpp}=1$, không trần $K_{\max}$ \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Phase 1 chạy Kneedle trên toàn bộ từ vựng. \texttt{kneedle.probe\_k}, \texttt{min\_k} và \texttt{max\_k} chỉ dùng khi dựng tín hiệu Phase 2.
+
 \subsection{Siêu tham số, chẩn đoán và ablation}
 \label{sec:p1ablation}
 
-Siêu tham số chính: $p_{drop}$, $\lambda_{div}$, $\lambda_{rep}$, $\varepsilon_{rel}$, $t_B$, $n_{rep}$. Thang của $d^2$ nay tối đa là $2r$ (trước đó $r\pi^2$), nên $\lambda_{rep}$ cần chỉnh lại, không giữ nguyên giá trị của bản geodesic.
+Siêu tham số chính của phương pháp là $p_{drop}$, $\lambda_{div}$, $\lambda_{rep}$, $\varepsilon_{rel}$, $t_B$ và $n_{rep}$. Giá trị đang chạy nằm ở Mục~\ref{sec:p1config}.
 
 Các đại lượng cần ghi log: $\bar d^2$ và $\bar f_{pq}$ trung bình theo cặp; $\min/\max$ của $K$; $\|F_{rep}\|$ và tỉ số $\|\eta\lambda_{rep}F_{rep}\|/\|\Delta\phi\|_{AdamW}$; NLL từng expert; độ đa dạng DPP; $V_i$ trung bình tính trên tập validation.
 

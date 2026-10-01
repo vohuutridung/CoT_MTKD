@@ -10,9 +10,10 @@ Model: `Qwen/Qwen2.5-7B-Instruct` · seed `42` · dtype `bfloat16`.
 
 | Tham số | Giá trị |
 |---|---|
-| LoRA Rank (r) | 4 |
-| LoRA Alpha (α) | 8 |
-| LoRA Dropout | 0.0% |
+| LoRA Rank (r) | 16 |
+| LoRA Alpha (α) | 16 |
+| LoRA Dropout | 0.05 |
+| use_rslora / use_dora / use_qalora | false / false / false |
 | Target Modules | `["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]` |
 | Bias | none |
 
@@ -24,13 +25,13 @@ LoRA này dùng chung cho 3 expert Stage 1 và student Stage 2.
 
 | Tham số | Stage 1 | Stage 2 |
 |---|---|---|
-| Số Epoch | 5 | 5 |
-| Scheduler horizon | 5 epoch | 5 epoch |
-| Benchmark checkpoint | ~epoch 3 | ~epoch 3 |
+| Số Epoch | 3 | 3 |
+| Scheduler horizon | 3 epoch | 3 epoch |
+| Benchmark checkpoint | epoch 3 (bước cuối) | epoch 3 (bước cuối) |
 | Micro batch size | 1 | 1 |
-| Effective Batch Size (`global_batch_size`) | **2** | **2** |
-| Gradient accumulation (world_size=1) | 2 | 2 |
-| Optimizer updates / run | ceil(1000 × 5 / 2) = 2500 | 2500 |
+| Effective Batch Size (`global_batch_size`) | **32** | **32** |
+| Gradient accumulation (world_size=1) | 32 | 32 |
+| Optimizer updates / run | ceil(1000 × 3 / 32) = 94 | 94 |
 | Max Sequence Length | 32,768 | 32,768 |
 | Learning Rate (LR) | **5.00e-05** | **5.00e-05** |
 | Max grad norm | 1.0 | 1.0 |
@@ -41,9 +42,9 @@ LoRA này dùng chung cho 3 expert Stage 1 và student Stage 2.
 | Merge method | — | `ta` (ablate: ties, dare_ties, tsv, iso_c) |
 | $\lambda_U$ / $\lambda_D$ | — | 0.5 / 0.5 |
 
-Effective batch = `micro_batch_size × world_size × accumulation` = 1 × 1 × 2 = **2**.
+Effective batch = `micro_batch_size × world_size × accumulation` = 1 × 1 × 32 = **32**. Cấu hình này gắn với một process: `gradient_accumulation_steps` được ghi tường minh là 32, nên `world_size` phải là 1.
 
-Cosine schedule trải đủ 5 epoch (2500 bước). Snapshot `benchmark/` được ghi khoảng epoch 3 (bước 1500) để eval giữa lịch, trước khi LR về 0 ở cuối epoch 5.
+Cosine schedule trải đủ 3 epoch (94 bước). Warmup là `round(0.1 × 94) = 9` bước. Snapshot `benchmark/` trùng bước cuối (94) vì `benchmark_checkpoint_epoch` là 3 trên lịch 3 epoch.
 
 ---
 

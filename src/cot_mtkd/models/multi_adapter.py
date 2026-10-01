@@ -98,17 +98,27 @@ def load_base_causal_lm(model_config: dict[str, Any], device: torch.device):
 
 
 def lora_config(lora: dict[str, Any]):
+    import inspect
+
     from peft import LoraConfig, TaskType
 
-    return LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=int(lora["rank"]),
-        lora_alpha=int(lora["alpha"]),
-        lora_dropout=float(lora["dropout"]),
-        target_modules=list(lora["target_modules"]),
-        bias="none",
-        inference_mode=False,
-    )
+    kwargs: dict[str, Any] = {
+        "task_type": TaskType.CAUSAL_LM,
+        "r": int(lora["rank"]),
+        "lora_alpha": int(lora["alpha"]),
+        "lora_dropout": float(lora["dropout"]),
+        "target_modules": list(lora["target_modules"]),
+        "bias": "none",
+        "inference_mode": False,
+    }
+    parameters = inspect.signature(LoraConfig).parameters
+    for key in ("use_rslora", "use_dora", "use_qalora"):
+        enabled = bool(lora.get(key, False))
+        if key in parameters:
+            kwargs[key] = enabled
+        elif enabled:
+            raise ValueError(f"Installed PEFT does not support LoRA flag {key}")
+    return LoraConfig(**kwargs)
 
 
 def create_multi_adapter_model(

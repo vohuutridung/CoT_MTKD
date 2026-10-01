@@ -276,16 +276,16 @@ Logged metric: `nll` (= `total_loss`).
 | Hạng mục | Default 7B |
 | --- | --- |
 | Init | merge $M=3$ expert (`merge_method=ta`) |
-| Epochs | 5 (scheduler horizon) |
-| Benchmark checkpoint | ~epoch 3 (step 1500) |
+| Epochs | 3 (scheduler horizon) |
+| Benchmark checkpoint | epoch 3 (step 94, trùng bước cuối) |
 | Micro batch | 1 |
-| Global batch | 2 |
-| Accumulation (1 GPU) | 2 |
-| Optimizer updates | $\lceil 1000\times 5/2\rceil=2500$ |
+| Global batch | 32 |
+| Accumulation (1 GPU) | 32 |
+| Optimizer updates | $\lceil 1000\times 3/32\rceil=94$ |
 | LR | $5\times 10^{-5}$ |
 | Optimizer | AdamW, $\beta=(0.9,0.999)$, wd $=0$ |
 | Scheduler | cosine, `warmup_ratio=0.10` |
-| LoRA rank / alpha / dropout | $4$ / $8$ / $0$ |
+| LoRA rank / alpha / dropout | $16$ / $16$ / $0.05$ (`use_rslora=false`) |
 | Clip | 1.0 |
 | $\lambda_U$, $\lambda_D$ | 0.5, 0.5 |
 
