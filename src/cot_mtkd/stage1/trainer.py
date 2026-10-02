@@ -65,9 +65,9 @@ from ..utils.training import (
 from .dpp import DPPMetrics, normalized_support_features, step_dpp_loss
 from .dropout import step_level_token_weights
 from .gac_gradient import apply_grassmann_force_, phase1_data_gradients
-from .kneedle import council_kneedle_candidates, pad_candidate_support
+from .kneedle import council_kneedle_candidates, dpp_support_rates, pad_candidate_support
 from .rbf import BandwidthEMA
-from .repulsion import compute_repulsion
+from .repulsion import compute_repulsion, lora_b_force_norms
 
 LOGGER = logging.getLogger(__name__)
 
@@ -84,6 +84,8 @@ class ProbeResult:
     selection_count: int
     valid_candidate_count: int
     reasoning_positions: torch.Tensor | None = None
+    tail_mass_sum: float = 0.0
+    ystar_outside_count: int = 0
 
 
 def _batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -181,6 +183,8 @@ def probe_stage1_dpp(
 
     candidates: list[torch.Tensor] = []
     selected_k: list[torch.Tensor] = []
+    tail_mass_sum = 0.0
+    ystar_outside_count = 0
 
     def select_council_candidates(
         start: int,
@@ -188,14 +192,17 @@ def probe_stage1_dpp(
         probabilities: list[torch.Tensor],
         _log_probabilities: list[torch.Tensor],
     ) -> None:
+        nonlocal tail_mass_sum, ystar_outside_count
         council = torch.stack(probabilities).mean(dim=0)
-        current, elbows = council_kneedle_candidates(
+        current, elbows, tail_mass, ystar_outside = council_kneedle_candidates(
             council,
             targets[start:end].to(council.device),
             k_max=capped_k,
         )
         candidates.extend(current)
         selected_k.append(elbows)
+        tail_mass_sum += float(tail_mass.sum().item())
+        ystar_outside_count += int(ystar_outside.sum().item())
 
     chunked_probability_statistics(
         hidden_by_expert,
@@ -248,6 +255,8 @@ def probe_stage1_dpp(
         selection_count=int(targets.shape[0]),
         valid_candidate_count=int(eligible.sum().item()),
         reasoning_positions=positions,
+        tail_mass_sum=tail_mass_sum,
+        ystar_outside_count=ystar_outside_count,
     )
 
 
@@ -380,6 +389,79 @@ def _stable_config(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(value.get("stage1"), dict):
         value["stage1"].pop("resume_from", None)
     return value
+
+
+def per_expert_sft_nll(
+    numerators: list[float] | tuple[float, ...],
+    denominators: list[float] | tuple[float, ...],
+) -> list[float]:
+    """Per-expert NLL from sums that have already been all-reduced.
+
+    Divide only after the numerator and the segment count have been summed
+    across ranks. Dividing on each rank and then averaging is a different
+    statistic when experts drop different steps.
+    """
+    if len(numerators) != len(denominators):
+        raise ValueError("SFT numerators and denominators must have one entry per expert")
+    return [
+        float(numerator) / max(float(denominator), 1.0)
+        for numerator, denominator in zip(numerators, denominators, strict=True)
+    ]
+
+
+def resolve_rep_b_start_step(stage1: dict[str, Any], total_optimizer_steps: int) -> int:
+    """Absolute step at which the column space of B turns on.
+
+    ``rep_B_start_frac`` is a fraction of
+    ``ceil(epochs * N_samples / effective_batch)``. The absolute index is
+    ``ceil(frac * total)``. ``rep_B_start_step`` sets that index directly.
+    The two keys are mutually exclusive. A start at or after the last
+    optimizer step would leave B off for the whole run, so startup refuses it.
+    """
+    if int(total_optimizer_steps) <= 0:
+        raise ValueError("total optimizer steps must be positive")
+    frac = stage1.get("rep_B_start_frac")
+    step = stage1.get("rep_B_start_step")
+    if frac is not None and step is not None:
+        raise ValueError("Set only one of stage1.rep_B_start_frac and stage1.rep_B_start_step")
+    if frac is not None:
+        fraction = float(frac)
+        if not 0.0 <= fraction < 1.0:
+            raise ValueError("stage1.rep_B_start_frac must be in [0, 1)")
+        start = math.ceil(fraction * int(total_optimizer_steps))
+    else:
+        start = int(200 if step is None else step)
+        if start < 0:
+            raise ValueError("stage1.rep_B_start_step must be non-negative")
+    if start >= int(total_optimizer_steps):
+        raise ValueError(
+            f"rep_B_start_step={start} is >= total optimizer steps={int(total_optimizer_steps)} "
+            "(ceil(epochs * N_samples / effective_batch)); the B gate would never turn on"
+        )
+    return start
+
+
+def resolve_rep_b_min_norm(stage1: dict[str, Any]) -> float | None:
+    """``None`` means the norm threshold is off. A number is ``tau_B``."""
+    if "rep_B_min_norm" not in stage1 or stage1["rep_B_min_norm"] is None:
+        return None
+    value = float(stage1["rep_B_min_norm"])
+    if value < 0.0:
+        raise ValueError("stage1.rep_B_min_norm must be null or non-negative")
+    return value
+
+
+def validate_rep_b_trial(stage1: dict[str, Any]) -> None:
+    """This run turns B on fully at ``t_B``. Ramp and the relative cap stay off."""
+    ramp = stage1.get("rep_B_ramp_steps", 0)
+    if int(0 if ramp is None else ramp) != 0:
+        raise ValueError(
+            "stage1.rep_B_ramp_steps must be 0; this run turns B on fully at t_B"
+        )
+    if stage1.get("rep_B_rel_cap", None) is not None:
+        raise ValueError(
+            "stage1.rep_B_rel_cap must be null; this run does not cap the B force"
+        )
 
 
 def _validate_stage1_config(config: dict[str, Any]) -> None:
@@ -616,7 +698,16 @@ def train_stage1(
                 f"Configured accumulation produces global batch {actual}, expected {requested_global_batch}"
             )
     epochs = int(config["stage1"]["epochs"])
-    total_steps = math.ceil(epochs * len(dataloader) / accumulation_steps)
+    total_steps = math.ceil(epochs * len(dataset) / requested_global_batch)
+    validate_rep_b_trial(config["stage1"])
+    b_start_step = resolve_rep_b_start_step(config["stage1"], total_steps)
+    b_min_norm = resolve_rep_b_min_norm(config["stage1"])
+    LOGGER.info(
+        "B repulsion gate: t_B=%d total_optimizer_steps=%d ramp_steps=0 rel_cap=off min_norm=%s",
+        b_start_step,
+        total_steps,
+        "off" if b_min_norm is None else b_min_norm,
+    )
     LOGGER.info(
         "Stage 1 setup: samples=%d epochs=%d micro_batch=%d "
         "accumulation=%d optimizer_steps=%d",
@@ -690,8 +781,8 @@ def train_stage1(
     chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
 
     # Accumulation deliberately crosses epoch boundaries. For the canonical
-    # 1,000 x 3 run this produces ceil(3,000 / 8) = 375 optimizer updates,
-    # instead of flushing three undersized batches at each epoch boundary.
+    # 1,000 x 3 run this produces ceil(3000 / 32) = 94 optimizer updates,
+    # instead of flushing a short batch at each epoch boundary.
     sft_buffers = [zeros_like_parameters(parameters) for parameters in parameter_lists]
     dpp_buffers = [zeros_like_parameters(parameters) for parameters in parameter_lists]
     sft_segment_counts = [0] * len(adapter_names)
@@ -701,6 +792,8 @@ def train_stage1(
     accumulated_dpp_loss = 0.0
     selected_k_sum = 0.0
     support_selection_count = valid_candidate_count = cholesky_fallbacks = 0
+    tail_mass_sum = 0.0
+    ystar_outside_count = 0
     dropped_step_count = 0
     force_cache = None
     b_side_was_active = False
@@ -743,6 +836,8 @@ def train_stage1(
             support_selection_count += probe.selection_count
             valid_candidate_count += probe.valid_candidate_count
             cholesky_fallbacks += probe.dpp_metrics.cholesky_fallbacks
+            tail_mass_sum += probe.tail_mass_sum
+            ystar_outside_count += probe.ystar_outside_count
             for expert, (adapter_name, parameters) in enumerate(
                 zip(adapter_names, parameter_lists, strict=True)
             ):
@@ -800,6 +895,8 @@ def train_stage1(
                     valid_candidate_count,
                     cholesky_fallbacks,
                     dropped_step_count,
+                    tail_mass_sum,
+                    ystar_outside_count,
                 ],
                 device=distributed.device,
                 dtype=torch.float64,
@@ -819,8 +916,8 @@ def train_stage1(
                     step=global_step,
                     eps_rel=float(config["stage1"].get("rep_eps_rel", 1.0e-4)),
                     eps_abs=float(config["stage1"].get("rep_eps_abs", 1.0e-8)),
-                    b_start_step=int(config["stage1"].get("rep_B_start_step", 200)),
-                    b_min_norm=float(config["stage1"].get("rep_B_min_norm", 0.0)),
+                    b_start_step=b_start_step,
+                    b_min_norm=b_min_norm,
                     bandwidth_floor=float(config["grassmann"]["bandwidth_floor"]),
                     rank_epsilon=float(config["grassmann"]["rank_epsilon"]),
                     angle_epsilon=float(config["grassmann"]["angle_epsilon"]),
@@ -831,12 +928,10 @@ def train_stage1(
                     and str(config["stage1"].get("rep_metric", "projection_closed_form"))
                     == "projection_closed_form"
                 ):
-                    LOGGER.info(
-                        "Projection repulsion turned the B side on at step %d",
-                        global_step,
-                    )
+                    LOGGER.info("B repulsion ACTIVE at step %d", global_step)
                 b_side_was_active = force_cache.b_active
             repulsion = force_cache.updates
+            fb_norms = lora_b_force_norms(groups, repulsion)
             lambda_rep = float(
                 config["stage1"]["lambda_rep"]
                 if "lambda_rep" in config["stage1"]
@@ -889,14 +984,27 @@ def train_stage1(
                     )
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+            if distributed.is_main and abs(global_step - b_start_step) <= 2:
+                LOGGER.info(
+                    "B gate neighborhood step %d b_active=%s ||F_B||=%s adam_ratio=%s",
+                    global_step,
+                    force_cache.b_active,
+                    fb_norms,
+                    update_ratios,
+                )
             global_step += 1
             if distributed.is_main:
+                sft_nll_per_expert = per_expert_sft_nll(
+                    [float(losses[expert].item()) for expert in range(len(adapter_names))],
+                    [float(counts[expert].item()) for expert in range(len(adapter_names))],
+                )
                 sft_nll = float(
-                    sum(
-                        losses[expert].item() / max(counts[expert].item(), 1.0)
-                        for expert in range(len(adapter_names))
-                    )
-                    / max(len(adapter_names), 1)
+                    sum(sft_nll_per_expert) / max(len(sft_nll_per_expert), 1)
+                )
+                dpp_tail_mass, dpp_ystar_outside_rate = dpp_support_rates(
+                    float(probe_statistics[5].item()),
+                    float(probe_statistics[6].item()),
+                    float(probe_statistics[1].item()),
                 )
                 dpp_loss = float(losses[-1].item() / max(counts[-1].item(), 1.0))
                 progress.set_postfix(
@@ -923,7 +1031,10 @@ def train_stage1(
                     step=global_step,
                     epoch=epoch,
                     sft_nll=sft_nll,
+                    sft_nll_per_expert=sft_nll_per_expert,
                     dpp_loss=dpp_loss,
+                    dpp_tail_mass=dpp_tail_mass,
+                    dpp_ystar_outside_rate=dpp_ystar_outside_rate,
                     dropped_reasoning_steps=int(probe_statistics[4].item()),
                     learning_rate=optimizers[0].param_groups[0]["lr"],
                     grassmann_bandwidth=force_cache.bandwidth,
@@ -937,13 +1048,15 @@ def train_stage1(
                     rep_max_f=force_cache.max_f,
                     rep_k_min=float(kernel_off.min().item()),
                     rep_k_max=float(kernel_off.max().item()),
+                    b_active=force_cache.b_active,
                     rep_b_active=force_cache.b_active,
                     rep_seconds=force_cache.seconds,
-                    rep_force_norms=tuple(
+                    rep_fb_norms=fb_norms,
+                    rep_force_norms=[
                         float(vector_norm(expert).item()) for expert in repulsion
-                    ),
-                    rep_update_ratios=tuple(update_ratios),
-                    rep_adam_norms=tuple(adam_norms),
+                    ],
+                    rep_update_ratios=list(update_ratios),
+                    rep_adam_norms=list(adam_norms),
                     mean_selected_k=float(
                         probe_statistics[0].item()
                         / max(probe_statistics[1].item(), 1.0)
@@ -1011,6 +1124,8 @@ def train_stage1(
             accumulated_dpp_loss = 0.0
             selected_k_sum = 0.0
             support_selection_count = valid_candidate_count = cholesky_fallbacks = 0
+            tail_mass_sum = 0.0
+            ystar_outside_count = 0
             dropped_step_count = 0
         progress.close()
         start_batch = 0

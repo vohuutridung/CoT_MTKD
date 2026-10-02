@@ -124,7 +124,6 @@ QR/SVD/autograd force remains available as `geodesic_autograd`.
 `stage1.repulsion_weight` is \(\lambda_{rep}\); set `stage1.lambda_rep` only
 when you want to override it. `dpp_topk_cap`, `dpp_token_frac < 1`, and
 `dpp_every > 1` change the DPP method and stay off by default.
-`dpp_mode: joint` is not implemented.
 
 Same seed and step budget, three runs:
 
@@ -145,8 +144,47 @@ python -m cot_mtkd.cli.train_stage1 \
   --set paths.output=artifacts/stage1/no_repulsion
 ```
 
-Compare `rep_mean_d2`, per-expert `sft_nll`, and `rep_seconds` in each
+Compare `rep_mean_d2`, `sft_nll_per_expert`, and `rep_seconds` in each
 `metrics.jsonl`. This recipe does not claim which run is better.
+
+### B gate
+
+`stage1.rep_B_start_frac` is a fraction of the optimizer budget. At startup
+the trainer sets
+
+\[
+t_B = \lceil \texttt{rep\_B\_start\_frac} \times T \rceil,
+\quad
+T = \lceil \texttt{epochs} \times N_{\mathrm{samples}} / \texttt{effective batch} \rceil.
+\]
+
+On the 1,000×3 run, \(T=94\) and \(f_B=0.10\), so \(t_B=10\). B turns on
+fully at that 0-based index: `rep_B_ramp_steps` is 0, `rep_B_min_norm` is
+null (no \(\tau_B\)), and `rep_B_rel_cap` is null (no relative cap). Startup
+raises if \(t_B \ge T\). A nonzero ramp or a non-null cap is rejected,
+because those mechanisms are not part of this run. The first step that
+passes the gate logs `B repulsion ACTIVE at step t` once. Steps within 2 of
+\(t_B\) also log `b_active`, \(\|F_B\|\), and the AdamW ratio. Every
+`metrics.jsonl` row includes `b_active`, `rep_fb_norms` (\(\|F_B\|\) per
+expert), and `rep_update_ratios`
+(\(\|\eta\lambda_{rep} F\|/\|\Delta\phi\|_{\mathrm{AdamW}}\) per expert).
+`step` counts completed updates, so the first row with `b_active: true` has
+`step` = \(t_B+1\). An absolute `stage1.rep_B_start_step` may be set instead
+of the fraction, but not both.
+
+### DPP jitter
+
+Cholesky starts at `dpp.jitter` (\(10^{-5}\)). A failed factorization
+multiplies the jitter by 10, up to `dpp.max_jitter` (\(10^{-2}\)). Each
+failed attempt on a token increments `cholesky_fallbacks` in
+`metrics.jsonl`. The training loop runs `dpp_mode: probe`.
+
+Logged with those rows: `sft_nll_per_expert` (length \(M\), numerator and
+denominator summed across ranks before the division), `dpp_tail_mass`
+(mean of \(1-\sum_{v\in V_k}\bar p(v)\) over DPP tokens), and
+`dpp_ystar_outside_rate` (fraction of DPP tokens whose label is outside
+\(V_k\), counted before \(y^*\) is removed from the support).
+
 Timing only, without a training claim:
 
 ```bash
@@ -168,7 +206,7 @@ artifacts/stage1/main/
 │       ├── expert_0/adapter_model.safetensors
 │       ├── expert_1/...
 │       └── expert_2/...                    # PEFT LoRA per expert (read by vLLM / publish)
-├── benchmark/                              # same layout, saved at stage1.benchmark_checkpoint_epoch
+├── benchmark/                              # same layout, saved at stage1.benchmark_checkpoint_epoch (epoch 2; distinct from final/)
 ├── checkpoint.pt                           # LoRA + optimizer + scheduler state for STAGE1_RESUME
 ├── manifest.json                           # adapter names, file paths, sha256 of every file
 ├── metrics.jsonl
@@ -241,6 +279,9 @@ stopped at the token limit.
 | Optimizer | betas, eps | (0.9, 0.999), 1e-8 |
 | Optimizer | weight decay | 0.0 |
 | Scheduler | schedule | cosine with warmup (`warmup_ratio` 0.1, `LambdaLR`) |
+| Repulsion | `rep_B_start_frac` | 0.10, so \(t_B=\lceil 0.10\times 94\rceil=10\) |
+| Repulsion | ramp / \(\tau_B\) / relative cap | 0 / off / off |
+| DPP | jitter / max jitter | \(10^{-5}\), raised by 10× up to \(10^{-2}\) |
 | Evaluation | samples per problem `n` | 3 |
 | Evaluation | temperature | 0.6 |
 | Evaluation | `top_p` | 0.9 |

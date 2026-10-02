@@ -8,11 +8,15 @@ def council_kneedle_candidates(
     targets: torch.Tensor,
     epsilon: float = 1.0e-12,
     k_max: int | None = None,
-) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """Full-vocabulary Kneedle on the mean expert distribution at each token.
+) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Kneedle on the mean expert distribution at each token.
 
-    The ground-truth token is removed only after the elbow and Top-k are
-    selected, as specified by the proposal. Candidate ids are detached.
+    The rank axis is ``x_j = j / N'``, where ``N'`` is the number of kept
+    ranks (the vocabulary, or ``dpp_topk_cap`` when it is smaller). A flat
+    row (``p_max == p_min``) selects every kept rank. The ground-truth token
+    is removed only after the elbow is chosen. Returned tail mass is
+    ``1 - sum_{v in V_k} p(v)`` and the outside flag is whether ``y*`` is
+    missing from that same ``V_k``, both measured before the removal.
     """
     if council_probabilities.ndim != 2 or targets.shape != council_probabilities.shape[:1]:
         raise ValueError("Council probabilities and targets have incompatible shapes")
@@ -30,15 +34,34 @@ def council_kneedle_candidates(
         )
         minimum = probabilities[:, -1:]
     ranks = torch.arange(1, kept + 1, device=probabilities.device, dtype=torch.float32)
-    x = ranks / vocab_size
+    x = ranks / float(kept)
     maximum = probabilities[:, :1]
+    flat = maximum.squeeze(-1) == minimum.squeeze(-1)
     y = (probabilities - minimum) / (maximum - minimum).clamp_min(epsilon)
     elbow = ((1.0 - x) - y).argmax(dim=-1) + 1
+    elbow = torch.where(flat, torch.full_like(elbow, kept), elbow)
+    in_support = torch.arange(kept, device=probabilities.device).unsqueeze(0) < elbow.unsqueeze(1)
+    mass = (probabilities * in_support.to(probabilities.dtype)).sum(dim=-1)
+    tail_mass = (1.0 - mass).detach().to("cpu")
+    target_ids = targets.to(device=ids.device)
+    ystar_outside = ~(ids.eq(target_ids.unsqueeze(1)) & in_support).any(dim=-1)
+    ystar_outside = ystar_outside.detach().to("cpu")
     candidates = []
     for row, k in enumerate(elbow.tolist()):
         top_ids = ids[row, :k]
         candidates.append(top_ids[top_ids.ne(targets[row])].detach().to("cpu", torch.long))
-    return candidates, elbow.detach().to("cpu", torch.long)
+    return candidates, elbow.detach().to("cpu", torch.long), tail_mass, ystar_outside
+
+
+def dpp_support_rates(
+    tail_mass_sum: float, ystar_outside_count: float, token_count: float
+) -> tuple[float, float]:
+    """Mean tail mass and ``y*`` miss rate over DPP tokens.
+
+    Callers sum the per-token values across ranks first, then divide here.
+    """
+    denominator = max(float(token_count), 1.0)
+    return float(tail_mass_sum) / denominator, float(ystar_outside_count) / denominator
 
 
 def pad_candidate_support(

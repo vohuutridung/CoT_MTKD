@@ -235,7 +235,7 @@ Một số tính chất có ý nghĩa thực hành:
 \end{itemize}
 
 \paragraph{Ổn định số.}
-$C_{pp}$ được thay bằng $\tilde C_{pp}=C_{pp}+\big(\varepsilon_{rel}\,\tfrac{\operatorname{tr}C_{pp}}{r}+\varepsilon_{abs}\big)I$ (ridge tương đối; cấu hình chạy dùng $\varepsilon_{rel}=10^{-4}$, $\varepsilon_{abs}=10^{-8}$) trong mọi nghịch đảo. Gram và nghịch đảo tính ở fp32. Với khởi tạo LoRA chuẩn ($B=0$), $\mathrm{col}(B)$ chưa xác định. Phía $B$ của \eqref{eq:grasstotal} và của lực chỉ bật khi đồng thời $t\ge t_B$ và $\min_m\|B_m\|_F>\tau_B$; trước đó chỉ dùng phía $A$.
+$C_{pp}$ được thay bằng $\tilde C_{pp}=C_{pp}+\big(\varepsilon_{rel}\,\tfrac{\operatorname{tr}C_{pp}}{r}+\varepsilon_{abs}\big)I$ (ridge tương đối; cấu hình chạy dùng $\varepsilon_{rel}=10^{-4}$, $\varepsilon_{abs}=10^{-8}$) trong mọi nghịch đảo. Gram và nghịch đảo tính ở fp32. Với khởi tạo LoRA chuẩn ($B=0$), $\mathrm{col}(B)$ chưa xác định. Cấu hình chạy bật phía $B$ của \eqref{eq:grasstotal} và của lực khi $t\ge t_B$, không thêm ngưỡng $\|B\|_F$; trước đó chỉ dùng phía $A$. Chi tiết cổng nằm ở đoạn ``Cổng cho phần $B$'' bên dưới.
 
 \paragraph{Cách tính và chi phí.}
 Mọi đại lượng chỉ phụ thuộc các Gram $C_{pq}$ cỡ $r\times r$. Với các mô-đun cùng shape (ví dụ q/k/v/o hoặc up/down qua các layer), xếp thành chiều batch $L$; mỗi nhóm tính $X_{all}\in\mathbb R^{L\times Mr\times d}$ và $G=X_{all}X_{all}^\top$ bằng một GEMM, rồi tách các khối $r\times r$. Chi phí mỗi nhóm là $O(L\,M^2r^2d)$ cho GEMM cộng $O(L\,M\,r^3)$ cho $M$ nghịch đảo và $O(L\,M^2r^3)$ cho các tích $r\times r$. Toàn bộ chạy dưới \texttt{no\_grad}, không lưu graph, không có QR/SVD. Với $d=4096$, $r=16$, $M=4$, mỗi mô-đun cần khoảng $2\times10^7$ FLOPs cho Gram; đây là ví dụ đếm phép tính. Cấu hình chạy ở Mục~\ref{sec:p1config} dùng $r=16$, $M=3$. Chi phí này không đáng kể so với forward/backward qua $\theta_{base}$; nút thắt còn lại là số lần gọi kernel, được giải quyết bằng gộp theo shape. Lực có thể được cập nhật mỗi $n_{rep}$ bước (cấu hình chạy dùng $n_{rep}=1$) và tái dùng ở các bước giữa, vì các không gian con thay đổi chậm.
@@ -274,11 +274,7 @@ l_{DPP,i,t}=-\log\det(G+\alpha I),\qquad \alpha=10^{-5},
 trong đó chỉ các token có $|\mathcal C|>0$ được tính. $\det$ của ma trận $M\times M$ chỉ tốn $O(M^3)$ và Gram tốn $O(M^2|\mathcal C|)$, không phải điểm cần tối ưu.
 
 \paragraph{Hiện thực: probe và VJP.}
-DPP cần logits của \emph{tất cả} $M$ expert trên cùng một token, trong khi SFT của từng expert là độc lập. Để không giữ đồng thời $M$ computation graph, DPP được tính trên một lượt probe \texttt{no-grad} (không dùng mask dropout), thu được cotangent $\partial\mathcal L_{DPP\_div}/\partial\log\hat p^{(m)}_{\mathcal C}$, rồi mỗi expert đưa cotangent này về tham số LoRA bằng VJP trong lượt forward có graph của chính nó (qua softmax đầy đủ). Đổi lại, mỗi expert forward hai lần. Vì dropout ở Mục~\ref{sec:gdrop} chỉ đổi trọng số loss, hai lượt cho logits giống hệt nhau, và có hai chế độ tương đương về toán học:
-\begin{itemize}
-\item \textbf{probe} (mặc định): tiết kiệm bộ nhớ, forward gấp đôi;
-\item \textbf{joint}: một forward duy nhất, giữ $M$ graph cùng lúc (cần gradient checkpointing nếu thiếu VRAM).
-\end{itemize}
+DPP cần logits của \emph{tất cả} $M$ expert trên cùng một token, trong khi SFT của từng expert là độc lập. Để không giữ đồng thời $M$ computation graph, DPP được tính trên một lượt probe \texttt{no-grad} (không dùng mask dropout), thu được cotangent $\partial\mathcal L_{DPP\_div}/\partial\log\hat p^{(m)}_{\mathcal C}$, rồi mỗi expert đưa cotangent này về tham số LoRA bằng VJP trong lượt forward có graph của chính nó (qua softmax đầy đủ). Đổi lại, mỗi expert forward hai lần. Dropout bước ở Mục~\ref{sec:gdrop} chỉ đổi trọng số loss. Dropout LoRA ($0.05$) bật ở cả lượt probe và lượt replay với cùng một seed RNG, nên logits hai lượt trùng nhau. Vòng huấn luyện chỉ chạy chế độ \textbf{probe}. Chế độ joint (một forward, giữ $M$ graph) tương đương về toán học và không được thực hiện.
 Hai tùy chọn giảm chi phí khác, đổi nhẹ phương pháp và mặc định tắt: chỉ tính DPP trên một tập con vị trí token (tỉ lệ $\pi_{dpp}$, chọn ngẫu nhiên hoặc ưu tiên entropy cao) và tính DPP mỗi $n_{dpp}$ bước.
 
 \subsection{Hàm mục tiêu và Quy tắc Cập nhật Phase 1}
@@ -355,10 +351,10 @@ Một bước optimizer $t$ gom $G$ microbatch (gradient accumulation; cửa s�
     \State Chụp $(A_m^{(\ell)},B_m^{(\ell)})$ của cả $M$ expert, trước mọi \texttt{AdamW.step}
     \State Gom các mô-đun cùng $(d_{in},d_{out})$. Gram và nghịch đảo ở fp32, dưới \texttt{no-grad}
     \State Ridge $\tilde C_{pp}$, rồi $f_{pq}$, $d^2$, $h$ và $K$ (stop-gradient) như Mục~\ref{sec:rep}
-    \If{$t<t_B$ hoặc $\min_m\|B_m\|_F\le \tau_B$}
+    \If{$t<t_B$}
         \State Chỉ phía $A$ đi vào \eqref{eq:grasstotal} và vào lực. Phía $B$ bằng $0$
     \Else
-        \State Cộng phía $B$: tính lực trên $X=B^\top$, rồi chuyển vị về dạng của $B$
+        \State Bật hẳn phía $B$ (không ramp, không chặn): lực trên $X=B^\top$, rồi chuyển vị về dạng của $B$
     \EndIf
     \State Ghi $F_{rep}(\phi_m^t)$ theo \eqref{eq:forceclosed} vào bộ đệm
 \Else
@@ -374,7 +370,14 @@ Một bước optimizer $t$ gom $G$ microbatch (gradient accumulation; cửa s�
 
 Ba chỗ cần đọc cùng \eqref{eq:phase1update}. Mẫu số của \eqref{eq:sftmean} và của \eqref{eq:dppsteploss} chỉ được chia sau khi cộng hết cửa sổ $G$ và all-reduce, nên $g_m$ là gradient của trung bình toàn cục, không phải trung bình của các gradient microbatch. $F_{rep}$ lấy từ một snapshot chung, chụp trước khi expert nào bước AdamW, nên lực đối xứng trên từng cặp. Khi $n_{rep}>1$, snapshot đó là lần làm tươi gần nhất, còn hệ số nhân vẫn là $\eta_t$ của bước hiện tại. Probe không lưu graph và không dùng mask dropout. Replay mới lấy $d_{i,s,m}$ và đưa cotangent về tham số LoRA. Weight decay nằm trong AdamW. Lực cộng sau \texttt{AdamW.step}, không đi vào trạng thái optimizer và không bị cắt chuẩn.
 
-Cổng $B$ trong thủ tục này yêu cầu đồng thời $t\ge t_B$ và $\min_m\|B_m\|_F>\tau_B$. $\tau_B$ mặc định bằng $0$, nên khởi tạo $B=0$ vẫn tắt phía $B$ cho đến khi cả hai điều kiện đúng. $\pi_{dpp}<1$, $n_{dpp}>1$ và trần Top-$k$ là các tuỳ chọn tắt mặc định, vì chúng đổi nhẹ tập token mà DPP nhìn thấy.
+\paragraph{Cổng cho phần $B$.}
+Cấu hình chạy dùng $f_B=0.10$. Số bước optimizer là $T=\lceil 1000\times 3/32\rceil=94$, nên
+\[
+t_B=\lceil f_B\,T\rceil=\lceil 0.10\times 94\rceil=10.
+\]
+Phía $B$ tắt khi $t<t_B$ và bật hẳn tại $t_B$: \texttt{rep\_B\_ramp\_steps}$=0$, không ramp. \texttt{rep\_B\_min\_norm} là null, nên không có ngưỡng $\tau_B$. \texttt{rep\_B\_rel\_cap} là null, nên không chặn tương đối $\|F_B\|$. Nếu $t_B\ge T$ thì khởi động báo lỗi và không chạy. Mỗi bước ghi \texttt{b\_active}, $\|F_B\|$ (\texttt{rep\_fb\_norms}) và tỉ số $\|\eta\lambda_{rep}F\|/\|\Delta\phi\|_{\mathrm{AdamW}}$ (\texttt{rep\_update\_ratios}); các bước sát $t_B$ còn in ba đại lượng này ra log. Ba cơ chế ramp, chặn tương đối và $\tau_B$ chưa được dùng. Nếu bước $t_B$ làm tỉ số lực/AdamW vượt khoảng $10$ hoặc $\|F_B\|$ tăng vọt, thứ tự bổ sung là chặn tương đối, rồi ramp, rồi $\tau_B$.
+
+$\pi_{dpp}<1$, $n_{dpp}>1$ và trần Top-$k$ là các tuỳ chọn tắt mặc định, vì chúng đổi nhẹ tập token mà DPP nhìn thấy.
 
 \subsection{Cấu hình thí nghiệm}
 \label{sec:p1config}
@@ -383,7 +386,7 @@ Các số dưới đây lấy từ \texttt{configs/stage1/qwen25\_7b\_m3.yaml}. 
 
 Base $\theta_{base}$ là Qwen2.5-7B-Instruct, đóng băng, dtype bfloat16. $M=3$ adapter LoRA với $r=16$, $\alpha=16$, nên $s=\alpha/r=1$ vì \texttt{use\_rslora}, \texttt{use\_dora} và \texttt{use\_qalora} đều tắt. Dropout LoRA bằng $0.05$; không học bias. Dropout này là dropout của adapter, khác với $p_{drop}$ của loss. Expert $m$ khởi tạo bằng seed $42+m$: $A$ khác nhau giữa các expert, $B=0$. Mô-đun đích là \texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj}, \texttt{o\_proj}, \texttt{gate\_proj}, \texttt{up\_proj}, \texttt{down\_proj}. Dữ liệu là s1K-1.1, 1000 mẫu. Chuỗi đưa vào loss là câu hỏi cộng thinking, không gồm attempt; độ dài tối đa $32768$. NLL không có label smoothing.
 
-Huấn luyện $3$ epoch, $\eta_{\max}=5\times 10^{-5}$. AdamW dùng $(\beta_1,\beta_2)=(0.9,\,0.999)$, $\varepsilon=10^{-8}$, weight decay $0$. Micro-batch bằng $1$, global batch bằng $32$, nên trên một GPU thì $G=32$ và số bước optimizer là $\lceil 1000\times 3/32\rceil=94$. Warmup chiếm $0.1$ số bước, tức $9$ bước, rồi cosine về $\eta_{\min}=0$. Gradient dữ liệu bị cắt ở chuẩn $\ell_2$ bằng $1$. Snapshot \texttt{benchmark/} ghi ở epoch $3$, trùng bước cuối.
+Huấn luyện $3$ epoch, $\eta_{\max}=5\times 10^{-5}$. AdamW dùng $(\beta_1,\beta_2)=(0.9,\,0.999)$, $\varepsilon=10^{-8}$, weight decay $0$. Micro-batch bằng $1$, global batch bằng $32$, nên trên một GPU thì $G=32$ và số bước optimizer là $\lceil 1000\times 3/32\rceil=94$. Warmup chiếm $0.1$ số bước, tức $9$ bước, rồi cosine về $\eta_{\min}=0$. Gradient dữ liệu bị cắt ở chuẩn $\ell_2$ bằng $1$. Snapshot \texttt{benchmark/} ghi ở epoch $2$, khác checkpoint cuối.
 
 \begin{center}
 \begin{tabularx}{\textwidth}{@{}lX@{}}
@@ -396,8 +399,8 @@ $p_{drop}$ & $0.20$ \\
 $\lambda_{div}$ & $0.2$ \\
 $\lambda_{rep}$ & $1.0$, chưa chỉnh theo thang $d^2$ mới \\
 $\varepsilon_{rel}$, $\varepsilon_{abs}$ & $10^{-4}$, $10^{-8}$ \\
-$t_B$, $\tau_B$, $n_{rep}$ & $200$, $0$, $1$ \\
-DPP & probe; $\alpha=10^{-5}$, jitter tăng tối đa $10^{-2}$ khi Cholesky thất bại; $\pi_{dpp}=1$, $n_{dpp}=1$, không trần $K_{\max}$ \\
+$f_B$, $t_B$, ramp, $\tau_B$, cap, $n_{rep}$ & $0.10$, $\lceil 0.10\times 94\rceil=10$, $0$, không dùng, không dùng, $1$ \\
+DPP & probe; $\alpha=10^{-5}$, jitter tăng dần tới $10^{-2}$ khi Cholesky thất bại và đếm trong \texttt{cholesky\_fallbacks}; $\pi_{dpp}=1$, $n_{dpp}=1$, không trần $K_{\max}$ \\
 \bottomrule
 \end{tabularx}
 \end{center}
@@ -409,7 +412,7 @@ Phase 1 chạy Kneedle trên toàn bộ từ vựng. \texttt{kneedle.probe\_k}, 
 
 Siêu tham số chính của phương pháp là $p_{drop}$, $\lambda_{div}$, $\lambda_{rep}$, $\varepsilon_{rel}$, $t_B$ và $n_{rep}$. Giá trị đang chạy nằm ở Mục~\ref{sec:p1config}.
 
-Các đại lượng cần ghi log: $\bar d^2$ và $\bar f_{pq}$ trung bình theo cặp; $\min/\max$ của $K$; $\|F_{rep}\|$ và tỉ số $\|\eta\lambda_{rep}F_{rep}\|/\|\Delta\phi\|_{AdamW}$; NLL từng expert; độ đa dạng DPP; $V_i$ trung bình tính trên tập validation.
+Các đại lượng cần ghi log: $\bar d^2$ và $\bar f_{pq}$ trung bình theo cặp; $\min/\max$ của $K$; $\|F_B\|$, $\|F_{rep}\|$ và tỉ số $\|\eta\lambda_{rep}F_{rep}\|/\|\Delta\phi\|_{AdamW}$; NLL từng expert; khối lượng đuôi $1-\sum_{v\in V_k}\bar p(v)$ và tỉ lệ $y^*\notin V_k$; cờ $b_{\mathrm{active}}$; số lần fallback Cholesky; độ đa dạng DPP; $V_i$ trung bình tính trên tập validation.
 
 \begin{center}
 \begin{tabularx}{\textwidth}{@{}lX@{}}
@@ -421,7 +424,6 @@ Chỉ dropout / chỉ lực / chỉ DPP & Đóng góp của từng cơ chế \\
 Lực geodesic (autodiff, bản cũ) vs. lực chiếu (dạng đóng) & Metric mới có đổi kết quả không; so thời gian mỗi bước \\
 Lực chiếu, $n_{rep}\in\{1,4,8\}$ & Độ nhạy với tần suất cập nhật lực \\
 Phần $B$ bật từ đầu vs. từ $t_B$ & Ảnh hưởng của cổng $B$ \\
-Probe vs. joint & Kiểm tra tương đương và so bộ nhớ/thời gian \\
 \bottomrule
 \end{tabularx}
 \end{center}

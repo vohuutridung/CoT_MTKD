@@ -10,6 +10,7 @@ from cot_mtkd.stage1.repulsion import (
     b_side_active,
     gram_stats,
     kernel_from_d2,
+    lora_b_force_norms,
     pairwise_d2,
     projection_repulsion_updates,
     repulsion_force,
@@ -166,6 +167,13 @@ class ProjectionRepulsionTest(unittest.TestCase):
         self.assertFalse(b_side_active(199, min_b_norm=1.0, start_step=200, min_norm=0.0))
         self.assertFalse(b_side_active(200, min_b_norm=0.0, start_step=200, min_norm=0.0))
         self.assertTrue(b_side_active(200, min_b_norm=1.0e-3, start_step=200, min_norm=0.0))
+        self.assertFalse(b_side_active(9, min_b_norm=0.0, start_step=10, min_norm=None))
+        self.assertTrue(b_side_active(10, min_b_norm=0.0, start_step=10, min_norm=None))
+        groups = [
+            _group(torch.tensor([[1.0, 0.0]]), torch.tensor([[3.0], [4.0]])),
+        ]
+        updates = [[torch.zeros(1, 2), torch.tensor([[3.0], [4.0]])]]
+        self.assertEqual(lora_b_force_norms(groups, updates), [5.0])
 
     def test_short_training_separates_experts_and_reduces_loss(self) -> None:
         torch.manual_seed(6)

@@ -27,7 +27,7 @@ LoRA này dùng chung cho 3 expert Stage 1 và student Stage 2.
 |---|---|---|
 | Số Epoch | 3 | 3 |
 | Scheduler horizon | 3 epoch | 3 epoch |
-| Benchmark checkpoint | epoch 3 (bước cuối) | epoch 3 (bước cuối) |
+| Benchmark checkpoint | epoch 2 (khác `final/`) | epoch 3 (bước cuối) |
 | Micro batch size | 1 | 1 |
 | Effective Batch Size (`global_batch_size`) | **32** | **32** |
 | Gradient accumulation (world_size=1) | 32 | 32 |
@@ -44,7 +44,7 @@ LoRA này dùng chung cho 3 expert Stage 1 và student Stage 2.
 
 Effective batch = `micro_batch_size × world_size × accumulation` = 1 × 1 × 32 = **32**. Cấu hình này gắn với một process: `gradient_accumulation_steps` được ghi tường minh là 32, nên `world_size` phải là 1.
 
-Cosine schedule trải đủ 3 epoch (94 bước). Warmup là `round(0.1 × 94) = 9` bước. Snapshot `benchmark/` trùng bước cuối (94) vì `benchmark_checkpoint_epoch` là 3 trên lịch 3 epoch.
+Cosine schedule trải đủ 3 epoch (94 bước). Warmup là `round(0.1 × 94) = 9` bước. Cổng \(B\) bật hẳn tại \(t_B=\lceil 0.10\times 94\rceil=10\): không ramp, không \(\tau_B\), không chặn tương đối. Snapshot `benchmark/` lấy ở epoch 2 (bước \(\lceil 2000/32\rceil=63\)), khác checkpoint `final/` ở bước 94.
 
 ---
 

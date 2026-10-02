@@ -5,6 +5,7 @@ import unittest
 from collections import OrderedDict
 
 import torch
+import torch.nn.functional as F
 
 from cot_mtkd.data.collator import shifted_token_views
 from cot_mtkd.data.schema import TokenRegion
@@ -15,7 +16,13 @@ from cot_mtkd.stage1.grassmann import (
     grassmann_repulsion_updates,
     grassmann_squared_distances,
 )
-from cot_mtkd.stage1.trainer import probe_stage1_dpp
+from cot_mtkd.stage1.trainer import (
+    per_expert_sft_nll,
+    probe_stage1_dpp,
+    resolve_rep_b_min_norm,
+    resolve_rep_b_start_step,
+    validate_rep_b_trial,
+)
 
 
 def _group(a: torch.Tensor, b: torch.Tensor) -> OrderedDict[str, torch.nn.Parameter]:
@@ -302,6 +309,42 @@ class Phase1ProposalTest(unittest.TestCase):
         assert torch.allclose(final[1][0], torch.tensor([1.3, 0.3]))
         assert diagnostics.repulsion_norms[0] > 0.0
         assert diagnostics.repulsion_norms[1] > 0.0
+
+    def test_b_gate_rejects_a_start_past_the_step_budget(self) -> None:
+        with self.assertRaises(ValueError):
+            resolve_rep_b_start_step({"rep_B_start_step": 200}, 94)
+
+    def test_b_gate_frac_resolves_inside_the_94_step_budget(self) -> None:
+        self.assertEqual(resolve_rep_b_start_step({"rep_B_start_frac": 0.10}, 94), 10)
+
+    def test_b_trial_rejects_ramp_and_relative_cap(self) -> None:
+        validate_rep_b_trial({"rep_B_ramp_steps": 0, "rep_B_rel_cap": None})
+        self.assertIsNone(resolve_rep_b_min_norm({}))
+        self.assertIsNone(resolve_rep_b_min_norm({"rep_B_min_norm": None}))
+        self.assertEqual(resolve_rep_b_min_norm({"rep_B_min_norm": 0.0}), 0.0)
+        with self.assertRaises(ValueError):
+            validate_rep_b_trial({"rep_B_ramp_steps": 4})
+        with self.assertRaises(ValueError):
+            validate_rep_b_trial({"rep_B_rel_cap": 0.05})
+
+    def test_sft_nll_per_expert_divides_after_allreduce(self) -> None:
+        def summed_nll(logits: torch.Tensor, targets: torch.Tensor) -> float:
+            return float(F.cross_entropy(logits, targets, reduction="sum"))
+
+        sharp = torch.tensor([[8.0, 0.0, 0.0]])
+        flat = torch.zeros(1, 3)
+        label = torch.tensor([0])
+        rank0 = [summed_nll(sharp, label), summed_nll(flat, label)]
+        uniform = torch.zeros(2, 3)
+        rank1 = [summed_nll(uniform, torch.tensor([0, 1])), 0.0]
+        numerators = [rank0[0] + rank1[0], rank0[1] + rank1[1]]
+        denominators = [1.0 + 2.0, 1.0 + 0.0]
+        reduced = per_expert_sft_nll(numerators, denominators)
+        self.assertEqual(len(reduced), 2)
+        self.assertAlmostEqual(reduced[0], numerators[0] / 3.0, places=6)
+        self.assertAlmostEqual(reduced[1], numerators[1] / 1.0, places=6)
+        premature = 0.5 * (rank0[0] / 1.0 + rank1[0] / 2.0)
+        self.assertGreater(abs(reduced[0] - premature), 1.0e-3)
 
 
 if __name__ == "__main__":

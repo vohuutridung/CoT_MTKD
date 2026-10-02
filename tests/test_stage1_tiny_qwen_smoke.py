@@ -7,6 +7,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from cot_mtkd.data.schema import TokenRegion
+from cot_mtkd.models.chunked_head import decoder_and_lm_head
 from cot_mtkd.models.multi_adapter import (
     adapter_parameter_groups,
     set_active_adapter,
@@ -14,6 +15,7 @@ from cot_mtkd.models.multi_adapter import (
 )
 from cot_mtkd.stage1.gac_gradient import apply_grassmann_force_
 from cot_mtkd.stage1.grassmann import grassmann_repulsion_updates
+from cot_mtkd.stage1 import trainer as trainer_module
 from cot_mtkd.stage1.trainer import probe_stage1_dpp, replay_expert_gradients
 
 
@@ -146,6 +148,120 @@ class Stage1TinyQwenSmokeTest(unittest.TestCase):
             parameters, data_only_result, forces[0], strict=True
         ):
             self.assertTrue(torch.allclose(parameter, data_only + 5.0e-4 * force))
+
+    def test_probe_and_replay_logits_match_under_lora_dropout(self) -> None:
+        torch.manual_seed(13)
+        base = Qwen2ForCausalLM(
+            Qwen2Config(
+                vocab_size=40,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=64,
+                attention_dropout=0.0,
+                use_cache=False,
+            )
+        )
+        lora = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=2,
+            lora_alpha=4,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "v_proj"],
+            bias="none",
+            inference_mode=False,
+        )
+        model = get_peft_model(
+            base, lora, adapter_name="expert_0", autocast_adapter_dtype=False
+        )
+        model.add_adapter("expert_1", lora)
+        model.train()
+        names = ["expert_0", "expert_1"]
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if "lora_B" in name:
+                    parameter.normal_()
+        dropout_rates = [
+            module.p
+            for module in model.modules()
+            if isinstance(module, torch.nn.Dropout) and module.p > 0.0
+        ]
+        self.assertTrue(dropout_rates)
+        self.assertTrue(all(rate == 0.05 for rate in dropout_rates))
+
+        input_ids = torch.randint(3, 40, (2, 9))
+        labels = input_ids.clone()
+        labels[:, 0] = -100
+        regions = [
+            TokenRegion.PROMPT,
+            TokenRegion.REASONING,
+            TokenRegion.REASONING,
+            TokenRegion.DELIMITER,
+            TokenRegion.REASONING,
+            TokenRegion.REASONING,
+            TokenRegion.ANSWER_MARKER,
+            TokenRegion.ANSWER,
+            TokenRegion.EOS,
+        ]
+        batch = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": torch.ones_like(input_ids),
+            "region_ids": torch.tensor([[int(region) for region in regions]] * 2),
+            "step_ids": torch.tensor([[-1, 0, 0, 0, 1, 1, -1, -1, -1]] * 2),
+        }
+        config = {
+            "runtime": {
+                "probe_hidden_device": "cpu",
+                "lm_head_chunk_tokens": 3,
+                "council_chunk_tokens": 2,
+            },
+            "dpp": {"jitter": 1.0e-5, "max_jitter": 1.0e-2},
+        }
+        recorded: list[torch.Tensor] = []
+        original = trainer_module.forward_hidden
+
+        def recording_forward(
+            model, input_ids, attention_mask, use_cache=False, past_key_values=None
+        ):
+            output = original(
+                model,
+                input_ids,
+                attention_mask,
+                use_cache=use_cache,
+                past_key_values=past_key_values,
+            )
+            recorded.append(output.last_hidden_state.detach().clone())
+            return output
+
+        device = torch.device("cpu")
+        trainer_module.forward_hidden = recording_forward
+        try:
+            probe = probe_stage1_dpp(
+                model, names, batch, global_step=0, rng_stream=0, base_seed=13,
+                config=config, device=device,
+            )
+            replay_expert_gradients(
+                model, names[0], 0, list(adapter_parameter_groups(model, names)[0].values()),
+                batch, probe, global_step=0, rng_stream=0, base_seed=13,
+                drop_probability=0.0, chunk_tokens=3, device=device,
+            )
+            replay_expert_gradients(
+                model, names[0], 0, list(adapter_parameter_groups(model, names)[0].values()),
+                batch, probe, global_step=0, rng_stream=1, base_seed=13,
+                drop_probability=0.0, chunk_tokens=3, device=device,
+            )
+        finally:
+            trainer_module.forward_hidden = original
+
+        _, head = decoder_and_lm_head(model)
+        probe_logits = head(recorded[0]).detach()
+        replay_logits = head(recorded[2]).detach()
+        other_seed_logits = head(recorded[3]).detach()
+        self.assertTrue(torch.equal(probe_logits, replay_logits))
+        self.assertFalse(torch.equal(probe_logits, other_seed_logits))
 
 
 if __name__ == "__main__":

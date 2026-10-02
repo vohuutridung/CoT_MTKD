@@ -36,10 +36,38 @@ def b_side_active(
     step: int,
     min_b_norm: float,
     start_step: int,
-    min_norm: float,
+    min_norm: float | None,
 ) -> bool:
-    """Turn on col(B) only after ``start_step`` and once every expert has left 0."""
-    return int(step) >= int(start_step) and float(min_b_norm) > float(min_norm)
+    """Turn on col(B) at ``start_step``.
+
+    ``min_norm is None`` skips the norm threshold, so B turns on fully even
+    while it is still near zero. A numeric threshold keeps the extra guard
+    ``min_m ||B_m||_F > min_norm``.
+    """
+    if int(step) < int(start_step):
+        return False
+    if min_norm is None:
+        return True
+    return float(min_b_norm) > float(min_norm)
+
+
+def lora_b_force_norms(
+    groups: list[OrderedDict[str, torch.nn.Parameter]],
+    updates: list[list[torch.Tensor]],
+) -> list[float]:
+    """Euclidean norm of the B-side force for each expert. A is excluded."""
+    norms: list[float] = []
+    for group, force in zip(groups, updates, strict=True):
+        if len(group) != len(force):
+            raise ValueError("Force list does not match the parameter group")
+        total = None
+        for key, tensor in zip(group, force, strict=True):
+            if "lora_B" not in key:
+                continue
+            square = tensor.detach().float().pow(2).sum()
+            total = square if total is None else total + square
+        norms.append(0.0 if total is None else float(total.sqrt().item()))
+    return norms
 
 
 def gram_stats(
@@ -285,7 +313,7 @@ def compute_repulsion(
     eps_rel: float,
     eps_abs: float,
     b_start_step: int,
-    b_min_norm: float,
+    b_min_norm: float | None,
     bandwidth_floor: float,
     rank_epsilon: float,
     angle_epsilon: float,

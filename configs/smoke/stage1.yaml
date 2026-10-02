@@ -25,8 +25,10 @@ stage1:
   rep_metric: projection_closed_form
   rep_eps_rel: 1.0e-4
   rep_eps_abs: 1.0e-8
-  rep_B_start_step: 200
-  rep_B_min_norm: 0.0
+  rep_B_start_frac: 0.10
+  rep_B_ramp_steps: 0
+  rep_B_min_norm: null
+  rep_B_rel_cap: null
   rep_every: 1
   dpp_mode: probe
   dpp_topk_cap: null
@@ -35,7 +37,7 @@ stage1:
   max_grad_norm: 1.0
   checkpoint_every_steps: 2
   log_every_steps: 1
-  benchmark_checkpoint_epoch: 1
+  benchmark_checkpoint_epoch: null
   resume_from: null
 kneedle:
   probe_k: 32
