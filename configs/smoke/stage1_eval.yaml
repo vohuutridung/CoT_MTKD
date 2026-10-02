@@ -1,0 +1,30 @@
+schema_version: 1
+seed: 42
+model:
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+  revision: 7ae557604adf67be50417f59c2c2f167def9a775
+  dtype: bfloat16
+stage1_checkpoint: final
+vllm:
+  max_model_len: 1024
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.5
+  max_lora_rank: 8
+generation:
+  prompt_prefix: "Please reason step by step, and put your final answer within \\boxed{}."
+  n: 3
+  temperature: 0.6
+  top_p: 0.9
+  repetition_penalty: 1.05
+  max_tokens: 64
+benchmarks:
+  - name: smoke
+    local_json: artifacts/smoke/eval.jsonl
+    split: train
+    expected_records: 2
+grading:
+  timeout_seconds: 10
+  prefer_math_verify: true
+paths:
+  stage1: artifacts/smoke/stage1
+  output: artifacts/smoke/evaluation_stage1

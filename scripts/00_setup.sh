@@ -9,7 +9,11 @@ if [[ ! -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
 fi
 
 "$PROJECT_ROOT/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
-"$PROJECT_ROOT/.venv/bin/python" -m pip install -e "$PROJECT_ROOT[dev]"
+extras="dev"
+if [[ "${INSTALL_VLLM:-0}" == "1" ]]; then
+  extras="dev,vllm"
+fi
+"$PROJECT_ROOT/.venv/bin/python" -m pip install -e "$PROJECT_ROOT[$extras]"
 
 echo "Environment ready at $PROJECT_ROOT/.venv"
 echo "FlashAttention-2 is optional and must match the node CUDA/PyTorch build."

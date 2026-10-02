@@ -1,17 +1,21 @@
 # GAC-CoT-MTKD
 
-Train five LoRA experts, merge them into one student adapter, then distill
+Train three LoRA experts, merge them into one student adapter, then distill
 with council-weighted step NLL.
 
 ## Setup
 
 ```bash
 ./project_commands.sh setup
+# also install vLLM, needed by stage1-eval (Linux + CUDA)
+INSTALL_VLLM=1 ./project_commands.sh setup
 ```
 
 ## Run
 
-Complete pipeline (`prepare` → `stage1` → `supervision` → `stage2` → `evaluate`):
+Complete pipeline (`prepare` → `stage1` → `stage1-eval` → `supervision` →
+`stage2` → `evaluate`). `all` checks that vLLM is installed before it starts;
+set `SKIP_STAGE1_EVAL=1` to drop `stage1-eval`:
 
 ```bash
 ./project_commands.sh all
@@ -34,6 +38,7 @@ Each step:
 ```bash
 ./project_commands.sh prepare
 ./project_commands.sh stage1
+./project_commands.sh stage1-eval
 ./project_commands.sh publish-stage1
 ./project_commands.sh supervision
 ./project_commands.sh stage2
@@ -104,6 +109,7 @@ SIGNALS_CONFIG=configs/signals/main.yaml ./project_commands.sh supervision
 STAGE2_CONFIG=configs/stage2/qwen25_7b.yaml ./project_commands.sh stage2
 CACHE_CONFIG=configs/cache/qwen25_7b_top512_tail.yaml ./project_commands.sh cache
 EVAL_CONFIG=configs/eval/p_align.yaml ./project_commands.sh evaluate
+STAGE1_EVAL_CONFIG=configs/eval/stage1_experts.yaml ./project_commands.sh stage1-eval
 HF_HUB_OFFLINE=1 ./project_commands.sh all
 ```
 
@@ -147,6 +153,117 @@ Timing only, without a training claim:
 python scripts/bench_repulsion.py
 python scripts/bench_repulsion.py --full
 ```
+
+## Stage-1 outputs
+
+`./project_commands.sh stage1` writes to `paths.output` of the Stage-1 config
+(default `artifacts/stage1/main`):
+
+```text
+artifacts/stage1/main/
+├── final/
+│   ├── adapter_states.pt                   # all experts in one torch bundle (read by supervision / stage2)
+│   └── adapters/
+│       ├── expert_0/adapter_config.json
+│       ├── expert_0/adapter_model.safetensors
+│       ├── expert_1/...
+│       └── expert_2/...                    # PEFT LoRA per expert (read by vLLM / publish)
+├── benchmark/                              # same layout, saved at stage1.benchmark_checkpoint_epoch
+├── checkpoint.pt                           # LoRA + optimizer + scheduler state for STAGE1_RESUME
+├── manifest.json                           # adapter names, file paths, sha256 of every file
+├── metrics.jsonl
+└── config.yaml
+```
+
+Load one expert in PEFT:
+
+```python
+from peft import PeftModel
+model = PeftModel.from_pretrained(base_model, "artifacts/stage1/main/final/adapters/expert_0")
+```
+
+## Stage-1 expert evaluation
+
+`stage1-eval` runs right after `stage1` in `all`. It loads the base model in
+vLLM once, then evaluates `expert_0`, `expert_1` and `expert_2` one after
+another as LoRA adapters on AIME25, AIME24, AMC12 and MATH-500:
+
+```bash
+./project_commands.sh stage1-eval
+# only some experts, a non-default run, or forced regeneration
+STAGE1_EVAL_EXPERTS=expert_0,expert_2 ./project_commands.sh stage1-eval
+./scripts/22_evaluate_stage1.sh --set paths.stage1=artifacts/stage1/no_repulsion \
+  --set paths.output=artifacts/evaluation/stage1_no_repulsion
+STAGE1_EVAL_FORCE=1 ./project_commands.sh stage1-eval
+# evaluate benchmark/ instead of final/
+./scripts/22_evaluate_stage1.sh --set stage1_checkpoint=benchmark
+```
+
+Config: `configs/eval/stage1_experts.yaml` (override with `STAGE1_EVAL_CONFIG`).
+Each expert's adapter sha256 is checked against the Stage-1 manifest before it
+is loaded. Every expert uses the same per-problem sampling seed. Results for
+one (expert, benchmark) pair are cached and reused while the adapter and
+settings stay the same, so an interrupted run resumes where it stopped.
+
+```text
+artifacts/evaluation/stage1/
+├── expert_0/
+│   ├── aime25.jsonl ... math500.jsonl      # generations, finish_reasons, correct flags
+│   ├── aime25.metrics.json ...
+│   └── manifest.json                       # per-benchmark metrics + macro average
+├── expert_1/ ...
+├── expert_2/ ...
+├── summary.md                              # Pass@1 / Pass@3 table, one row per expert
+└── manifest.json
+```
+
+`length_capped_fraction` in each metrics file is the share of generations that
+stopped at the token limit.
+
+## Hyperparameters
+
+| Group | Hyperparameter | Value |
+| --- | --- | --- |
+| LoRA | rank `r` | 16 |
+| LoRA | alpha | 16 |
+| LoRA | dropout | 0.05 |
+| LoRA | target modules | `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj` |
+| LoRA | `use_rslora` / `use_dora` / `use_qalora` | false / false / false |
+| Training | epochs | 3 |
+| Training | effective batch size | 32 |
+| Training | `per_device_train_batch_size` | 1 |
+| Training | `gradient_accumulation_steps` | 32 |
+| Training | max sequence length | 32,768 |
+| Training | learning rate | 5e-5 |
+| Training | `max_grad_norm` | 1.0 |
+| Training | `label_smoothing_factor` | 0.0 |
+| Optimizer | optimizer | AdamW |
+| Optimizer | betas, eps | (0.9, 0.999), 1e-8 |
+| Optimizer | weight decay | 0.0 |
+| Scheduler | schedule | cosine with warmup (`warmup_ratio` 0.1, `LambdaLR`) |
+| Evaluation | samples per problem `n` | 3 |
+| Evaluation | temperature | 0.6 |
+| Evaluation | `top_p` | 0.9 |
+| Evaluation | `repetition_penalty` | 1.05 |
+| Evaluation | `max_tokens` | 4,096 |
+| Evaluation | vLLM `max_model_len` | 4,096 |
+| Evaluation | `tensor_parallel_size` | 1 |
+| Evaluation | `gpu_memory_utilization` | 0.8 |
+
+`max_model_len` bounds prompt plus completion, so a completion stops at
+`4096 − prompt_tokens` tokens even though `max_tokens` is 4,096.
+
+### Metrics
+
+For problem \(i\) with correctness flags \(y_1, y_2, y_3\) of its three
+generations, over \(N\) problems:
+
+- **Pass@1** = \(\frac{1}{N}\sum_i \frac{y_1+y_2+y_3}{3}\), which equals
+  total correct generations / \(3N\).
+- **Pass@3** = \(\frac{1}{N}\sum_i \mathbb{1}[y_1 \lor y_2 \lor y_3]\): a
+  problem counts as solved if any of its three generations is correct.
+
+The macro average is the unweighted mean over benchmarks.
 
 ## Publish Stage-1 LoRA experts
 

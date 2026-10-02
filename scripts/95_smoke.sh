@@ -3,7 +3,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 # Tiny Qwen2.5-0.5B-Instruct inputs, then the real README `full` command:
-# setup -> test -> prepare -> stage1 -> supervision -> stage2 -> evaluate.
+# setup -> test -> prepare -> stage1 -> stage1-eval -> supervision -> stage2 -> evaluate.
 
 SMOKE_PREPARED="${SMOKE_PREPARED:-artifacts/prepared/s1k_1_1/data.jsonl}"
 SMOKE_RECORDS="${SMOKE_RECORDS:-8}"
@@ -15,6 +15,13 @@ export STAGE1_CONFIG="${STAGE1_CONFIG:-configs/smoke/stage1.yaml}"
 export SIGNALS_CONFIG="${SIGNALS_CONFIG:-configs/smoke/signals.yaml}"
 export STAGE2_CONFIG="${STAGE2_CONFIG:-configs/smoke/stage2.yaml}"
 export EVAL_CONFIG="${EVAL_CONFIG:-configs/smoke/eval.yaml}"
+export STAGE1_EVAL_CONFIG="${STAGE1_EVAL_CONFIG:-configs/smoke/stage1_eval.yaml}"
+
+if [[ -z "${SKIP_STAGE1_EVAL:-}" && "${INSTALL_VLLM:-0}" != "1" ]] \
+  && ! "$PYTHON_BIN" -c "import vllm" >/dev/null 2>&1; then
+  echo "[smoke] vLLM not installed; skipping stage1-eval (set INSTALL_VLLM=1 to include it)"
+  export SKIP_STAGE1_EVAL=1
+fi
 
 write_smoke_inputs() {
   if [[ ! -f "$SMOKE_PREPARED" ]]; then
@@ -86,6 +93,7 @@ PY
 
 rm -rf "$PROJECT_ROOT/artifacts/smoke/prepared" \
   "$PROJECT_ROOT/artifacts/smoke/stage1" \
+  "$PROJECT_ROOT/artifacts/smoke/evaluation_stage1" \
   "$PROJECT_ROOT/artifacts/smoke/supervision" \
   "$PROJECT_ROOT/artifacts/smoke/teacher_cache" \
   "$PROJECT_ROOT/artifacts/smoke/stage2" \
