@@ -112,10 +112,15 @@ def build_stage2_medoid(
     config: dict[str, Any], distributed: DistributedContext
 ) -> dict[str, Any]:
     """Select one functional medoid over the complete prepared Phase-1 corpus."""
-    temperature = float(config["geometry"]["temperature"])
+    section = (
+        "aggregation"
+        if config.get("method") == "disagreement_adaptive_distribution_aggregation_mtkd"
+        else "geometry"
+    )
+    temperature = float(config[section]["temperature"])
     chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
     if not math.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError("geometry.temperature must be finite and positive")
+        raise ValueError(f"{section}.temperature must be finite and positive")
     if chunk_tokens <= 0:
         raise ValueError("runtime.lm_head_chunk_tokens must be positive")
     prepared_dir = Path(config["paths"]["prepared"])

@@ -20,6 +20,7 @@ from cot_mtkd.models.multi_adapter import adapter_parameter_map, extract_adapter
 from cot_mtkd.stage2.medoid import build_stage2_medoid
 from cot_mtkd.stage2.trainer import (
     METHOD,
+    OUTPUT_SPACE_METHOD,
     _load_checkpoint,
     _save_checkpoint,
     apply_accumulated_update,
@@ -268,6 +269,12 @@ class Stage2UpdateTest(unittest.TestCase):
         self.assertEqual(optimizer.state, {})
 
     def test_complete_medoid_training_export_and_completed_resume_on_tiny_Qwen(self):
+        self.check_medoid_training_export_and_resume(METHOD)
+
+    def test_output_space_medoid_training_export_and_completed_resume_on_tiny_Qwen(self):
+        self.check_medoid_training_export_and_resume(OUTPUT_SPACE_METHOD)
+
+    def check_medoid_training_export_and_resume(self, method):
         tokenizer = CharacterTokenizer()
         context = DistributedContext(0, 0, 1, torch.device("cpu"))
         initial_model, names, _ = tiny_online_council(checkpointing=True)
@@ -349,7 +356,7 @@ class Stage2UpdateTest(unittest.TestCase):
             }
             write_json(stage1 / "manifest.json", stage1_manifest)
             config = {
-                "method": METHOD,
+                "method": method,
                 "seed": 42,
                 "model": model_config,
                 "lora": LORA,
@@ -387,6 +394,12 @@ class Stage2UpdateTest(unittest.TestCase):
                 },
                 "_project_root": str(root),
             }
+            if method == OUTPUT_SPACE_METHOD:
+                config["aggregation"] = {
+                    "temperature": config["geometry"]["temperature"],
+                    "teacher_execution": "online_full_vocab",
+                }
+                del config["geometry"]
             with (
                 patch(
                     "cot_mtkd.models.multi_adapter.load_base_causal_lm",
@@ -397,7 +410,7 @@ class Stage2UpdateTest(unittest.TestCase):
             ):
                 medoid_manifest = build_stage2_medoid(config, context)
                 manifest = train_stage2(config, context)
-                self.assertEqual(manifest["method"], METHOD)
+                self.assertEqual(manifest["method"], method)
                 self.assertEqual(manifest["data_step"], 1)
                 self.assertEqual(manifest["global_step"], 1)
                 self.assertEqual(manifest["loss_scalars"]["examples"], 2)
@@ -408,6 +421,41 @@ class Stage2UpdateTest(unittest.TestCase):
                 bundle = torch.load(output / manifest["adapter_bundle"], weights_only=True)
                 self.assertEqual(set(bundle), {"student"})
                 checkpoint = torch.load(output / "checkpoint.pt", weights_only=False)
+                self.assertEqual(checkpoint["method"], method)
+                if method == OUTPUT_SPACE_METHOD:
+                    self.assertEqual(manifest["loss_scalars"]["active_steps"], 4)
+                    self.assertIn("disagreement_mean", manifest["loss_scalars"])
+                    self.assertNotIn("anchor_ce_mean", manifest["loss_scalars"])
+                    step_log = output / "reasoning_steps.jsonl"
+                    rows = [json.loads(line) for line in step_log.read_text().splitlines()]
+                    self.assertEqual(len(rows), 4)
+                    self.assertEqual(
+                        {row["sample_id"] for row in rows}, {record.sample_id for record in records}
+                    )
+                    self.assertEqual({row["step_id"] for row in rows}, {0, 1})
+                    for row in rows:
+                        self.assertEqual(row["run_fingerprint"], manifest["run_fingerprint"])
+                        self.assertEqual(row["data_step_before"], 0)
+                        self.assertEqual(row["global_step_before"], 0)
+                        self.assertEqual(row["rho"], row["js_normalized"])
+                        self.assertAlmostEqual(row["js_mean"], row["rho"] * math.log(3))
+                    for record in records:
+                        sample_rows = [row for row in rows if row["sample_id"] == record.sample_id]
+                        self.assertEqual(len(sample_rows), 2)
+                        self.assertAlmostEqual(
+                            sum(row["step_kd_loss"] for row in sample_rows) / 2,
+                            sample_rows[0]["sample_kd_loss"],
+                        )
+                    self.assertEqual(
+                        manifest["reasoning_step_logs"],
+                        [
+                            {
+                                "rank": 0,
+                                "file": "reasoning_steps.jsonl",
+                                "sha256": file_sha256(step_log),
+                            }
+                        ],
+                    )
                 self.assert_state_equal(bundle["student"], checkpoint["student_state"])
                 self.assertTrue(
                     (output / "final" / "adapters" / "student" / "adapter_config.json").is_file()
@@ -419,14 +467,23 @@ class Stage2UpdateTest(unittest.TestCase):
                 metrics_hash = file_sha256(output / "metrics.jsonl")
                 resume_config = copy.deepcopy(config)
                 resume_config["stage2"]["resume_from"] = str(output / "checkpoint.pt")
+                gradient_path = (
+                    "cot_mtkd.stage2.output_space.compute_record_gradient"
+                    if method == OUTPUT_SPACE_METHOD
+                    else "cot_mtkd.stage2.trainer.compute_record_gradient"
+                )
                 with patch(
-                    "cot_mtkd.stage2.trainer.compute_record_gradient",
+                    gradient_path,
                     side_effect=AssertionError("A completed resume must not retrain examples"),
                 ):
                     resumed_manifest = train_stage2(resume_config, context)
                 self.assertEqual(resumed_manifest, manifest)
                 self.assertEqual(file_sha256(output / "checkpoint.pt"), checkpoint_hash)
                 self.assertEqual(file_sha256(output / "metrics.jsonl"), metrics_hash)
+                if method == OUTPUT_SPACE_METHOD:
+                    self.assertEqual(
+                        file_sha256(step_log), manifest["reasoning_step_logs"][0]["sha256"]
+                    )
 
 
 if __name__ == "__main__":

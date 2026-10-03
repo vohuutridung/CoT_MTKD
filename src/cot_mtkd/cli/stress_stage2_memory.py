@@ -26,6 +26,7 @@ from ..stage2.online import (
 )
 from ..stage2.trainer import (
     METHOD,
+    OUTPUT_SPACE_METHOD,
     _stable_config,
     _validate_stage2_config,
     apply_accumulated_update,
@@ -45,16 +46,17 @@ GIB = 1024**3
 
 
 def make_synthetic_record(
-    record: PreparedRecord, tokenizer: Any, max_length: int
+    record: PreparedRecord, tokenizer: Any, max_length: int, method: str = METHOD
 ) -> tuple[PreparedRecord, Phase2RecordPlan]:
-    """Extend one retained reasoning step while preserving the full gold solution.
+    """Extend the last retained step to the method's full context limit.
 
-    The synthetic sequence exercises the configured maximum gold-anchor length.
-    Its extended single step is a memory stress only; its timing does not estimate
-    typical training cost. Already discarded trailing steps are removed first so
-    the extension cannot disappear during the planner's complete-step truncation.
+    Output-space uses the reasoning sequence limit; task-geometry reserves its
+    complete gold-anchor suffix. The source answer is preserved in the record.
+    The extended step is a memory stress only; its timing does not estimate
+    typical training cost. Remove discarded trailing steps before extending.
     """
-    plan = plan_record(record, tokenizer, max_length)
+    planner = _record_planner(method)
+    plan = planner(record, tokenizer, max_length)
     if plan.num_steps == 0:
         raise ValueError("Cannot extend a sample with no eligible reasoning steps")
     retained_end = len(plan.input_ids)
@@ -91,7 +93,7 @@ def make_synthetic_record(
 
     synthetic = replace(
         source,
-        sample_id=f"{record.sample_id}-synthetic-anchor-{max_length}",
+        sample_id=f"{record.sample_id}-synthetic-{'reasoning' if method == OUTPUT_SPACE_METHOD else 'anchor'}-{max_length}",
         input_ids=insert(source.input_ids, repeated),
         labels=insert(source.labels, repeated),
         attention_mask=insert(source.attention_mask, [1] * extra),
@@ -102,7 +104,7 @@ def make_synthetic_record(
         original_length=len(source.input_ids) + extra,
         kept_length=len(source.input_ids) + extra,
     )
-    synthetic_plan = plan_record(synthetic, tokenizer, max_length)
+    synthetic_plan = planner(synthetic, tokenizer, max_length)
     if synthetic_plan.num_steps != plan.num_steps or synthetic_plan.discarded_steps != 0:
         raise RuntimeError("Synthetic extension unexpectedly changed the retained reasoning steps")
     if max(len(synthetic_plan.input_ids), synthetic_plan.max_anchor_length) != max_length:
@@ -111,8 +113,9 @@ def make_synthetic_record(
 
 
 def longest_eligible_record(
-    dataset: JsonlRecordDataset, tokenizer: Any, max_length: int
+    dataset: JsonlRecordDataset, tokenizer: Any, max_length: int, method: str = METHOD
 ) -> tuple[PreparedRecord, Phase2RecordPlan, dict[str, int]]:
+    planner = _record_planner(method)
     selected: tuple[PreparedRecord, Phase2RecordPlan] | None = None
     selected_size = (-1, -1)
     counts = {
@@ -123,7 +126,7 @@ def longest_eligible_record(
     }
     for index in range(len(dataset)):
         record = dataset[index]
-        plan = plan_record(record, tokenizer, max_length)
+        plan = planner(record, tokenizer, max_length)
         counts["examples_with_discarded_steps"] += int(plan.discarded_steps > 0)
         if plan.num_steps == 0:
             counts["examples_without_eligible_steps"] += 1
@@ -135,6 +138,14 @@ def longest_eligible_record(
     if selected is None:
         raise ValueError("Prepared dataset has no Phase-2-ready reasoning samples")
     return selected[0], selected[1], counts
+
+
+def _record_planner(method: str):
+    if method == OUTPUT_SPACE_METHOD:
+        from ..stage2.output_space import plan_record as output_plan
+
+        return output_plan
+    return plan_record
 
 
 def _optimizer_and_scheduler(
@@ -172,10 +183,14 @@ def _run_microbatch(
 ) -> dict[str, Any]:
     """Run the full trainer gradient path and a temporary single-record update."""
     optimizer.zero_grad(set_to_none=True)
-    # Training holds its FP32 accumulation buffer during every geometry pass.
+    # Training holds its FP32 accumulation buffer during the complete forward.
     # Allocate it before the forward so the measured peak includes that state.
     buffer = zeros_like_parameters(parameters)
-    result = compute_record_gradient(
+    if config.get("method") == OUTPUT_SPACE_METHOD:
+        from ..stage2.output_space import compute_record_gradient as record_gradient
+    else:
+        record_gradient = compute_record_gradient
+    result = record_gradient(
         model, adapter_names, parameters, record, tokenizer, config, device, profile=True
     )
     if not isinstance(result, RecordGradientResult):
@@ -298,7 +313,11 @@ def run_case(
         "error": error,
         "sample_id": record.sample_id,
         "reasoning_sequence_length": len(plan.input_ids),
-        "max_gold_anchor_sequence_length": plan.max_anchor_length,
+        **(
+            {"max_teacher_forced_sequence_length": len(plan.input_ids)}
+            if config.get("method") == OUTPUT_SPACE_METHOD
+            else {"max_gold_anchor_sequence_length": plan.max_anchor_length}
+        ),
         "planned_steps": plan.num_steps,
         "all_retained_steps_evaluated": all(
             item["steps"] == plan.num_steps for item in iteration_details
@@ -428,7 +447,7 @@ def _record_provenance(
     # Exactly the same run identity as the one-device training command.
     report["run_fingerprint"] = fingerprint(
         {
-            "method": METHOD,
+            "method": config.get("method", METHOD),
             "config_fingerprint": report["config_fingerprint"],
             "prepared_manifest_fingerprint": source_hashes["prepared"],
             "stage1_manifest_fingerprint": source_hashes["stage1"],
@@ -443,7 +462,7 @@ def main() -> None:
         description="Measure full online Phase-2 updates on one H200 with all LoRA parameters and steps"
     )
     parser.add_argument("--config", required=True)
-    parser.add_argument("--output", default="artifacts/stage2/stress_memory.json")
+    parser.add_argument("--output", default="artifacts/stage2/output_space_stress_memory.json")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--min-headroom-gib", type=float, default=12.0)
@@ -457,6 +476,9 @@ def main() -> None:
     if int(config["stage2"]["micro_batch_size"]) != 1:
         raise ValueError("Phase-2 stress requires stage2.micro_batch_size: 1")
     stable_config = _stable_config(config)
+    method = config.get("method", METHOD)
+    output_space = method == OUTPUT_SPACE_METHOD
+    section = "aggregation" if output_space else "geometry"
     report: dict[str, Any] = {
         "status": "not_measured",
         "recommendation": "not_measured",
@@ -470,8 +492,9 @@ def main() -> None:
         "warmup_iterations_per_case": arguments.warmup,
         "measured_iterations_per_case": arguments.repetitions,
         "required_headroom_gib": arguments.min_headroom_gib,
-        "method": "online_direct_teacher_full_vocabulary_full_lora_all_retained_steps",
-        "gold_answer_source": "entire_solution_field",
+        "method": method,
+        "execution": "online_direct_teacher_full_vocabulary_full_lora_all_retained_steps",
+        "gold_answer_source": None if output_space else "entire_solution_field",
         "trained_artifact_written": False,
         "temporary_optimizer_updates_only": True,
         "timing_unit": "one_microbatch_with_temporary_optimizer_step",
@@ -484,9 +507,11 @@ def main() -> None:
             "global_batch_size": int(config["stage2"]["global_batch_size"]),
             "gradient_checkpointing": bool(config["model"].get("gradient_checkpointing", False)),
             "lora_dropout": float(config["lora"]["dropout"]),
-            "temperature": float(config["geometry"]["temperature"]),
-            "epsilon_a": float(config["geometry"]["epsilon_a"]),
-            "epsilon_u": float(config["geometry"]["epsilon_u"]),
+            "temperature": float(config[section]["temperature"]),
+            **({} if output_space else {
+                "epsilon_a": float(config["geometry"]["epsilon_a"]),
+                "epsilon_u": float(config["geometry"]["epsilon_u"]),
+            }),
             "reasoning_step_cap": None,
             "lora_parameter_sampling": False,
         },
@@ -535,8 +560,12 @@ def main() -> None:
         if len(dataset) != int(manifests["prepared"]["records"]) or not len(dataset):
             raise RuntimeError("Prepared dataset record count is invalid")
         max_length = int(config["stage2"]["max_length"])
-        longest, longest_plan, counts = longest_eligible_record(dataset, tokenizer, max_length)
-        synthetic, synthetic_plan = make_synthetic_record(longest, tokenizer, max_length)
+        longest, longest_plan, counts = longest_eligible_record(
+            dataset, tokenizer, max_length, method=method
+        )
+        synthetic, synthetic_plan = make_synthetic_record(
+            longest, tokenizer, max_length, method=method
+        )
         report["dataset_scan"] = counts
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
@@ -560,7 +589,7 @@ def main() -> None:
         report["scheduler_training_steps"] = total_training_steps
         for name, record, plan in (
             ("longest_real", longest, longest_plan),
-            (f"synthetic_anchor_{max_length}", synthetic, synthetic_plan),
+            (f"synthetic_{'reasoning' if output_space else 'anchor'}_{max_length}", synthetic, synthetic_plan),
         ):
             result = run_case(
                 name,

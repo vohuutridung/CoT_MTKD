@@ -42,9 +42,16 @@ from ..utils.training import (
     zeros_like_parameters,
 )
 from .online import compute_record_gradient, create_online_model
+from .step_logging import (
+    create_reasoning_logger,
+    log_record_steps,
+    reasoning_log_filename,
+    trim_jsonl_to_checkpoint,
+)
 
 LOGGER = logging.getLogger(__name__)
 METHOD = "task_anchored_gradient_geometry_mtkd"
+OUTPUT_SPACE_METHOD = "disagreement_adaptive_distribution_aggregation_mtkd"
 
 
 def _stable_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -56,16 +63,18 @@ def _stable_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_stage2_config(config: dict[str, Any]) -> None:
-    if config.get("method") != METHOD:
+    method = config.get("method")
+    if method not in (METHOD, OUTPUT_SPACE_METHOD):
         raise ValueError(
-            "Use the task-geometry Stage-2 config; legacy dual-source caches are unsupported"
+            "Use an output-space or task-geometry Stage-2 config; "
+            "legacy dual-source caches are unsupported"
         )
     if str(config["optimizer"].get("name", "")).lower() != "adamw":
         raise ValueError("Phase 2 implements optimizer.name: adamw")
     if str(config["scheduler"].get("name", "")).lower() != "cosine":
         raise ValueError("Phase 2 implements scheduler.name: cosine")
     if float(config["lora"]["dropout"]) != 0.0:
-        raise ValueError("Task-anchored Phase 2 requires lora.dropout: 0.0")
+        raise ValueError("Phase 2 requires lora.dropout: 0.0")
     for key in (
         "epochs",
         "micro_batch_size",
@@ -80,16 +89,25 @@ def _validate_stage2_config(config: dict[str, Any]) -> None:
         value = float(config["stage2"][key])
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"stage2.{key} must be finite and positive")
-    for key in ("temperature", "epsilon_a", "epsilon_u"):
-        value = float(config["geometry"][key])
+    section = "aggregation" if method == OUTPUT_SPACE_METHOD else "geometry"
+    selector = config[section]
+    selector_keys = (
+        ("temperature",)
+        if method == OUTPUT_SPACE_METHOD
+        else ("temperature", "epsilon_a", "epsilon_u")
+    )
+    for key in selector_keys:
+        value = float(selector[key])
         if not math.isfinite(value) or value <= 0.0:
-            raise ValueError(f"geometry.{key} must be finite and positive")
-    if config["geometry"].get("teacher_execution") != "online_full_vocab":
+            raise ValueError(f"{section}.{key} must be finite and positive")
+    if selector.get("teacher_execution") != "online_full_vocab":
         raise ValueError("Phase 2 requires online_full_vocab teacher execution")
     if int(config["runtime"]["lm_head_chunk_tokens"]) <= 0:
         raise ValueError("runtime.lm_head_chunk_tokens must be positive")
     if "hard_loss_weight" in config["stage2"] or "kd_loss_weight" in config["stage2"]:
         raise ValueError("Old hard/KD source weights are not part of the new Phase-2 objective")
+    if not isinstance(config.get("logging", {}).get("reasoning_steps", True), bool):
+        raise TypeError("logging.reasoning_steps must be a boolean")
 
 
 def _record_collator(records):
@@ -109,13 +127,14 @@ def _save_checkpoint(
     base_seed,
     world_size,
     metrics,
+    method: str = METHOD,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "method": METHOD,
+            "method": method,
             "student_state": extract_adapter_state(model, "student"),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -141,9 +160,9 @@ def _save_checkpoint(
     temporary.replace(path)
 
 
-def _load_checkpoint(path, model, optimizer, scheduler, expected_run_fingerprint):
+def _load_checkpoint(path, model, optimizer, scheduler, expected_run_fingerprint, method=METHOD):
     value = torch.load(path, map_location="cpu", weights_only=False)
-    if value.get("method") != METHOD or value["run_fingerprint"] != expected_run_fingerprint:
+    if value.get("method") != method or value["run_fingerprint"] != expected_run_fingerprint:
         raise RuntimeError("Refusing to resume Phase 2 from a different method or configuration")
     load_adapter_state(model, "student", value["student_state"])
     optimizer.load_state_dict(value["optimizer"])
@@ -196,6 +215,11 @@ def apply_accumulated_update(
 
 def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dict[str, Any]:
     _validate_stage2_config(config)
+    method = config["method"]
+    if method == OUTPUT_SPACE_METHOD:
+        from .output_space import compute_record_gradient as record_gradient
+    else:
+        record_gradient = compute_record_gradient
     paths = config["paths"]
     prepared_dir, stage1_dir = Path(paths["prepared"]), Path(paths["stage1"])
     medoid_dir, output_dir = Path(paths["medoid"]), Path(paths["output"])
@@ -266,7 +290,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
     config_hash = fingerprint(public_config)
     run_hash = fingerprint(
         {
-            "method": METHOD,
+            "method": method,
             "config_fingerprint": config_hash,
             "prepared_manifest_fingerprint": fingerprint(prepared),
             "stage1_manifest_fingerprint": fingerprint(stage1),
@@ -299,16 +323,26 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
     resume = config["stage2"].get("resume_from")
     if resume:
         global_step, data_step, start_epoch, start_batch, last_metrics = _load_checkpoint(
-            resume, model, optimizer, scheduler, run_hash
+            resume, model, optimizer, scheduler, run_hash, method=method
         )
         if start_epoch >= epochs:
             barrier()
             return read_json(output_dir / "manifest.json")
+    if resume and distributed.is_main and method == OUTPUT_SPACE_METHOD:
+        trim_jsonl_to_checkpoint(
+            output_dir / "metrics.jsonl", run_hash, data_step, before_update=False
+        )
     logger = JsonlLogger(
         output_dir / "metrics.jsonl", enabled=distributed.is_main, truncate=not bool(resume)
     )
+    step_logger = None
+    if method == OUTPUT_SPACE_METHOD and config.get("logging", {}).get("reasoning_steps", True):
+        step_logger = create_reasoning_logger(
+            output_dir, distributed.rank, distributed.world_size, run_hash, data_step, bool(resume)
+        )
     buffer = zeros_like_parameters(parameters)
     # Example/step counts and losses; reduction follows fixed K then example mean.
+    # Last four slots hold method-specific detached teacher statistics.
     totals = torch.zeros(9, device=distributed.device, dtype=torch.float64)
     accumulated = 0
     for epoch in range(start_epoch, epochs):
@@ -316,10 +350,23 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
         for batch_index, records in enumerate(loader):
             if epoch == start_epoch and batch_index < start_batch:
                 continue
-            for record in records:
-                result = compute_record_gradient(
+            for sample_index, record in enumerate(records):
+                result = record_gradient(
                     model, adapter_names, parameters, record, tokenizer, config, distributed.device
                 )
+                if step_logger is not None:
+                    log_record_steps(
+                        step_logger,
+                        result,
+                        record.sample_id,
+                        run_fingerprint=run_hash,
+                        rank=distributed.rank,
+                        epoch=epoch,
+                        batch_in_epoch=batch_index,
+                        sample_in_batch=sample_index,
+                        data_step_before=data_step,
+                        global_step_before=global_step,
+                    )
                 add_gradients_(buffer, result.gradients)
                 totals += totals.new_tensor(
                     [
@@ -328,8 +375,15 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                         result.active_steps,
                         result.discarded_steps,
                         result.loss,
-                        result.metrics.get("agreement_sum", 0.0),
-                        result.metrics.get("weight_sum", 0.0),
+                        result.metrics.get(
+                            "disagreement_sum"
+                            if method == OUTPUT_SPACE_METHOD
+                            else "agreement_sum",
+                            0.0,
+                        ),
+                        result.metrics.get(
+                            "rho_sum" if method == OUTPUT_SPACE_METHOD else "weight_sum", 0.0
+                        ),
                         result.metrics.get("consensus_sum", 0.0),
                         result.metrics.get("anchor_loss_sum", 0.0),
                     ]
@@ -360,14 +414,24 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                 "active_steps": int(counts[2]),
                 "discarded_steps": int(counts[3]),
                 "skipped_update": not updated,
-                "agreement_mean": counts[5] / max(counts[1], 1),
-                "utility_weight_mean": counts[6] / max(counts[1], 1),
-                "consensus_weight_mean": counts[7] / max(counts[1], 1),
-                "anchor_ce_mean": counts[8] / max(counts[1], 1),
             }
+            if method == OUTPUT_SPACE_METHOD:
+                last_metrics.update(
+                    disagreement_mean=counts[5] / max(counts[1], 1),
+                    rho_mean=counts[6] / max(counts[1], 1),
+                    js_mean=counts[5] * math.log(len(adapter_names)) / max(counts[1], 1),
+                )
+            else:
+                last_metrics.update(
+                    agreement_mean=counts[5] / max(counts[1], 1),
+                    utility_weight_mean=counts[6] / max(counts[1], 1),
+                    consensus_weight_mean=counts[7] / max(counts[1], 1),
+                    anchor_ce_mean=counts[8] / max(counts[1], 1),
+                )
             if data_step % int(config["stage2"]["log_every_steps"]) == 0:
                 logger.log(
                     "stage2_step",
+                    run_fingerprint=run_hash,
                     step=global_step,
                     data_step=data_step,
                     epoch=epoch,
@@ -376,12 +440,18 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     **last_metrics,
                 )
                 LOGGER.info(
-                    "Phase 2 batch=%d update=%d KD=%.6f active=%d/%d%s",
+                    "Phase 2 batch=%d update=%d KD=%.6f active=%d/%d lr=%.3e%s%s",
                     data_step,
                     global_step,
                     last_metrics["kd_loss"],
                     int(counts[2]),
                     int(counts[1]),
+                    optimizer.param_groups[0]["lr"],
+                    (
+                        f" JS={last_metrics['js_mean']:.6g} nats rho={last_metrics['rho_mean']:.6g}"
+                        if method == OUTPUT_SPACE_METHOD
+                        else ""
+                    ),
                     " (skip)" if not updated else "",
                 )
             if (
@@ -401,6 +471,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     int(config["seed"]),
                     distributed.world_size,
                     last_metrics,
+                    method=method,
                 )
             buffer = zeros_like_parameters(parameters)
             totals.zero_()
@@ -423,11 +494,12 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             int(config["seed"]),
             distributed.world_size,
             last_metrics,
+            method=method,
         )
         manifest = {
             "schema_version": 2,
             "artifact": "stage2_checkpoint",
-            "method": METHOD,
+            "method": method,
             "global_step": global_step,
             "data_step": data_step,
             "training_checkpoint": checkpoint.name,
@@ -449,6 +521,17 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             "metrics_file_sha256": file_sha256(output_dir / "metrics.jsonl"),
             "runtime": runtime_metadata(config["_project_root"]),
         }
+        if step_logger is not None:
+            manifest["reasoning_step_logs"] = [
+                {
+                    "rank": rank,
+                    "file": reasoning_log_filename(rank, distributed.world_size),
+                    "sha256": file_sha256(
+                        output_dir / reasoning_log_filename(rank, distributed.world_size)
+                    ),
+                }
+                for rank in range(distributed.world_size)
+            ]
         write_json(output_dir / "manifest.json", manifest)
     barrier()
     return read_json(output_dir / "manifest.json")

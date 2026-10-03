@@ -76,9 +76,10 @@ and exits with status 2. All six cases must complete before the preflight is rea
 Stress updates affect only the temporary model in that process; no training
 checkpoint or adapters are saved.
 
-## Phase 2: task-anchored gradient geometry MTKD
+## Phase 2: disagreement-adaptive output-space MTKD
 
-The default Phase 2 follows the latest task-anchored proposal. Three frozen
+The `output-space` branch defaults to disagreement-adaptive distribution
+aggregation from the Phase-2 proposal. Phase 1 is unchanged. Three frozen
 teachers and one student share a single backbone. Teacher forcing uses fixed
 DeepSeek reasoning trajectories; training performs no autoregressive generation.
 Only the student LoRA is updated, with dropout disabled.
@@ -113,57 +114,118 @@ changing teacher sources; old medoid artifacts and checkpoints are rejected.
 targets in the complete prepared corpus. It does not compute the old PAG or
 static teacher weights. The student copies this adapter.
 
-For each example and each retained reasoning step, Phase 2 computes every
-teacher's KD gradient over all student LoRA parameters, its raw council mean
-and agreement, and the student's gold-answer CE gradient after that step.
-The anchor uses the entire raw `solution` field, preceded by the existing answer
-marker; only solution tokens contribute to its CE. Its gradient includes the
-complete reasoning prefix. KD uses reasoning content tokens only; delimiters
-remain in prefixes. The full gold continuation is reserved within 32,768 tokens;
-only complete trailing reasoning steps may be discarded. A sample with no
-retained reasoning steps contributes zero loss. If prompt plus full gold alone
-does not fit, training fails with the sample ID rather than truncating gold.
+For each reasoning token, all teachers and the student use the same fixed prefix
+and temperature `T`. The default is `T: 2.0`; the proposal leaves this as a positive
+hyperparameter. With `M` teachers, the arithmetic council mean is
 
-Positive anchor cosines determine teacher weights and the step's absolute
-utility weight. The target blends the teachers' weighted arithmetic mixture
-with their normalized geometric mixture, gated by raw agreement and common
-direction utility. All selectors and targets are detached. The final objective
-contains KD only: mean over each step's tokens, weighted sum divided by the
-example's fixed retained step count, then mean over examples. Gold-answer CE
-is an anchor diagnostic and is never added to the update loss.
+$$
+p_{m,t}=\operatorname{softmax}(z_{m,t}/T),\qquad
+\bar p_t=\frac{1}{M}\sum_{m=1}^{M}p_{m,t}.
+$$
 
-Zero-signal examples remain in the batch denominator. If an entire effective
-batch has zero useful steps, AdamW and the LR scheduler are both skipped; data
-progress still advances. Checkpoints store separate successful-update and data
-batch counters. The new method cannot resume a legacy dual-source checkpoint.
+Every teacher has equal weight. Token disagreement is generalized JSD normalized
+by its upper bound `log(M)`. A single power parameter is shared by every token
+within reasoning step `s`:
 
-Teachers run sequentially without gradients; their temporary hidden states
-are held on CPU. Full-vocabulary logits and targets are streamed in blocks of
-64 tokens, without Top-K/tail approximation. The old mixture cache is not used.
-Gradient checkpointing remains enabled. A student trajectory graph and one
-gold-anchor graph coexist; per-step LoRA gradient buffers are released before
-the next step. Exact geometry is expensive: an example with K steps requires
-3K teacher-KD parameter VJPs, K anchor VJPs and a final student KD VJP.
+$$
+D_t^{\mathrm{JS}}=\frac{1}{M}\sum_{m=1}^{M}
+\operatorname{KL}(p_{m,t}\Vert\bar p_t),\qquad
+\rho_s=d_s=\frac{1}{n_s}\sum_{t\in T_s}\frac{D_t^{\mathrm{JS}}}{\log M}.
+$$
+
+The target is the normalized power mean over the full vocabulary:
+
+$$
+\tilde q_{s,t}(v)=\left[\frac{1}{M}\sum_{m=1}^{M}
+p_{m,t}(v)^{\rho_s}\right]^{1/\rho_s},\qquad
+q_{s,t}(v)=\frac{\tilde q_{s,t}(v)}{\sum_{v'}\tilde q_{s,t}(v')}.
+$$
+
+At `rho = 0`, the continuous limit is the normalized geometric mean,
+`q(v) ∝ exp(mean_m log p_m(v))`, equivalent to softmax of mean teacher logits.
+At `rho = 1`, it is the arithmetic mean. Intermediate values change the power
+mean operator directly; they are not a linear blend of these two endpoints.
+JSD, `rho` and the target depend only on the frozen teachers and fixed trajectory.
+All are detached during the student update.
+
+The loss averages KL over each step's tokens, then gives each retained step and
+each example equal weight:
+
+$$
+\ell_s=\frac{T^2}{n_s}\sum_{t\in T_s}
+\operatorname{KL}(\operatorname{sg}(q_{s,t})\Vert p_{S,t}),\qquad
+L_{\mathrm{example}}=\frac{1}{K}\sum_{s=1}^{K}\ell_s,\qquad
+L_B=\frac{1}{|B|}\sum_{(x,R)\in B}L_{\mathrm{example}}.
+$$
+
+The implementation currently uses reasoning content tokens for `T_s`.
+Delimiters remain in the teacher-forced prefixes but have no KD target; assistant
+control, answer and EOS tokens have no Phase-2 loss. Only complete reasoning
+steps fitting the 32,768-token trajectory context are retained. Gold solutions
+are not used for a task anchor or an SFT objective. Every retained step
+participates in KD, including steps with zero disagreement. An example with no
+retained step contributes zero loss and stays in the batch denominator. If a
+whole effective batch has no retained steps, AdamW and the LR scheduler are both
+skipped while data progress advances.
+
+Teachers run sequentially without gradients; their selected hidden states are
+held on CPU. Full-vocabulary logits and targets use head chunks of 64 tokens,
+without Top-K/tail approximation. Power pooling is evaluated in the log domain,
+including a stable evaluation near `rho = 0`. Gradient checkpointing remains
+enabled. Each example needs one student trajectory graph and a final student
+backward; teacher-gradient and gold-anchor passes are absent. Teacher targets
+could be cached because they are independent of the student, but this branch
+currently evaluates them online and does not use the legacy mixture cache.
+
+Training writes aggregate loss, learning rate, preclip gradient norm, example/step
+counts, raw JSD mean (nats), and normalized disagreement/rho to `metrics.jsonl`
+in the Phase-2 output directory. The terminal also reports KD, LR, JSD and rho.
+By default, `logging.reasoning_steps: true` additionally writes every retained
+reasoning step of every sample on every epoch to `reasoning_steps.jsonl`.
+Each row identifies `sample_id`, original `step_id`, epoch, minibatch, rank and
+the completed data/optimizer-step counters before that minibatch. It includes
+the step's reasoning-token count, mean raw JSD in `js_mean` (natural-log nats),
+normalized `js_normalized = js_mean / log(M)`, `rho = js_normalized`, the step KD
+loss, temperature and teacher count. `step_kd_loss` is the token-mean, T-squared
+loss before the equal-step/example averaging; `sample_kd_loss` is the example
+mean. Epoch, step ID and minibatch indices start at zero. Token offsets are
+zero-based in the prepared trajectory, with an exclusive end.
+
+These rows reuse the existing teacher statistics, independent of
+`stage2.log_every_steps`; no additional teacher forward is performed. Context-
+discarded steps have no JSD row because they are not evaluated. With multiple
+GPUs, each rank writes `reasoning_steps.rank00000.jsonl`, etc., so every rank's
+samples are covered without concurrent writes to one file. A fresh run clears
+its logs; resume trims records after the saved checkpoint cursor before
+appending, including interrupted trailing writes. Final manifests record the
+per-rank log filenames and checksums. Set `logging.reasoning_steps: false` to
+disable the detailed step log while retaining aggregate metrics.
 
 On one H200, run `stage2-medoid`, then `stage2-stress`, then `stage2`. The stress
 command executes the actual full method on the longest eligible real example
 and a synthetic example reaching the context limit. It reports component times,
 peak VRAM, configuration/source fingerprints and completed optimizer updates
-at `artifacts/stage2/stress_memory.json`. It updates only a temporary model.
+at `artifacts/stage2/output_space_stress_memory.json`. It updates only a temporary model.
 Missing CUDA/H200 or incomplete update coverage does not establish readiness.
 The single-microbatch measurements do not estimate the whole training run.
 `all` uses the new medoid and trainer; the H200-specific preflight is explicit.
 
-Positive teacher utilities describe local raw gradient-descent directions.
-Geometric pooling and AdamW do not guarantee that the final update improves
-the gold-answer loss. The implementation follows the proposal without adding
-an extra target-selection guard.
+The report measures this method only when its cases actually run successfully;
+no H200 runtime or memory result is supplied by the implementation change.
+
+The gradient-space variant remains available with
+`STAGE2_CONFIG=configs/stage2/qwen25_7b_task_geometry.yaml`. Its objective,
+gold-answer anchors and artifact paths remain distinct. Checkpoints bind the
+selected method, configuration and source fingerprints, so an output-space run
+cannot resume a gradient-space or legacy dual-source checkpoint. Evaluation
+defaults to `artifacts/stage2/output_space`; evaluating another variant requires
+setting the corresponding `paths.stage2` in an evaluation config.
 
 ## Resume training
 
 ```bash
 STAGE1_RESUME=artifacts/stage1/main/checkpoint.pt ./project_commands.sh stage1
-STAGE2_RESUME=artifacts/stage2/task_geometry/checkpoint.pt ./project_commands.sh stage2
+STAGE2_RESUME=artifacts/stage2/output_space/checkpoint.pt ./project_commands.sh stage2
 ```
 
 ## Useful overrides
@@ -172,7 +234,7 @@ STAGE2_RESUME=artifacts/stage2/task_geometry/checkpoint.pt ./project_commands.sh
 DATA_CONFIG=configs/data/s1k_1_1.yaml ./project_commands.sh prepare
 STAGE1_CONFIG=configs/stage1/qwen25_7b_m3.yaml ./project_commands.sh stage1
 SIGNALS_CONFIG=configs/signals/main.yaml ./project_commands.sh supervision
-STAGE2_CONFIG=configs/stage2/qwen25_7b_task_geometry.yaml ./project_commands.sh stage2
+STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space.yaml ./project_commands.sh stage2
 EVAL_CONFIG=configs/eval/p_align.yaml ./project_commands.sh evaluate
 HF_HUB_OFFLINE=1 ./project_commands.sh all
 ```

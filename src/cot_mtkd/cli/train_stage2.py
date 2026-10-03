@@ -8,7 +8,7 @@ from .common import parsed_config
 
 
 def main() -> None:
-    config = parsed_config("Train the task-anchored gradient-geometry MTKD student")
+    config = parsed_config("Train the configured Phase-2 MTKD student")
     distributed = initialize_distributed()
     configure_logging(distributed.rank)
     seed_everything(int(config["seed"]) + distributed.rank)

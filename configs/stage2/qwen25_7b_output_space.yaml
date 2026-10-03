@@ -1,0 +1,57 @@
+schema_version: 2
+teacher_source:
+  type: huggingface
+  repo_id: duyentl04/abc
+  revision: 52aff0a878826b09fa62fa5a8229a6d49910ff6a
+  adapter_names: [expert_0, expert_1, expert_2]
+  weight_sha256:
+    expert_0: d3ff1ce81c7c014a37d77074bed25286f43bc90e42a0a9fff289cecfd4282a2b
+    expert_1: d579de75c7270ccfb5bede6aa8c80937883e4c3879d824d0a2ab81025af2218c
+    expert_2: be99ab3f0b8c5882b4ab127822ab41a8eada9700631917563921f3f853ba1078
+method: disagreement_adaptive_distribution_aggregation_mtkd
+seed: 42
+model:
+  name_or_path: Qwen/Qwen2.5-7B-Instruct
+  revision: a09a35458c702b33eeacc393d103063234e8bc28
+  dtype: bfloat16
+  attn_implementation: flash_attention_2
+  gradient_checkpointing: true
+  use_cache: false
+lora:
+  rank: 16
+  alpha: 16
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+aggregation:
+  temperature: 2.0
+  teacher_execution: online_full_vocab
+logging:
+  reasoning_steps: true
+stage2:
+  epochs: 3
+  learning_rate: 2.0e-5
+  micro_batch_size: 1
+  global_batch_size: 32
+  gradient_accumulation_steps: null
+  max_length: 32768
+  max_grad_norm: 1.0
+  checkpoint_every_steps: 10
+  log_every_steps: 1
+  resume_from: null
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+scheduler:
+  name: cosine
+  warmup_ratio: 0.10
+  min_lr_ratio: 0.0
+runtime:
+  lm_head_chunk_tokens: 64
+  dataloader_workers: 0
+paths:
+  prepared: artifacts/prepared/s1k_1_1
+  stage1: artifacts/stage1/duyentl04_abc
+  medoid: artifacts/stage2_medoid/output_space
+  output: artifacts/stage2/output_space
