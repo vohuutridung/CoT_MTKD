@@ -88,6 +88,12 @@ def compute_record_gradient(
         raise ValueError("Disagreement-adaptive MTKD requires at least two teachers")
     hidden_storage, cache_bytes = runtime_options(config["runtime"])
     plan = plan_record(record, tokenizer, int(config["stage2"]["max_length"]))
+    execution_metrics = {
+        "head_chunks": 0,
+        "cached_steps": 0,
+        "recomputed_steps": 0,
+        "teacher_head_chunk_sweeps": 0,
+    }
     timers: dict[str, float] = {}
 
     def tick() -> float:
@@ -105,7 +111,10 @@ def compute_record_gradient(
             0,
             0,
             plan.discarded_steps,
-            {"disagreement_sum": 0.0, "rho_sum": 0.0},
+            {
+                "disagreement_sum": 0.0, "rho_sum": 0.0,
+                "prefix_tokens": 0, "reasoning_tokens": 0, **execution_metrics,
+            },
             timers,
         )
     chunk = int(config["runtime"]["lm_head_chunk_tokens"])
@@ -146,6 +155,7 @@ def compute_record_gradient(
             temperature,
             chunk,
             teacher_probability_cache_bytes=cache_bytes,
+            execution_metrics=execution_metrics,
         )
         final_cotangent[cursor : cursor + count] = cotangent / plan.num_steps
         loss += current_loss / plan.num_steps
@@ -188,7 +198,11 @@ def compute_record_gradient(
         plan.num_steps,
         plan.num_steps,
         plan.discarded_steps,
-        {"disagreement_sum": disagreement_sum, "rho_sum": disagreement_sum},
+        {
+            "disagreement_sum": disagreement_sum, "rho_sum": disagreement_sum,
+            "prefix_tokens": len(plan.input_ids), "reasoning_tokens": len(positions),
+            **execution_metrics,
+        },
         timers,
         step_metrics,
     )

@@ -27,6 +27,7 @@ aggregation:
   teacher_execution: online_full_vocab
 logging:
   reasoning_steps: true
+  performance: true
 stage2:
   epochs: 3
   learning_rate: 2.0e-5

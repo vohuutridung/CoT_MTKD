@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ from ..utils.training import (
     zeros_like_parameters,
 )
 from .online import compute_record_gradient, create_online_model
+from .performance import TrainingPerformanceLogger, performance_log_filename
 from .step_logging import (
     create_reasoning_logger,
     log_record_steps,
@@ -112,6 +114,8 @@ def _validate_stage2_config(config: dict[str, Any]) -> None:
         raise ValueError("Old hard/KD source weights are not part of the new Phase-2 objective")
     if not isinstance(config.get("logging", {}).get("reasoning_steps", True), bool):
         raise TypeError("logging.reasoning_steps must be a boolean")
+    if not isinstance(config.get("logging", {}).get("performance", True), bool):
+        raise TypeError("logging.performance must be a boolean")
 
 
 def _record_collator(records):
@@ -344,6 +348,12 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
         step_logger = create_reasoning_logger(
             output_dir, distributed.rank, distributed.world_size, run_hash, data_step, bool(resume)
         )
+    performance = None
+    if method == OUTPUT_SPACE_METHOD and config.get("logging", {}).get("performance", True):
+        performance = TrainingPerformanceLogger(
+            output_dir, distributed.device, distributed.rank, distributed.world_size,
+            run_hash, config_hash, public_config, data_step, bool(resume),
+        )
     buffer = zeros_like_parameters(parameters)
     # Example/step counts and losses; reduction follows fixed K then example mean.
     # Last four slots hold method-specific detached teacher statistics.
@@ -355,9 +365,11 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             if epoch == start_epoch and batch_index < start_batch:
                 continue
             for sample_index, record in enumerate(records):
+                started = performance.begin_sample() if performance is not None else None
                 result = record_gradient(
                     model, adapter_names, parameters, record, tokenizer, config, distributed.device
                 )
+                record_seconds = time.perf_counter() - started if started is not None else None
                 if step_logger is not None:
                     log_record_steps(
                         step_logger,
@@ -392,6 +404,16 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                         result.metrics.get("anchor_loss_sum", 0.0),
                     ]
                 )
+                if performance is not None:
+                    performance.log_sample(
+                        record.sample_id, record_seconds, result,
+                        epoch=epoch,
+                        batch_in_epoch=batch_index,
+                        sample_in_batch=sample_index,
+                        data_step_before=data_step,
+                        global_step_before=global_step,
+                        prepared_tokens=len(record.input_ids),
+                    )
                 del result
             accumulated += 1
             final_batch = epoch + 1 == epochs and batch_index + 1 == len(loader)
@@ -411,6 +433,12 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             )
             data_step += 1
             global_step += int(updated)
+            performance_summary = {}
+            if performance is not None:
+                performance_summary = performance.log_update(
+                    data_step, global_step, total_steps,
+                    epoch=epoch, global_examples=int(counts[0]), skipped_update=not updated,
+                )
             last_metrics = {
                 "kd_loss": counts[4] / counts[0],
                 "examples": int(counts[0]),
@@ -441,10 +469,11 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     epoch=epoch,
                     learning_rate=optimizer.param_groups[0]["lr"],
                     preclip_gradient_norm=norm,
+                    **performance_summary,
                     **last_metrics,
                 )
                 LOGGER.info(
-                    "Phase 2 batch=%d update=%d KD=%.6f active=%d/%d lr=%.3e%s%s",
+                    "Phase 2 batch=%d update=%d KD=%.6f active=%d/%d lr=%.3e%s%s%s",
                     data_step,
                     global_step,
                     last_metrics["kd_loss"],
@@ -457,6 +486,14 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                         else ""
                     ),
                     " (skip)" if not updated else "",
+                    (
+                        f" wall={performance_summary['update_window_wall_seconds']:.1f}s"
+                        + (
+                            f" peak={performance_summary['peak_allocated_gib']:.1f} GiB"
+                            if performance_summary['peak_allocated_gib'] is not None else ""
+                        )
+                        if performance_summary else ""
+                    ),
                 )
             if (
                 distributed.is_main
@@ -532,6 +569,17 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     "file": reasoning_log_filename(rank, distributed.world_size),
                     "sha256": file_sha256(
                         output_dir / reasoning_log_filename(rank, distributed.world_size)
+                    ),
+                }
+                for rank in range(distributed.world_size)
+            ]
+        if performance is not None:
+            manifest["performance_logs"] = [
+                {
+                    "rank": rank,
+                    "file": performance_log_filename(rank, distributed.world_size),
+                    "sha256": file_sha256(
+                        output_dir / performance_log_filename(rank, distributed.world_size)
                     ),
                 }
                 for rank in range(distributed.world_size)

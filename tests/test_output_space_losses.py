@@ -155,16 +155,22 @@ class OutputSpaceLossTest(unittest.TestCase):
         # Three chunks: caching projects teachers once each; fallback projects
         # twice each. The budget must cover the whole step, not just one chunk.
         for budget, calls in ((0, 6), (required - 1, 6), (required, 3)):
+            metrics = {}
             with self.subTest(budget=budget), patch.object(
                 losses, "_head_log_probabilities", wraps=losses._head_log_probabilities
             ) as projection:
                 actual = adaptive_kd_hidden_gradient(
                     student, teachers, head, 2.0, 3,
                     teacher_probability_cache_bytes=budget,
+                    execution_metrics=metrics,
                 )
             self.assertEqual(projection.call_count, calls)
             torch.testing.assert_close(actual[0], reference[0], atol=0, rtol=0)
             self.assertEqual(actual[1:], reference[1:])
+            self.assertEqual(metrics["head_chunks"], 3)
+            self.assertEqual(metrics["cached_steps"], int(budget >= required))
+            self.assertEqual(metrics["recomputed_steps"], int(budget < required))
+            self.assertEqual(metrics["teacher_head_chunk_sweeps"], calls)
         with self.assertRaisesRegex(ValueError, "nonnegative"):
             adaptive_kd_hidden_gradient(
                 student, teachers, head, 2.0, 3, teacher_probability_cache_bytes=-1

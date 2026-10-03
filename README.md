@@ -102,7 +102,7 @@ Purpose of each command above:
 6. `stage2` runs the three training epochs and exports the student to
    `artifacts/stage2/output_space/final/adapters/student`. The same output root
    contains `checkpoint.pt`, `manifest.json`, `metrics.jsonl` and the detailed
-   `reasoning_steps.jsonl` log.
+   `reasoning_steps.jsonl` and `performance.jsonl` logs.
 7. `evaluate` optionally benchmarks the exported student. Training is complete
    when `stage2` finishes; evaluation is not needed to export the adapter.
 
@@ -359,6 +359,42 @@ its logs; resume trims records after the saved checkpoint cursor before
 appending, including interrupted trailing writes. Final manifests record the
 per-rank log filenames and checksums. Set `logging.reasoning_steps: false` to
 disable the detailed step log while retaining aggregate metrics.
+
+By default, `logging.performance: true` also writes `performance.jsonl` (or
+`performance.rank00000.jsonl`, etc., for multiple GPUs). It records one session
+header, one row per sample, and one row per completed effective-batch window:
+
+- The session header records the configuration/fingerprints, GPU name and total
+  memory, device, PyTorch version, rank and GPU count.
+- Sample rows record prepared/prefix/reasoning token counts, retained/discarded
+  reasoning steps, token-head chunks, steps using the GPU probability cache,
+  steps requiring teacher-head recomputation, and record-gradient wall time.
+- Memory fields record current and peak allocated/reserved PyTorch allocator
+  bytes and GiB on that rank. Sample peaks include gradient accumulation;
+  update peaks take the maximum over all accumulated samples and the optimizer
+  calls. Session peaks exclude the earlier model-loading high-water mark.
+- Update rows record local examples/tokens, wall time, local throughput, session
+  elapsed time and a remaining-time estimate. ETA uses completed data windows
+  after discarding the first two warmup windows of the current process. Skipped
+  optimizer updates still count as processed data windows.
+
+This monitoring reads host-side allocator counters and uses `perf_counter`.
+It adds no CUDA synchronization, events, profiler, subprocess GPU polling, extra
+teacher/student forwards or distributed reductions. Timings are explicitly
+`host_wall_no_cuda_sync`: CPU-observed wall times, not exact CUDA kernel timings.
+Prefix throughput counts each trajectory token once, not once per teacher.
+Update windows include sample processing, existing logging/gradient accumulation
+and optimizer enqueue time; checkpoint saving and final export are outside those
+windows. CUDA work may still be pending at a measurement boundary. Memory fields
+are null on CPU and do not include allocations outside PyTorch or other processes.
+Monitoring entails a small amount of CPU work and JSONL I/O; no H200 overhead
+percentage is claimed without measurement.
+
+Performance rows reuse the checkpoint cursor recovery rules and have per-rank
+checksums in the final manifest. A resumed process starts a new timing session
+and warmup period. Rank-zero update summaries also appear in `metrics.jsonl`;
+the terminal shows wall time and, on CUDA, peak allocated VRAM. Set
+`logging.performance: false` to disable this monitoring.
 
 On one H200, run `stage2-medoid`, then `stage2-stress`, then `stage2`. The stress
 command executes the actual full method on the longest eligible real example

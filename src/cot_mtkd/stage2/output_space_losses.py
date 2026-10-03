@@ -139,6 +139,7 @@ def adaptive_kd_hidden_gradient(
     chunk_tokens: int,
     *,
     teacher_probability_cache_bytes: int = 0,
+    execution_metrics: dict[str, int] | None = None,
 ) -> tuple[torch.Tensor, float, float]:
     """Return the step KD hidden cotangent, mean loss, and disagreement ds.
 
@@ -178,6 +179,15 @@ def adaptive_kd_hidden_gradient(
             cached_probabilities.append(log_probabilities)
         del log_probabilities
     disagreement = min(1.0, max(0.0, float(disagreement_total) / token_count))
+    if execution_metrics is not None:
+        chunks = (token_count + chunk_tokens - 1) // chunk_tokens
+        for name, value in {
+            "head_chunks": chunks,
+            "cached_steps": int(cache_step),
+            "recomputed_steps": int(not cache_step),
+            "teacher_head_chunk_sweeps": chunks * (1 if cache_step else 2),
+        }.items():
+            execution_metrics[name] = execution_metrics.get(name, 0) + value
 
     gradient = torch.zeros_like(student_hidden)
     loss_total = 0.0

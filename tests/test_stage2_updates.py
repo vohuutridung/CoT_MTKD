@@ -456,6 +456,31 @@ class Stage2UpdateTest(unittest.TestCase):
                             }
                         ],
                     )
+                    performance_log = output / "performance.jsonl"
+                    perf_rows = [json.loads(line) for line in performance_log.read_text().splitlines()]
+                    self.assertEqual(perf_rows[0]["event"], "stage2_performance_session")
+                    self.assertEqual(perf_rows[0]["config_fingerprint"], manifest["config_fingerprint"])
+                    samples = [row for row in perf_rows if row["event"] == "stage2_sample_performance"]
+                    updates = [row for row in perf_rows if row["event"] == "stage2_update_performance"]
+                    self.assertEqual(len(samples), 2)
+                    self.assertEqual(len(updates), 1)
+                    self.assertEqual({row["sample_id"] for row in samples}, {r.sample_id for r in records})
+                    for row in samples:
+                        self.assertEqual(row["prefix_tokens"], 10)
+                        self.assertEqual(row["reasoning_tokens"], 5)
+                        self.assertEqual(row["cached_steps"], 0)
+                        self.assertEqual(row["recomputed_steps"], 2)
+                        self.assertEqual(row["head_chunks"], 3)
+                        self.assertEqual(row["teacher_head_chunk_sweeps"], 6)
+                        self.assertIsNone(row["peak_allocated_gib"])
+                        self.assertGreaterEqual(row["record_gradient_wall_seconds"], 0)
+                    self.assertEqual(updates[0]["local_examples"], 2)
+                    self.assertEqual(updates[0]["local_prefix_tokens"], 20)
+                    self.assertEqual(updates[0]["eta_remaining_wall_seconds_estimate"], 0)
+                    self.assertEqual(manifest["performance_logs"], [{
+                        "rank": 0, "file": "performance.jsonl",
+                        "sha256": file_sha256(performance_log),
+                    }])
                 self.assert_state_equal(bundle["student"], checkpoint["student_state"])
                 self.assertTrue(
                     (output / "final" / "adapters" / "student" / "adapter_config.json").is_file()
@@ -483,6 +508,9 @@ class Stage2UpdateTest(unittest.TestCase):
                 if method == OUTPUT_SPACE_METHOD:
                     self.assertEqual(
                         file_sha256(step_log), manifest["reasoning_step_logs"][0]["sha256"]
+                    )
+                    self.assertEqual(
+                        file_sha256(performance_log), manifest["performance_logs"][0]["sha256"]
                     )
 
 
