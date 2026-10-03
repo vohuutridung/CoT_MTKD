@@ -104,6 +104,10 @@ def _validate_stage2_config(config: dict[str, Any]) -> None:
         raise ValueError("Phase 2 requires online_full_vocab teacher execution")
     if int(config["runtime"]["lm_head_chunk_tokens"]) <= 0:
         raise ValueError("runtime.lm_head_chunk_tokens must be positive")
+    if method == OUTPUT_SPACE_METHOD:
+        from .output_space import runtime_options
+
+        runtime_options(config["runtime"])
     if "hard_loss_weight" in config["stage2"] or "kd_loss_weight" in config["stage2"]:
         raise ValueError("Old hard/KD source weights are not part of the new Phase-2 objective")
     if not isinstance(config.get("logging", {}).get("reasoning_steps", True), bool):

@@ -20,6 +20,16 @@ class OutputSpaceGradientResult(RecordGradientResult):
     step_metrics: list[dict[str, Any]] = field(default_factory=list)
 
 
+def runtime_options(runtime: dict[str, Any]) -> tuple[str, int]:
+    storage = runtime.get("teacher_hidden_storage", "cpu")
+    if storage not in ("cpu", "device"):
+        raise ValueError("runtime.teacher_hidden_storage must be cpu or device")
+    cache_gib = float(runtime.get("teacher_probability_cache_gib", 0.0))
+    if not math.isfinite(cache_gib) or cache_gib < 0:
+        raise ValueError("runtime.teacher_probability_cache_gib must be finite and nonnegative")
+    return storage, int(cache_gib * 2**30)
+
+
 def plan_record(record: PreparedRecord, tokenizer: Any, max_length: int) -> Phase2RecordPlan:
     """Retain complete reasoning steps without reserving an answer-anchor suffix.
 
@@ -69,12 +79,14 @@ def compute_record_gradient(
 ) -> OutputSpaceGradientResult:
     """PDF equations (1)--(19), with one final student-LoRA VJP per example.
 
-    Teachers use no-grad forwards and CPU hidden-state storage. Head projections
-    are chunked in tokens while retaining the full vocabulary. Every retained
-    step contributes equally; the target and its step rho depend only on teachers.
+    Teachers use no-grad forwards with configurable hidden-state storage and
+    bounded probability caching. Head projections are chunked in tokens while
+    retaining full vocabulary. Every retained step contributes equally; the
+    target and its step rho depend only on teachers.
     """
     if len(adapter_names) < 2:
         raise ValueError("Disagreement-adaptive MTKD requires at least two teachers")
+    hidden_storage, cache_bytes = runtime_options(config["runtime"])
     plan = plan_record(record, tokenizer, int(config["stage2"]["max_length"]))
     timers: dict[str, float] = {}
 
@@ -108,7 +120,9 @@ def compute_record_gradient(
         with torch.no_grad():
             output = forward_hidden(model, ids, torch.ones_like(ids), use_cache=False)
             selected = output.last_hidden_state[0].index_select(0, hidden_indices)
-            teacher_hidden.append(selected.detach().cpu())
+            teacher_hidden.append(
+                selected.detach().cpu() if hidden_storage == "cpu" else selected.detach()
+            )
         del selected, output
     elapsed("teacher_forward", started)
 
@@ -131,6 +145,7 @@ def compute_record_gradient(
             head,
             temperature,
             chunk,
+            teacher_probability_cache_bytes=cache_bytes,
         )
         final_cotangent[cursor : cursor + count] = cotangent / plan.num_steps
         loss += current_loss / plan.num_steps

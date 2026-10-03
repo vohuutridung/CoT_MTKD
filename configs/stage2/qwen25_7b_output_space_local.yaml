@@ -1,13 +1,6 @@
 schema_version: 2
 teacher_source:
-  type: huggingface
-  repo_id: duyentl04/abc
-  revision: 52aff0a878826b09fa62fa5a8229a6d49910ff6a
-  adapter_names: [expert_0, expert_1, expert_2]
-  weight_sha256:
-    expert_0: d3ff1ce81c7c014a37d77074bed25286f43bc90e42a0a9fff289cecfd4282a2b
-    expert_1: d579de75c7270ccfb5bede6aa8c80937883e4c3879d824d0a2ab81025af2218c
-    expert_2: be99ab3f0b8c5882b4ab127822ab41a8eada9700631917563921f3f853ba1078
+  type: local
 method: disagreement_adaptive_distribution_aggregation_mtkd
 seed: 42
 model:
@@ -54,6 +47,6 @@ runtime:
   dataloader_workers: 0
 paths:
   prepared: artifacts/prepared/s1k_1_1
-  stage1: artifacts/stage1/duyentl04_abc
-  medoid: artifacts/stage2_medoid/output_space
-  output: artifacts/stage2/output_space
+  stage1: artifacts/stage1/main
+  medoid: artifacts/stage2_medoid/output_space_local
+  output: artifacts/stage2/output_space_local

@@ -3,10 +3,12 @@ from __future__ import annotations
 import math
 import unittest
 from decimal import Decimal, localcontext
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
+import cot_mtkd.stage2.output_space_losses as losses
 from cot_mtkd.stage2.output_space_losses import (
     adaptive_kd_hidden_gradient,
     normalized_js_disagreement,
@@ -141,6 +143,31 @@ class OutputSpaceLossTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             adaptive_kd_hidden_gradient(
                 torch.zeros(3, 2), [torch.zeros(3, 2)], torch.nn.Linear(2, 4), 2.0, 1
+            )
+
+    def test_probability_cache_reuses_head_and_falls_back_at_budget_boundary(self):
+        torch.manual_seed(981)
+        head = torch.nn.Linear(6, 19, bias=False)
+        student = torch.randn(7, 6, requires_grad=True)
+        teachers = [torch.randn(7, 6) for _ in range(3)]
+        required = 3 * 7 * 19 * 8
+        reference = adaptive_kd_hidden_gradient(student, teachers, head, 2.0, 3)
+        # Three chunks: caching projects teachers once each; fallback projects
+        # twice each. The budget must cover the whole step, not just one chunk.
+        for budget, calls in ((0, 6), (required - 1, 6), (required, 3)):
+            with self.subTest(budget=budget), patch.object(
+                losses, "_head_log_probabilities", wraps=losses._head_log_probabilities
+            ) as projection:
+                actual = adaptive_kd_hidden_gradient(
+                    student, teachers, head, 2.0, 3,
+                    teacher_probability_cache_bytes=budget,
+                )
+            self.assertEqual(projection.call_count, calls)
+            torch.testing.assert_close(actual[0], reference[0], atol=0, rtol=0)
+            self.assertEqual(actual[1:], reference[1:])
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            adaptive_kd_hidden_gradient(
+                student, teachers, head, 2.0, 3, teacher_probability_cache_bytes=-1
             )
 
 

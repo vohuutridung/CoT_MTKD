@@ -137,41 +137,64 @@ def adaptive_kd_hidden_gradient(
     head: torch.nn.Module,
     temperature: float,
     chunk_tokens: int,
+    *,
+    teacher_probability_cache_bytes: int = 0,
 ) -> tuple[torch.Tensor, float, float]:
     """Return the step KD hidden cotangent, mean loss, and disagreement ds.
 
     Implements T^2/n sum_t KL(sg(q_t(rho)) || pS_t), with one rho=ds for
-    this entire reasoning step. Two chunked teacher-head sweeps first compute
-    ds over all step tokens, then construct targets using that same rho. Only
-    one chunk's full-vocabulary distributions are retained at a time.
-    Teacher hidden states can remain on CPU. No teacher graph is constructed,
-    and the returned cotangent is detached and already normalized by n.
+    this entire reasoning step. Cache the step's teacher log probabilities when
+    they fit the byte budget, avoiding a second teacher-head sweep. Larger steps
+    use two sweeps with bounded chunk storage. Both paths retain full vocabulary
+    and the same step rho. No teacher graph is constructed; the cotangent is
+    detached and already normalized by n.
     """
     head_device, head_dtype = _validate_inputs(
         student_hidden, teacher_hidden_by_expert, head, temperature, chunk_tokens
     )
     if len(teacher_hidden_by_expert) < 2:
         raise ValueError("Disagreement-adaptive output-space KD requires at least two teachers")
+    if teacher_probability_cache_bytes < 0:
+        raise ValueError("Teacher probability cache byte budget must be nonnegative")
     token_count = student_hidden.shape[0]
-    disagreement_total = 0.0
+    disagreement_total = torch.zeros((), device=head_device, dtype=torch.float64)
+    cached_probabilities: list[torch.Tensor | None] = []
+    cache_step = False
     for start in range(0, token_count, chunk_tokens):
         end = min(token_count, start + chunk_tokens)
         log_probabilities = _head_log_probabilities(
             teacher_hidden_by_expert, head, start, end, temperature, head_device, head_dtype
         )
-        disagreement_total += float(normalized_js_disagreement(log_probabilities).sum())
+        if start == 0:
+            required_bytes = (
+                len(teacher_hidden_by_expert)
+                * token_count
+                * log_probabilities.shape[-1]
+                * log_probabilities.element_size()
+            )
+            cache_step = required_bytes <= teacher_probability_cache_bytes
+        disagreement_total += normalized_js_disagreement(log_probabilities).sum()
+        if cache_step:
+            cached_probabilities.append(log_probabilities)
         del log_probabilities
-    disagreement = min(1.0, max(0.0, disagreement_total / token_count))
+    disagreement = min(1.0, max(0.0, float(disagreement_total) / token_count))
 
     gradient = torch.zeros_like(student_hidden)
     loss_total = 0.0
     scale = temperature**2 / token_count
-    for start in range(0, token_count, chunk_tokens):
+    for index, start in enumerate(range(0, token_count, chunk_tokens)):
         end = min(token_count, start + chunk_tokens)
-        log_probabilities = _head_log_probabilities(
-            teacher_hidden_by_expert, head, start, end, temperature, head_device, head_dtype
-        )
+        if cache_step:
+            log_probabilities = cached_probabilities[index]
+            assert log_probabilities is not None
+        else:
+            log_probabilities = _head_log_probabilities(
+                teacher_hidden_by_expert, head, start, end, temperature, head_device, head_dtype
+            )
         target = power_mean_log_target(log_probabilities, disagreement)
+        if cache_step:
+            # Release each cached chunk once its target has been constructed.
+            cached_probabilities[index] = None
         del log_probabilities
         current_gradient, current_loss = _chunk_gradient(
             student_hidden[start:end],

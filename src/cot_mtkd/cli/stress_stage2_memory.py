@@ -508,6 +508,12 @@ def main() -> None:
             "gradient_checkpointing": bool(config["model"].get("gradient_checkpointing", False)),
             "lora_dropout": float(config["lora"]["dropout"]),
             "temperature": float(config[section]["temperature"]),
+            **({
+                "teacher_hidden_storage": config["runtime"].get("teacher_hidden_storage", "cpu"),
+                "teacher_probability_cache_gib": float(
+                    config["runtime"].get("teacher_probability_cache_gib", 0.0)
+                ),
+            } if output_space else {}),
             **({} if output_space else {
                 "epsilon_a": float(config["geometry"]["epsilon_a"]),
                 "epsilon_u": float(config["geometry"]["epsilon_u"]),

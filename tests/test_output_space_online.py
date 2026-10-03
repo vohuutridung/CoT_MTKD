@@ -17,7 +17,7 @@ from cot_mtkd.cli.stress_stage2_memory import (
     make_synthetic_record,
 )
 from cot_mtkd.models.multi_adapter import extract_adapter_state, set_active_adapter
-from cot_mtkd.stage2.output_space import compute_record_gradient, plan_record
+from cot_mtkd.stage2.output_space import compute_record_gradient, plan_record, runtime_options
 from cot_mtkd.stage2.trainer import OUTPUT_SPACE_METHOD
 
 
@@ -138,6 +138,40 @@ class OutputSpaceOnlineTest(unittest.TestCase):
         self.assertEqual(plan_record(self.record, None, 5).num_steps, 0)
         with self.assertRaisesRegex(ValueError, "prompt/control"):
             plan_record(self.record, None, 2)
+
+    def test_device_hidden_storage_and_cached_probabilities_match_memory_path(self):
+        model, names, parameters = tiny_online_council(checkpointing=True)
+        reference = compute_record_gradient(
+            model, names, parameters, self.record, None, self.config, torch.device("cpu")
+        )
+        config = copy.deepcopy(self.config)
+        config["runtime"].update(
+            teacher_hidden_storage="device", teacher_probability_cache_gib=1.0,
+            lm_head_chunk_tokens=1024,
+        )
+        actual = compute_record_gradient(
+            model, names, parameters, self.record, None, config, torch.device("cpu")
+        )
+        self.assertAlmostEqual(actual.loss, reference.loss, delta=3.0e-7)
+        self.assertAlmostEqual(
+            actual.metrics["disagreement_sum"], reference.metrics["disagreement_sum"],
+            delta=1.0e-8,
+        )
+        for a, b in zip(actual.gradients, reference.gradients, strict=True):
+            torch.testing.assert_close(a, b, atol=3.0e-7, rtol=3.0e-4)
+        self.assertEqual(len(actual.step_metrics), len(reference.step_metrics))
+
+    def test_runtime_options_reject_invalid_storage_and_cache_limits(self):
+        self.assertEqual(runtime_options({}), ("cpu", 0))
+        self.assertEqual(
+            runtime_options({"teacher_hidden_storage": "device", "teacher_probability_cache_gib": 8}),
+            ("device", 8 * 2**30),
+        )
+        for value in (-1, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "finite and nonnegative"):
+                runtime_options({"teacher_probability_cache_gib": value})
+        with self.assertRaisesRegex(ValueError, "cpu or device"):
+            runtime_options({"teacher_hidden_storage": "disk"})
 
     def test_gold_and_final_answer_do_not_change_training_target_or_gradient(self):
         model, names, parameters = tiny_online_council(checkpointing=False)
