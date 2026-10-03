@@ -55,8 +55,13 @@ def full_vocab_probe(
     targets: torch.Tensor,
     probe_k: int,
     chunk_tokens: int,
+    output_device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return descending non-target top-k values/ids and full non-target min/max on CPU."""
+    """Return non-target Top-k and full min/max on the requested output device.
+
+    CPU remains the default for offline signal extraction. Stage 1 requests its
+    training device so selection and support construction stay on CUDA.
+    """
     count = hidden.shape[0]
     all_values: list[torch.Tensor] = []
     all_ids: list[torch.Tensor] = []
@@ -80,10 +85,10 @@ def full_vocab_probe(
             logits[row, target] = torch.inf
             minimum = logits.min(dim=-1).values
             logits[row, target] = target_values
-            all_values.append(values.cpu())
-            all_ids.append(ids.to(torch.int32).cpu())
-            all_min.append(minimum.cpu())
-            all_max.append(maximum.cpu())
+            all_values.append(values.to(output_device))
+            all_ids.append(ids.to(device=output_device, dtype=torch.int32))
+            all_min.append(minimum.to(output_device))
+            all_max.append(maximum.to(output_device))
     return (
         torch.cat(all_values),
         torch.cat(all_ids),

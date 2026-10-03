@@ -56,12 +56,26 @@ The combined path preserves the original global token and sample normalizers.
 
 After preparing the dataset and before full H200 training, run
 `./project_commands.sh stage1-stress` with exactly one H200 visible. It executes
-two ramp-path cases: the longest prepared real sample and a synthetic
-32,768-token extension of its reasoning. Each case exercises the ramp path,
-which retains both transformer VJPs and the separate gradient buffers. The report at
-`artifacts/stage1/stress_memory.json` records both peak allocated and reserved
-VRAM. A worst reserved peak below 110 GiB is marked ready for one-pass; 110–120
-GiB asks for review; 120 GiB or more recommends the two-pass fallback.
+six cases: SFT, ramp, and full paths for both the longest prepared real sample
+and a synthetic 32,768-token extension of its reasoning. SFT skips probe/DPP/RBF;
+ramp retains separate SFT/DPP transformer VJPs and gradient buffers; full uses
+the normalized combined task gradient and one transformer VJP. The default
+config keeps gradient checkpointing enabled, places probe/support on CUDA, and
+uses `lm_head_chunk_tokens: 32768` while retaining configurable head chunking.
+
+Each case runs one warm-up followed by one measured iteration. Adjust these
+with `STAGE1_STRESS_WARMUP` and `STAGE1_STRESS_REPETITIONS` (warm-up may be zero;
+repetitions must be positive). The report at `artifacts/stage1/stress_memory.json`
+records peak allocated/reserved VRAM across warm-up and measurement, plus measured
+times and completion counters. Times are for **one sample/microbatch including
+an optimizer update**, not a training update accumulating the global batch of
+32 samples. These longest-sample timings do not estimate the complete training run.
+
+A worst reserved peak below 110 GiB is marked ready for one-pass; 110–120 GiB
+asks for review; 120 GiB or more, or any CUDA OOM, recommends the two-pass fallback
+and exits with status 2. All six cases must complete before the preflight is ready.
+Stress updates affect only the temporary model in that process; no training
+checkpoint or adapters are saved.
 
 ## Resume training
 

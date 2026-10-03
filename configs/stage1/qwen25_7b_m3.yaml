@@ -48,10 +48,10 @@ scheduler:
   warmup_ratio: 0.10
   min_lr_ratio: 0.0
 runtime:
-  lm_head_chunk_tokens: 1024
+  lm_head_chunk_tokens: 32768
   dataloader_workers: 0
   pin_memory: true
-  probe_hidden_device: cpu
+  probe_hidden_device: cuda
   deterministic_algorithms: false
 paths:
   prepared: artifacts/prepared/s1k_1_1

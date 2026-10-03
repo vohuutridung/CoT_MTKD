@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import statistics
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -28,6 +30,7 @@ from ..stage1.trainer import (
     _optimizer_and_scheduler,
     _run_compatible_config,
     one_pass_expert_gradients,
+    sft_only_expert_gradients,
 )
 from ..utils.manifest import fingerprint, read_json, require_file_sha256
 from ..utils.seed import seed_everything
@@ -40,6 +43,7 @@ from ..utils.training import (
 
 TARGET_LENGTH = 32_768
 GIB = 1024**3
+PHASES = ("sft", "ramp", "full")
 
 
 def extend_reasoning(record: PreparedRecord, target_length: int) -> PreparedRecord:
@@ -95,8 +99,8 @@ def extend_reasoning(record: PreparedRecord, target_length: int) -> PreparedReco
     return synthetic
 
 
-def run_case(
-    name: str,
+def _run_microbatch(
+    phase: str,
     record: PreparedRecord,
     collator: LongCoTCollator,
     model: torch.nn.Module,
@@ -105,95 +109,225 @@ def run_case(
     parameters: list[list[torch.nn.Parameter]],
     optimizers: list[torch.optim.Optimizer],
     schedulers: list[torch.optim.lr_scheduler.LRScheduler],
-    sft_buffers: list[list[torch.Tensor]],
-    dpp_buffers: list[list[torch.Tensor]],
     bandwidth: BandwidthEMA,
     config: dict[str, Any],
     device: torch.device,
+    iteration: int,
 ) -> dict[str, Any]:
-    for group in (*sft_buffers, *dpp_buffers):
-        for value in group:
-            value.zero_()
-    torch.cuda.synchronize(device)
-    torch.cuda.reset_peak_memory_stats(device)
-    start = time.perf_counter()
+    """Exercise one optimizer update using the trainer's phase-specific path.
+
+    This is a single-sample optimizer window. Its token/sample normalizers
+    match training, but its time is not a global-batch optimizer-step time.
+    """
+    if phase not in PHASES:
+        raise ValueError(f"Unknown Stage-1 stress phase: {phase}")
+    sft_buffers = [zeros_like_parameters(current) for current in parameters]
+    dpp_buffers = (
+        [zeros_like_parameters(current) for current in parameters] if phase == "ramp" else None
+    )
     batch = _batch_to_device(collator([record]), device)
     views = shifted_token_views(batch)
     sft_tokens = int(views["response_targets"].numel())
     dpp_samples = int(torch.unique(views["reasoning_batch_indices"]).numel())
-    probe, results = one_pass_expert_gradients(
-        model,
-        names,
-        parameters,
-        batch,
-        0,
-        0,
-        int(config["seed"]),
-        config,
-        device,
-    )
-    if probe.dpp_sample_count != dpp_samples:
-        raise RuntimeError(
-            "Stress DPP sample count differs from its planned denominator"
+    if sft_tokens <= 0:
+        raise ValueError("Stress sample has no labeled response tokens")
+    combined_dpp_scale = None
+    if phase == "sft":
+        results = (
+            sft_only_expert_gradients(
+                model,
+                name,
+                expert,
+                current,
+                batch,
+                iteration,
+                iteration,
+                int(config["seed"]),
+                int(config["runtime"]["lm_head_chunk_tokens"]),
+                device,
+            )
+            for expert, (name, current) in enumerate(zip(names, parameters, strict=True))
         )
+    else:
+        if phase == "full":
+            combined_dpp_scale = (
+                float(config["stage1"]["dpp_weight"]) * sft_tokens / dpp_samples
+                if dpp_samples
+                else 0.0
+            )
+        probe, results = one_pass_expert_gradients(
+            model,
+            names,
+            parameters,
+            batch,
+            iteration,
+            iteration,
+            int(config["seed"]),
+            config,
+            device,
+            combined_dpp_scale=combined_dpp_scale,
+        )
+        if probe.dpp_sample_count != dpp_samples:
+            raise RuntimeError("Stress DPP sample count differs from its planned denominator")
     for expert, (sft, dpp, _, _) in enumerate(results):
         add_gradients_(sft_buffers[expert], sft)
-        add_gradients_(dpp_buffers[expert], dpp)
+        if dpp_buffers is not None:
+            add_gradients_(dpp_buffers[expert], dpp)
     for values in sft_buffers:
         for value in values:
             value.div_(max(sft_tokens, 1))
-    for values in dpp_buffers:
-        for value in values:
-            value.div_(max(dpp_samples, 1))
-    set_all_adapters_trainable(model, names)
-    scaling = float(config["lora"]["alpha"]) / float(config["lora"]["rank"])
-    distances_for_step = effective_update_distances(groups, scaling)
-    current_bandwidth = bandwidth.update(distances_for_step)
-    repulsion, kernel, _ = repulsion_updates(
-        groups, scaling, current_bandwidth, distances=distances_for_step
-    )
-    final, _ = stable_gac_gradients(
-        sft_buffers,
-        dpp_buffers,
-        repulsion,
-        kernel,
-        0.5,  # The ramp keeps both transformer VJPs and their gradient buffers.
-        float(config["stage1"]["dpp_weight"]),
-        float(config["stage1"]["rbf_weight"]),
-    )
+    if dpp_buffers is not None:
+        for values in dpp_buffers:
+            for value in values:
+                value.div_(max(dpp_samples, 1))
+    if phase == "sft":
+        final = sft_buffers
+    else:
+        set_all_adapters_trainable(model, names)
+        scaling = float(config["lora"]["alpha"]) / float(config["lora"]["rank"])
+        distances_for_step = effective_update_distances(groups, scaling)
+        current_bandwidth = bandwidth.update(distances_for_step)
+        repulsion, kernel, _ = repulsion_updates(
+            groups, scaling, current_bandwidth, distances=distances_for_step
+        )
+        final, _ = stable_gac_gradients(
+            sft_buffers,
+            dpp_buffers,
+            repulsion,
+            kernel,
+            0.5 if phase == "ramp" else 1.0,
+            float(config["stage1"]["dpp_weight"]),
+            float(config["stage1"]["rbf_weight"]),
+        )
     for values, current, optimizer, scheduler in zip(
         final, parameters, optimizers, schedulers, strict=True
     ):
-        global_clip_grad_list_(values, float(config["stage1"]["max_grad_norm"]))
+        norm = global_clip_grad_list_(values, float(config["stage1"]["max_grad_norm"]))
+        if not math.isfinite(norm):
+            raise FloatingPointError(f"Stress {phase} path produced a non-finite gradient norm")
         assign_gradients(current, values)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
+    return {
+        "response_tokens": sft_tokens,
+        "dpp_samples": dpp_samples if phase != "sft" else 0,
+        "combined_dpp_scale": combined_dpp_scale,
+    }
+
+
+def run_case(
+    name: str,
+    phase: str,
+    record: PreparedRecord,
+    collator: LongCoTCollator,
+    model: torch.nn.Module,
+    names: list[str],
+    groups: list[dict[str, torch.nn.Parameter]],
+    parameters: list[list[torch.nn.Parameter]],
+    optimizers: list[torch.optim.Optimizer],
+    schedulers: list[torch.optim.lr_scheduler.LRScheduler],
+    bandwidth: BandwidthEMA,
+    config: dict[str, Any],
+    device: torch.device,
+    *,
+    warmup: int = 1,
+    repetitions: int = 1,
+    first_iteration: int = 0,
+) -> dict[str, Any]:
+    if phase not in PHASES:
+        raise ValueError(f"Unknown Stage-1 stress phase: {phase}")
+    if warmup < 0 or repetitions <= 0:
+        raise ValueError("Stress warmup must be nonnegative and repetitions must be positive")
     torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    measured_times: list[float] = []
+    completed_warmup = 0
+    details: dict[str, Any] = {}
+    status = "ok"
+    failed_iteration_kind = None
+    for index in range(warmup + repetitions):
+        torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        try:
+            details = _run_microbatch(
+                phase,
+                record,
+                collator,
+                model,
+                names,
+                groups,
+                parameters,
+                optimizers,
+                schedulers,
+                bandwidth,
+                config,
+                device,
+                first_iteration + index,
+            )
+            torch.cuda.synchronize(device)
+        except torch.cuda.OutOfMemoryError:
+            status = "cuda_oom"
+            failed_iteration_kind = "warmup" if index < warmup else "measured"
+            break
+        elapsed = time.perf_counter() - start
+        if index < warmup:
+            completed_warmup += 1
+        else:
+            measured_times.append(elapsed)
+    # Reset only once per case so warm-up allocation spikes also count toward
+    # the preflight decision, even when subsequent measured iterations fit.
     allocated = torch.cuda.max_memory_allocated(device)
     reserved = torch.cuda.max_memory_reserved(device)
     return {
         "case": name,
-        "status": "ok",
-        "interaction_phase": "ramp",
+        "case_id": f"{name}_{phase}",
+        "status": status,
+        "interaction_phase": phase,
         "sample_id": record.sample_id,
         "sequence_length": len(record.input_ids),
-        "dpp_samples": probe.dpp_sample_count,
+        **details,
+        "micro_batch_size": 1,
+        "training_global_batch_size": int(config["stage1"]["global_batch_size"]),
+        "timing_unit": "one_microbatch_with_optimizer_step",
+        "warmup_iterations": warmup,
+        "measured_iterations": repetitions,
+        "completed_warmup_iterations": completed_warmup,
+        "completed_measured_iterations": len(measured_times),
+        "failed_iteration_kind": failed_iteration_kind,
+        "memory_includes_warmup": True,
         "max_memory_allocated_bytes": allocated,
         "max_memory_reserved_bytes": reserved,
         "max_memory_allocated_gib": round(allocated / GIB, 3),
         "max_memory_reserved_gib": round(reserved / GIB, 3),
-        "elapsed_seconds": round(time.perf_counter() - start, 2),
+        "measured_elapsed_seconds": [round(value, 3) for value in measured_times],
+        "elapsed_seconds": round(statistics.mean(measured_times), 3) if measured_times else None,
+        "median_elapsed_seconds": (
+            round(statistics.median(measured_times), 3) if measured_times else None
+        ),
     }
+
+
+def memory_recommendation(cases: list[dict[str, Any]]) -> tuple[str, float]:
+    worst_reserved = max(case["max_memory_reserved_bytes"] for case in cases) / GIB
+    if any(case["status"] != "ok" for case in cases) or worst_reserved >= 120:
+        return "two_pass_fallback", worst_reserved
+    if worst_reserved < 110:
+        return "one_pass_ready", worst_reserved
+    return "review_headroom", worst_reserved
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run exactly two one-pass Phase-1 H200 memory stress cases"
+        description="Stress SFT/ramp/full Phase-1 paths on two long samples with warm-up"
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", default="artifacts/stage1/stress_memory.json")
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--repetitions", type=int, default=1)
     arguments = parser.parse_args()
+    if arguments.warmup < 0 or arguments.repetitions <= 0:
+        parser.error("--warmup must be nonnegative and --repetitions must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("An H200 CUDA GPU is required for the VRAM stress tests")
     if torch.cuda.device_count() != 1:
@@ -242,20 +376,24 @@ def main() -> None:
         raise ValueError("Synthetic sequence exceeds the model context limit")
     groups = adapter_parameter_groups(model, names)
     parameters = [list(group.values()) for group in groups]
-    pairs = [_optimizer_and_scheduler(current, config, 2) for current in parameters]
+    case_count = len(PHASES) * 2
+    iterations_per_case = arguments.warmup + arguments.repetitions
+    pairs = [
+        _optimizer_and_scheduler(current, config, case_count * iterations_per_case)
+        for current in parameters
+    ]
     optimizers = [pair[0] for pair in pairs]
     schedulers = [pair[1] for pair in pairs]
-    sft_buffers = [zeros_like_parameters(current) for current in parameters]
-    dpp_buffers = [zeros_like_parameters(current) for current in parameters]
     bandwidth = BandwidthEMA(
         decay=float(config["rbf"]["bandwidth_ema"]),
         floor=float(config["rbf"]["bandwidth_floor"]),
     )
     cases = []
-    for name, record in (("longest_real", longest), ("synthetic_32768", synthetic)):
-        try:
+    for phase in PHASES:
+        for name, record in (("longest_real", longest), ("synthetic_32768", synthetic)):
             result = run_case(
                 name,
+                phase,
                 record,
                 collator,
                 model,
@@ -264,46 +402,37 @@ def main() -> None:
                 parameters,
                 optimizers,
                 schedulers,
-                sft_buffers,
-                dpp_buffers,
                 bandwidth,
                 config,
                 device,
+                warmup=arguments.warmup,
+                repetitions=arguments.repetitions,
+                first_iteration=len(cases) * iterations_per_case,
             )
-        except torch.cuda.OutOfMemoryError:
-            allocated = torch.cuda.max_memory_allocated(device)
-            reserved = torch.cuda.max_memory_reserved(device)
-            result = {
-                "case": name,
-                "status": "cuda_oom",
-                "sample_id": record.sample_id,
-                "sequence_length": len(record.input_ids),
-                "max_memory_allocated_bytes": allocated,
-                "max_memory_reserved_bytes": reserved,
-                "max_memory_allocated_gib": round(allocated / GIB, 3),
-                "max_memory_reserved_gib": round(reserved / GIB, 3),
-            }
-        cases.append(result)
-        print(json.dumps(result, ensure_ascii=False), flush=True)
-        if result["status"] == "cuda_oom":
+            cases.append(result)
+            print(json.dumps(result, ensure_ascii=False), flush=True)
+            if result["status"] == "cuda_oom":
+                break
+        if cases[-1]["status"] == "cuda_oom":
             break
-    worst_reserved = max(case["max_memory_reserved_bytes"] for case in cases) / GIB
-    if any(case["status"] == "cuda_oom" for case in cases) or worst_reserved >= 120:
-        recommendation = "two_pass_fallback"
-    elif worst_reserved < 110:
-        recommendation = "one_pass_ready"
-    else:
-        recommendation = "review_headroom"
+    recommendation, worst_reserved = memory_recommendation(cases)
     report = {
         "gpu_name": gpu_name,
         "gpu_total_memory_gib": round(
             torch.cuda.get_device_properties(device).total_memory / GIB, 3
         ),
         "forward_mode": "one_pass",
-        "interaction_phase": "ramp",
+        "interaction_phases": list(PHASES),
+        "gradient_checkpointing": bool(config["model"].get("gradient_checkpointing", False)),
+        "lm_head_chunk_tokens": int(config["runtime"]["lm_head_chunk_tokens"]),
+        "probe_hidden_device": config["runtime"].get("probe_hidden_device", "cpu"),
+        "timing_unit": "one_microbatch_with_optimizer_step",
+        "warmup_iterations_per_case": arguments.warmup,
+        "measured_iterations_per_case": arguments.repetitions,
         "config_fingerprint": fingerprint(_run_compatible_config(config)),
         "prepared_manifest_fingerprint": fingerprint(manifest),
         "cases": cases,
+        "cases_planned": case_count,
         "cases_completed": sum(case["status"] == "ok" for case in cases),
         "worst_reserved_gib": round(worst_reserved, 3),
         "recommendation": recommendation,

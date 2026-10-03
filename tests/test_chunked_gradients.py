@@ -7,6 +7,8 @@ import torch.nn.functional as F
 
 from cot_mtkd.models.chunked_head import (
     cross_entropy_hidden_gradient,
+    full_vocab_probe,
+    gather_support_logits,
     support_vjp_hidden_gradient,
 )
 from cot_mtkd.stage2.losses import dual_source_hidden_gradients
@@ -50,6 +52,50 @@ class ChunkedGradientTest(unittest.TestCase):
         self.assertTrue(
             torch.allclose(gradient, dense_gradient, atol=1.0e-6, rtol=1.0e-5)
         )
+
+    def _assert_large_chunk_parity(self, device: torch.device) -> None:
+        head = self.head.to(device)
+        hidden = self.hidden.to(device)
+        targets = self.targets.to(device)
+        small_probe = full_vocab_probe(hidden, head, targets, 6, 3)
+        large_probe = full_vocab_probe(
+            hidden, head, targets, 6, 32768, output_device=device
+        )
+        for small, large in zip(small_probe, large_probe, strict=True):
+            self.assertEqual(small.device.type, "cpu")
+            self.assertEqual(large.device, device)
+            if small.is_floating_point():
+                torch.testing.assert_close(small, large.cpu(), atol=1e-6, rtol=1e-5)
+            else:
+                self.assertTrue(torch.equal(small, large.cpu()))
+        self.assertEqual(large_probe[1].dtype, torch.int32)
+        self.assertFalse((large_probe[1] == targets[:, None]).any())
+        support = large_probe[1].long()
+        small_logits = gather_support_logits(hidden, head, support, 3)
+        large_logits = gather_support_logits(hidden, head, support, 32768)
+        torch.testing.assert_close(small_logits, large_logits, atol=1e-6, rtol=1e-5)
+        cotangent = torch.randn_like(large_logits)
+        for chunk_tokens in (3, 32768):
+            ce_gradient, ce_loss, count = cross_entropy_hidden_gradient(
+                hidden, head, targets, chunk_tokens
+            )
+            dpp_gradient = support_vjp_hidden_gradient(
+                hidden, head, support, cotangent, chunk_tokens
+            )
+            if chunk_tokens == 3:
+                expected_ce, expected_loss, expected_dpp = ce_gradient, ce_loss, dpp_gradient
+            else:
+                torch.testing.assert_close(ce_gradient, expected_ce, atol=1e-6, rtol=1e-5)
+                torch.testing.assert_close(ce_loss, expected_loss, atol=1e-6, rtol=1e-5)
+                torch.testing.assert_close(dpp_gradient, expected_dpp, atol=1e-6, rtol=1e-5)
+            self.assertEqual(count, hidden.shape[0])
+
+    def test_chunk_32768_matches_small_chunks(self) -> None:
+        self._assert_large_chunk_parity(torch.device("cpu"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_probe_and_chunk_32768_parity(self) -> None:
+        self._assert_large_chunk_parity(torch.device("cuda:0"))
 
     def test_dual_source_chunking_matches_dense_autograd(self) -> None:
         hard_weights = torch.linspace(0.25, 1.75, self.hidden.shape[0])

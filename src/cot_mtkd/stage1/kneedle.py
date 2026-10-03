@@ -44,27 +44,42 @@ def build_union_support(
         top_ids: int tensor `[experts, tokens, probe_k]` on CPU or GPU.
         selected_k: int tensor `[experts, tokens]`.
     Returns:
-        padded support ids `[tokens, max_union]` and bool validity mask.
+        padded support ids `[tokens, max_union]` and bool validity mask on
+        `top_ids.device`. Valid ids are ascending and unique. Padding repeats
+        the first valid id, or zero for an empty support.
     """
     if top_ids.ndim != 3 or selected_k.shape != top_ids.shape[:2]:
         raise ValueError("Incompatible top-id and K tensors")
-    ids_cpu = top_ids.detach().to("cpu", dtype=torch.int64)
-    k_cpu = selected_k.detach().to("cpu", dtype=torch.int64)
-    per_token: list[torch.Tensor] = []
-    maximum = 0
-    for token in range(ids_cpu.shape[1]):
-        pieces = [
-            ids_cpu[expert, token, : int(k_cpu[expert, token])]
-            for expert in range(ids_cpu.shape[0])
-        ]
-        union = torch.unique(torch.cat(pieces), sorted=True)
-        per_token.append(union)
-        maximum = max(maximum, union.numel())
-    support = torch.zeros((ids_cpu.shape[1], maximum), dtype=torch.int64)
-    mask = torch.zeros((ids_cpu.shape[1], maximum), dtype=torch.bool)
-    for token, union in enumerate(per_token):
-        support[token, : union.numel()] = union
-        mask[token, : union.numel()] = True
-        if union.numel() < maximum:
-            support[token, union.numel() :] = union[0]
+    ids = top_ids.detach().to(dtype=torch.int64)
+    k = selected_k.detach().to(device=ids.device, dtype=torch.int64)
+    experts, tokens, probe_k = ids.shape
+    if not experts or not tokens or not probe_k:
+        return (
+            ids.new_empty((tokens, 0)),
+            torch.empty((tokens, 0), device=ids.device, dtype=torch.bool),
+        )
+    # Match the prefix slicing used by the reference implementation, including
+    # K values outside the probe width. This synchronizes only a scalar on CUDA.
+    k = torch.where(k < 0, (k + probe_k).clamp_min(0), k.clamp_max(probe_k))
+    candidate_k = int(k.max().item())
+    if candidate_k == 0:
+        return (
+            ids.new_empty((tokens, 0)),
+            torch.empty((tokens, 0), device=ids.device, dtype=torch.bool),
+        )
+    ranks = torch.arange(candidate_k, device=ids.device)
+    valid = ranks[None, None, :] < k[:, :, None]
+    # Vocabulary ids cannot equal this sentinel. Move padding to the end before
+    # finding adjacent duplicates, then compact unique ids with a second sort.
+    sentinel = torch.iinfo(torch.int64).max
+    candidates = ids[:, :, :candidate_k].masked_fill(~valid, sentinel)
+    ordered = candidates.permute(1, 0, 2).reshape(tokens, -1).sort(dim=1).values
+    starts = ordered != sentinel
+    starts[:, 1:] &= ordered[:, 1:] != ordered[:, :-1]
+    counts = starts.sum(dim=1)
+    maximum = int(counts.max().item())
+    compact = ordered.masked_fill(~starts, sentinel).sort(dim=1).values[:, :maximum]
+    mask = torch.arange(maximum, device=ids.device)[None, :] < counts[:, None]
+    first = ordered[:, :1].masked_fill(counts[:, None] == 0, 0)
+    support = torch.where(mask, compact, first)
     return support, mask

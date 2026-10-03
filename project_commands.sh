@@ -15,7 +15,7 @@ Commands:
   setup         Create .venv and install the local project.
   prepare       Download/read and preprocess s1K-1.1.
   stage1        Train the three GAC-CoT LoRA experts.
-  stage1-stress Run two one-pass H200 VRAM stress cases before Phase 1.
+  stage1-stress Run six H200 SFT/ramp/full VRAM stress cases before Phase 1.
   supervision  Build PAG, importance, teacher features, weights, and medoid.
   cache         Compile Top-512 plus tail-bucket teacher targets.
   stage2        Train the single medoid-initialized student adapter.
@@ -27,7 +27,7 @@ Commands:
 
 Environment overrides:
   NPROC_PER_NODE, PYTHON_BIN, DATA_CONFIG, STAGE1_CONFIG, STAGE1_FORWARD_MODE,
-  STAGE1_STRESS_OUTPUT,
+  STAGE1_STRESS_OUTPUT, STAGE1_STRESS_WARMUP, STAGE1_STRESS_REPETITIONS,
   SIGNALS_CONFIG, STAGE2_CONFIG, EVAL_CONFIG, STAGE1_RESUME,
   STAGE2_RESUME, HF_HUB_OFFLINE.
 EOF

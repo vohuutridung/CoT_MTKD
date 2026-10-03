@@ -132,6 +132,8 @@ def probe_stage1_dpp(
     probe_hidden_device = torch.device(
         config["runtime"].get("probe_hidden_device", "cpu")
     )
+    if probe_hidden_device.type == device.type and probe_hidden_device.index is None:
+        probe_hidden_device = device
     hidden_by_expert: list[torch.Tensor] = []
     top_values: list[torch.Tensor] = []
     top_ids: list[torch.Tensor] = []
@@ -169,9 +171,10 @@ def probe_stage1_dpp(
         values, ids, minimum, maximum = full_vocab_probe(
             selected_hidden,
             head,
-            views["reasoning_targets"].to("cpu"),
+            views["reasoning_targets"],
             probe_k,
             chunk_tokens,
+            output_device=device,
         )
         hidden_by_expert.append(selected_hidden)
         top_values.append(values)
@@ -192,15 +195,13 @@ def probe_stage1_dpp(
             for values, minimum, maximum in zip(top_values, minima, maxima, strict=True)
         ]
     )
-    support_ids_cpu, support_mask_cpu = build_union_support(
+    support_ids, support_mask = build_union_support(
         torch.stack(top_ids), selected_k
     )
-    support_ids = support_ids_cpu.to(device, non_blocking=True)
-    support_mask = support_mask_cpu.to(device, non_blocking=True)
     support_logits = torch.stack(
         [
             gather_support_logits(
-                hidden, head, support_ids_cpu, chunk_tokens, output_device=device
+                hidden, head, support_ids, chunk_tokens, output_device=device
             )
             for hidden in hidden_by_expert
         ],

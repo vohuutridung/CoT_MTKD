@@ -220,6 +220,25 @@ class Stage1OnePassTest(unittest.TestCase):
                             old_gradient, new_gradient, atol=2.0e-5, rtol=1.0e-4
                         )
                     )
+        large_config = {**config, "runtime": {**config["runtime"], "lm_head_chunk_tokens": 32768}}
+        large_probe, large_results = one_pass_expert_gradients(
+            model, names, parameters, batch, 0, 0, 42, large_config, device
+        )
+        self.assertTrue(torch.equal(new_probe.support_ids, large_probe.support_ids))
+        self.assertTrue(torch.equal(new_probe.support_mask, large_probe.support_mask))
+        torch.testing.assert_close(
+            new_probe.dpp_logit_gradients, large_probe.dpp_logit_gradients,
+            atol=1e-6, rtol=1e-5,
+        )
+        self.assertAlmostEqual(new_probe.dpp_loss_sum, large_probe.dpp_loss_sum, places=6)
+        for small, large in zip(new_results, large_results, strict=True):
+            self.assertAlmostEqual(small[2], large[2], places=5)
+            self.assertEqual(small[3], large[3])
+            for small_set, large_set in zip(small[:2], large[:2], strict=True):
+                for small_gradient, large_gradient in zip(small_set, large_set, strict=True):
+                    torch.testing.assert_close(
+                        small_gradient, large_gradient, atol=2e-5, rtol=1e-4
+                    )
         scale = 0.75
         transformer_vjps.clear()
         with patch("torch.autograd.grad", side_effect=count_transformer_vjp):
@@ -231,7 +250,7 @@ class Stage1OnePassTest(unittest.TestCase):
                 0,
                 0,
                 42,
-                config,
+                large_config,
                 device,
                 combined_dpp_scale=scale,
             )
