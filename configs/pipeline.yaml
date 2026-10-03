@@ -2,14 +2,15 @@ schema_version: 1
 paths:
   prepared: artifacts/prepared/s1k_1_1
   stage1: artifacts/stage1/main
+  stage2_teachers: artifacts/stage1/duyentl04_abc
   supervision: artifacts/supervision/main
   teacher_cache: artifacts/teacher_cache/top512_tail
-  stage2: artifacts/stage2/main
+  stage2_medoid: artifacts/stage2_medoid/main
+  stage2: artifacts/stage2/task_geometry
   evaluation: artifacts/evaluation/p_align
 configs:
   data: configs/data/s1k_1_1.yaml
   stage1: configs/stage1/qwen25_7b_m3.yaml
   signals: configs/signals/main.yaml
-  stage2: configs/stage2/qwen25_7b_top512_tail.yaml
+  stage2: configs/stage2/qwen25_7b_task_geometry.yaml
   evaluation: configs/eval/p_align.yaml
-

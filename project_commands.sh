@@ -16,12 +16,15 @@ Commands:
   prepare       Download/read and preprocess s1K-1.1.
   stage1        Train the three GAC-CoT LoRA experts.
   stage1-stress Run six H200 SFT/ramp/full VRAM stress cases before Phase 1.
-  supervision  Build PAG, importance, teacher features, weights, and medoid.
-  cache         Compile Top-512 plus tail-bucket teacher targets.
+  fetch-teachers Download/import the trained duyentl04/abc experts for Phase 2.
+  supervision  Build legacy PAG/features (not used by the new Phase 2).
+  cache         Compile legacy Top-512/tail targets (not used by the new Phase 2).
+  stage2-medoid Select the functional medoid without legacy PAG/features.
+  stage2-stress Run real/synthetic full-update H200 Phase-2 VRAM checks.
   stage2        Train the single medoid-initialized student adapter.
   evaluate      Generate and grade the P-ALIGN benchmark suite.
   test          Run local unit tests without downloading a model.
-  all           Run prepare through evaluate (assumes setup is complete).
+  all           Prepare, load trained teachers, run Phase 2 and evaluate.
   full          Run setup, tests, and the complete pipeline.
   help          Show this message.
 
@@ -29,7 +32,8 @@ Environment overrides:
   NPROC_PER_NODE, PYTHON_BIN, DATA_CONFIG, STAGE1_CONFIG, STAGE1_FORWARD_MODE,
   STAGE1_STRESS_OUTPUT, STAGE1_STRESS_WARMUP, STAGE1_STRESS_REPETITIONS,
   SIGNALS_CONFIG, STAGE2_CONFIG, EVAL_CONFIG, STAGE1_RESUME,
-  STAGE2_RESUME, HF_HUB_OFFLINE.
+  STAGE2_RESUME, HF_HUB_OFFLINE, STAGE2_STRESS_OUTPUT, STAGE2_STRESS_WARMUP,
+  STAGE2_STRESS_REPETITIONS, STAGE2_STRESS_MIN_HEADROOM_GIB.
 EOF
 }
 
@@ -39,16 +43,18 @@ case "$command" in
   prepare) run_step 10_prepare_data.sh ;;
   stage1) run_step 20_train_stage1.sh ;;
   stage1-stress) run_step 25_stress_stage1_memory.sh ;;
+  fetch-teachers) run_step 32_fetch_stage2_teachers.sh ;;
   supervision) run_step 30_build_supervision.sh ;;
   cache) run_step 40_build_teacher_cache.sh ;;
+  stage2-medoid) run_step 35_build_stage2_medoid.sh ;;
+  stage2-stress) run_step 45_stress_stage2_memory.sh ;;
   stage2) run_step 50_train_stage2.sh ;;
   evaluate) run_step 60_evaluate.sh ;;
   test) run_step 90_test.sh ;;
   all)
     run_step 10_prepare_data.sh
-    run_step 20_train_stage1.sh
-    run_step 30_build_supervision.sh
-    run_step 40_build_teacher_cache.sh
+    run_step 32_fetch_stage2_teachers.sh
+    run_step 35_build_stage2_medoid.sh
     run_step 50_train_stage2.sh
     run_step 60_evaluate.sh
     ;;

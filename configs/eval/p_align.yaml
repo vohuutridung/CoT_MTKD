@@ -39,5 +39,5 @@ grading:
   timeout_seconds: 10
   prefer_math_verify: true
 paths:
-  stage2: artifacts/stage2/main
+  stage2: artifacts/stage2/task_geometry
   output: artifacts/evaluation/p_align
