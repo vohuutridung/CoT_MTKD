@@ -69,7 +69,9 @@ scheduler:
   min_lr_ratio: 0.0
 runtime:
   lm_head_chunk_tokens: 4096
-  preprocessing_hidden_storage: cpu
+  # Hidden states of the M experts stay on the GPU (~0.6 GB at 27k tokens);
+  # cpu offload made the cache CPU-bound (GPU ~20% busy).
+  preprocessing_hidden_storage: device
   dataloader_workers: 0
 paths:
   prepared: artifacts/prepared/s1k_1_1_cot_only
