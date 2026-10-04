@@ -69,7 +69,7 @@ Purpose of each command above:
 6. `stage2-stress` checks the actual Phase-2 forward, loss, gradients and temporary
    optimizer update at real and synthetic context lengths. The explicit output
    override saves its report as `artifacts/stage2/output_space_local_stress_memory.json`.
-7. `stage2` trains the student for three epochs with cached KD + SFT and writes
+7. `stage2` trains the student for one epoch with cached KD + SFT and writes
    checkpoints, the final student adapter and logs to `artifacts/stage2/output_space_local`.
 8. The final `evaluate` command optionally generates and grades the local
    student on AIME 2025, AIME 2024, AMC and MATH-500. It writes benchmark outputs
@@ -106,7 +106,7 @@ Purpose of each command above:
 5. `stage2-stress` checks Phase-2 VRAM and update completion on one H200. Its
    report is `artifacts/stage2/output_space_stress_memory.json`; it does not
    save a trained student.
-6. `stage2` runs the three training epochs and exports the student to
+6. `stage2` runs one training epoch and exports the student to
    `artifacts/stage2/output_space/final/adapters/student`. The same output root
    contains `checkpoint.pt`, `manifest.json`, `metrics.jsonl` and the detailed
    `reasoning_steps.jsonl` and `performance.jsonl` logs.
