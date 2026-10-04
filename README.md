@@ -441,6 +441,30 @@ correctness), `seed<N>/result.json` (same keys as exp_s1k: `benchmarks.*.pass@1`
 `result.json` exists is skipped, so an interrupted run resumes; `--set overwrite=true`
 re-runs it. `protocol.yaml` refuses to mix different protocols in one output directory.
 
+### Evaluate automatically when Stage 2 finishes
+
+Clone this branch into a **separate directory** on the training server (do not
+switch the branch of the checkout that is training), install vLLM there, and
+start the watcher; it polls until Stage 2 writes `manifest.json` and then
+evaluates the student:
+
+```bash
+git clone --branch eval-p-align https://github.com/vohuutridung/CoT_MTKD.git CoT_MTKD_eval
+cd CoT_MTKD_eval
+./project_commands.sh setup-eval
+
+STAGE2_DIR=/path/to/training/CoT_MTKD/artifacts/stage2/output_space \
+  EVAL_GPUS=0,1,2 \
+  nohup ./project_commands.sh evaluate-after-stage2 > eval_after_stage2.log 2>&1 &
+```
+
+`EVAL_GPUS` spreads seeds 42/43/44 over the listed GPUs (default: one GPU),
+`POLL_SECONDS` sets the polling interval (default 300) and `EVAL_OUTPUT` the
+output directory (default `artifacts/evaluation/<stage2 dir name>`). The
+processes are named `hieunq10_eval` (`PROC_TITLE`). If Stage 2 has already
+finished, evaluation starts immediately. The final lines of the log are the
+mean ± std Pass@1 over seeds; details are in `summary.json`.
+
 ### Evaluate on another machine
 
 On the training machine, after `stage2` finishes:

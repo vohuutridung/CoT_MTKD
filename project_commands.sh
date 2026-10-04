@@ -25,6 +25,7 @@ Commands:
   stage2        Train the single medoid-initialized student adapter.
   pack-student  Archive the Stage-2 student (optionally upload: HF_REPO=...).
   evaluate      Generate and grade the P-ALIGN suite (vLLM, seeds 42 43 44).
+  evaluate-after-stage2  Wait for Stage 2 to finish, then evaluate it.
   test          Run local unit tests without downloading a model.
   all           Prepare, load trained teachers, run Phase 2 and evaluate.
   full          Run setup, tests, and the complete pipeline.
@@ -34,7 +35,7 @@ Environment overrides:
   NPROC_PER_NODE, PYTHON_BIN, DATA_CONFIG, STAGE1_CONFIG, STAGE1_FORWARD_MODE,
   STAGE1_STRESS_OUTPUT, STAGE1_STRESS_WARMUP, STAGE1_STRESS_REPETITIONS,
   SIGNALS_CONFIG, STAGE2_CONFIG, EVAL_CONFIG, EVAL_ADAPTER, EVAL_OUTPUT,
-  EVAL_SEEDS, STAGE2_DIR, PACK_OUT, HF_REPO, STAGE1_RESUME,
+  EVAL_SEEDS, EVAL_GPUS, POLL_SECONDS, STAGE2_DIR, PACK_OUT, HF_REPO, STAGE1_RESUME,
   STAGE2_RESUME, HF_HUB_OFFLINE, STAGE2_STRESS_OUTPUT, STAGE2_STRESS_WARMUP,
   STAGE2_STRESS_REPETITIONS, STAGE2_STRESS_MIN_HEADROOM_GIB.
 EOF
@@ -55,6 +56,7 @@ case "$command" in
   stage2) run_step 50_train_stage2.sh ;;
   pack-student) run_step 65_pack_student.sh ;;
   evaluate) shift; "$PROJECT_ROOT/scripts/60_evaluate.sh" "$@" ;;
+  evaluate-after-stage2) run_step 70_evaluate_after_stage2.sh ;;
   test) run_step 90_test.sh ;;
   all)
     run_step 10_prepare_data.sh
