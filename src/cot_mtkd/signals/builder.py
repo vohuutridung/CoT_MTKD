@@ -35,7 +35,6 @@ from ..utils.manifest import (
     write_json,
 )
 from .group_importance import group_step_importance
-from .medoid import functional_medoid
 from .pag import score_reference_solution_pag
 from .predictive import score_predictive_signals
 from .teacher_features import (
@@ -59,8 +58,6 @@ def build_supervision(
         raise ValueError("uniform_teacher_mass must be in [0, 1]")
     if float(signal_config["temperature_features"]) <= 0.0:
         raise ValueError("temperature_features must be positive")
-    if float(signal_config["temperature_medoid"]) <= 0.0:
-        raise ValueError("temperature_medoid must be positive")
     clip = tuple(float(value) for value in signal_config["importance_clip"])
     if len(clip) != 2 or not (0.0 < clip[0] <= clip[1]):
         raise ValueError("importance_clip must contain two ordered positive values")
@@ -130,10 +127,6 @@ def build_supervision(
         f"signals-rank{distributed.rank:05d}-of{distributed.world_size:05d}.jsonl"
     )
     temporary = shard_path.with_suffix(".jsonl.tmp")
-    medoid_sum = torch.zeros(
-        len(adapter_names), device=distributed.device, dtype=torch.float64
-    )
-    medoid_tokens = torch.zeros((), device=distributed.device, dtype=torch.float64)
     nonfinite_pag = 0
     kneedle = stage1_config["kneedle"]
     chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
@@ -151,7 +144,6 @@ def build_supervision(
                 kneedle,
                 float(signal_config["dpp_jitter"]),
                 float(signal_config["temperature_features"]),
-                float(signal_config["temperature_medoid"]),
             )
             pag_rows: list[torch.Tensor] = []
             pag_nonfinite_rows: list[torch.Tensor] = []
@@ -247,12 +239,8 @@ def build_supervision(
                 "answer_weights": _as_list(answer_weights),
             }
             handle.write(json.dumps(value, ensure_ascii=False) + "\n")
-            medoid_sum += predictive.medoid_kl_sum.to(distributed.device)
-            medoid_tokens += predictive.medoid_token_count
             processed += 1
     temporary.replace(shard_path)
-    all_reduce_tensor(medoid_sum)
-    all_reduce_tensor(medoid_tokens)
     nonfinite_tensor = torch.tensor(
         nonfinite_pag, device=distributed.device, dtype=torch.int64
     )
@@ -274,8 +262,6 @@ def build_supervision(
         missing_shards = [str(path) for path in signal_paths if not path.is_file()]
         if missing_shards:
             raise RuntimeError(f"Missing signal shards: {missing_shards}")
-        medoid_scores = medoid_sum / medoid_tokens.clamp_min(1.0)
-        medoid_index = functional_medoid(medoid_scores)
         manifest = {
             "schema_version": 1,
             "artifact": "step_signals",
@@ -283,9 +269,6 @@ def build_supervision(
             "shards": [path.name for path in signal_paths],
             "signals_fingerprint": files_fingerprint(signal_paths),
             "adapter_names": adapter_names,
-            "functional_medoid_index": medoid_index,
-            "functional_medoid_adapter": adapter_names[medoid_index],
-            "functional_medoid_kl": _as_list(medoid_scores),
             "pag_nonfinite_fallbacks": int(nonfinite_tensor.item()),
             "prepared_manifest_fingerprint": fingerprint(prepared_manifest),
             "stage1_manifest_fingerprint": fingerprint(stage1_manifest),
@@ -296,6 +279,6 @@ def build_supervision(
             "runtime": runtime_metadata(config["_project_root"]),
         }
         write_json(output_dir / "manifest.json", manifest)
-        LOGGER.info("Functional medoid: %s", adapter_names[medoid_index])
+        LOGGER.info("Built legacy step signals for %d samples", int(processed_tensor.item()))
     barrier()
     return read_json(output_dir / "manifest.json")

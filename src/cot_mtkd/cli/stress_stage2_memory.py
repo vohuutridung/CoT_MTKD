@@ -191,7 +191,19 @@ def _run_microbatch(
     else:
         record_gradient = compute_record_gradient
     result = record_gradient(
-        model, adapter_names, parameters, record, tokenizer, config, device, profile=True
+        model,
+        adapter_names,
+        parameters,
+        record,
+        tokenizer,
+        config,
+        device,
+        profile=True,
+        **(
+            {"cached_target": config["_stress_targets"][record.sample_id]}
+            if config.get("method") == OUTPUT_SPACE_METHOD
+            else {}
+        ),
     )
     if not isinstance(result, RecordGradientResult):
         raise TypeError("The Phase-2 gradient path returned an unexpected result type")
@@ -404,12 +416,18 @@ def _source_manifests(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     from ..stage2.teachers import ensure_stage2_teachers
 
     manifests = {}
-    for key in ("prepared", "stage1", "medoid"):
+    for key in ("prepared", "stage1"):
         source = Path(config["paths"][key])
         manifests[key] = (
-            ensure_stage2_teachers(config) if key == "stage1" and config.get("teacher_source")
+            ensure_stage2_teachers(config)
+            if key == "stage1" and config.get("teacher_source")
             else read_json(source if source.is_file() else source / "manifest.json")
         )
+    from ..stage2.council_cache import load_council_cache
+
+    manifests["council_cache"] = load_council_cache(
+        config, manifests["prepared"], manifests["stage1"]
+    ).manifest
     return manifests
 
 
@@ -423,7 +441,6 @@ def _record_provenance(
             "stage1",
             [("adapter_bundle", "adapter_bundle_sha256"), ("config_file", "config_file_sha256")],
         ),
-        ("medoid", [("config_file", "config_file_sha256")]),
     ):
         root, manifest = Path(config["paths"][key]), manifests[key]
         for file_key, hash_key in pairs:
@@ -433,13 +450,28 @@ def _record_provenance(
                 "sha256": manifest[hash_key],
                 "verified": True,
             }
-    medoid = manifests["medoid"]
-    if medoid.get("artifact") != "stage2_medoid":
-        raise RuntimeError("Phase-2 stress requires the new Stage-2 medoid artifact")
-    if medoid["prepared_manifest_fingerprint"] != fingerprint(manifests["prepared"]):
-        raise RuntimeError("Medoid/prepared dataset mismatch")
-    if medoid["stage1_manifest_fingerprint"] != fingerprint(manifests["stage1"]):
-        raise RuntimeError("Medoid/Stage-1 checkpoint mismatch")
+    council = manifests["council_cache"]
+    if council.get("artifact") != "stage2_council_cache":
+        raise RuntimeError("Phase-2 stress requires the council cache")
+    if council["prepared_manifest_fingerprint"] != fingerprint(manifests["prepared"]):
+        raise RuntimeError("Council cache/prepared mismatch")
+    if council["stage1_manifest_fingerprint"] != fingerprint(manifests["stage1"]):
+        raise RuntimeError("Council cache/teachers mismatch")
+    root = (
+        Path(config["paths"]["teacher_cache_dir"]) / council["fingerprint"]
+        if "teacher_cache_dir" in config["paths"]
+        else Path(council["cache_directory"])
+    )
+    for file_key, hash_key in [
+        ("index_file", "index_file_sha256"),
+        ("best_expert_file", "best_expert_file_sha256"),
+    ]:
+        path = require_file_sha256(root, council, file_key, hash_key)
+        file_checksums[f"council_cache.{file_key}"] = {
+            "path": str(path),
+            "sha256": council[hash_key],
+            "verified": True,
+        }
     source_hashes = {key: fingerprint(value) for key, value in manifests.items()}
     report["source_manifest_fingerprints"] = source_hashes
     report["verified_source_files"] = file_checksums
@@ -451,7 +483,7 @@ def _record_provenance(
             "config_fingerprint": report["config_fingerprint"],
             "prepared_manifest_fingerprint": source_hashes["prepared"],
             "stage1_manifest_fingerprint": source_hashes["stage1"],
-            "medoid_manifest_fingerprint": source_hashes["medoid"],
+            "council_cache_fingerprint": council["fingerprint"],
             "world_size": 1,
         }
     )
@@ -459,7 +491,7 @@ def _record_provenance(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Measure full online Phase-2 updates on one H200 with all LoRA parameters and steps"
+        description="Measure configured Phase-2 updates on one H200 with all LoRA parameters and steps"
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", default="artifacts/stage2/output_space_stress_memory.json")
@@ -493,7 +525,9 @@ def main() -> None:
         "measured_iterations_per_case": arguments.repetitions,
         "required_headroom_gib": arguments.min_headroom_gib,
         "method": method,
-        "execution": "online_direct_teacher_full_vocabulary_full_lora_all_retained_steps",
+        "execution": "cached_support_tail_student_only"
+        if output_space
+        else "legacy_online_task_geometry",
         "gold_answer_source": None if output_space else "entire_solution_field",
         "trained_artifact_written": False,
         "temporary_optimizer_updates_only": True,
@@ -507,17 +541,23 @@ def main() -> None:
             "global_batch_size": int(config["stage2"]["global_batch_size"]),
             "gradient_checkpointing": bool(config["model"].get("gradient_checkpointing", False)),
             "lora_dropout": float(config["lora"]["dropout"]),
-            "temperature": float(config[section]["temperature"]),
-            **({
-                "teacher_hidden_storage": config["runtime"].get("teacher_hidden_storage", "cpu"),
-                "teacher_probability_cache_gib": float(
-                    config["runtime"].get("teacher_probability_cache_gib", 0.0)
-                ),
-            } if output_space else {}),
-            **({} if output_space else {
-                "epsilon_a": float(config["geometry"]["epsilon_a"]),
-                "epsilon_u": float(config["geometry"]["epsilon_u"]),
-            }),
+            **(
+                {
+                    "js_temperature": float(config["aggregation"]["js_temperature"]),
+                    "kd_temperature": float(config["aggregation"]["kd_temperature"]),
+                    "sft_weight": float(config["aggregation"]["sft_weight"]),
+                }
+                if output_space
+                else {"temperature": float(config[section]["temperature"])}
+            ),
+            **(
+                {}
+                if output_space
+                else {
+                    "epsilon_a": float(config["geometry"]["epsilon_a"]),
+                    "epsilon_u": float(config["geometry"]["epsilon_u"]),
+                }
+            ),
             "reasoning_step_cap": None,
             "lora_parameter_sampling": False,
         },
@@ -577,12 +617,48 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats(device)
         load_start = time.perf_counter()
         distributed = DistributedContext(0, 0, 1, device)
-        model, adapter_names, parameters = create_online_model(config, distributed)
+        if output_space:
+            from ..stage2.council_cache import compile_record, load_council_cache
+            from ..stage2.initialization import create_cached_student
+            from ..models.multi_adapter import (
+                create_multi_adapter_model,
+                load_adapter_bundle,
+                load_adapter_state,
+            )
+
+            cache = load_council_cache(config, manifests["prepared"], manifests["stage1"])
+            # Synthetic trajectories cannot reuse the real record's target.
+            # Precompute them separately, before any measured student iteration.
+            prep_started = time.perf_counter()
+            teachers, names = create_multi_adapter_model(
+                config["model"], config["lora"], 3, device, int(config["seed"])
+            )
+            bundle_path = Path(config["paths"]["stage1"]) / manifests["stage1"]["adapter_bundle"]
+            bundle = load_adapter_bundle(bundle_path)
+            for name in names:
+                load_adapter_state(teachers, name, bundle[name])
+            synthetic_target, _, _ = compile_record(teachers, names, synthetic, config, device)
+            del teachers, bundle
+            torch.cuda.empty_cache()
+            report["synthetic_preprocessing_seconds_excluded_from_training"] = (
+                time.perf_counter() - prep_started
+            )
+            config["_stress_targets"] = {
+                longest.sample_id: cache.get(longest.sample_id),
+                synthetic.sample_id: synthetic_target,
+            }
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            load_start = time.perf_counter()
+            model, adapter_names, parameters = create_cached_student(config, distributed, cache)
+        else:
+            model, adapter_names, parameters = create_online_model(config, distributed)
         torch.cuda.synchronize(device)
         report["model_load_seconds"] = time.perf_counter() - load_start
         report["model_load_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
         report["model_load_peak_reserved_bytes"] = torch.cuda.max_memory_reserved(device)
-        report["teacher_adapters"] = adapter_names
+        report["council_experts"] = adapter_names
+        report["teachers_loaded_during_student_measurement"] = not output_space
         report["student_lora_parameter_count"] = sum(parameter.numel() for parameter in parameters)
         if max_length > int(model.config.max_position_embeddings):
             raise ValueError("Configured Phase-2 context exceeds the model context limit")
@@ -595,7 +671,11 @@ def main() -> None:
         report["scheduler_training_steps"] = total_training_steps
         for name, record, plan in (
             ("longest_real", longest, longest_plan),
-            (f"synthetic_{'reasoning' if output_space else 'anchor'}_{max_length}", synthetic, synthetic_plan),
+            (
+                f"synthetic_{'reasoning' if output_space else 'anchor'}_{max_length}",
+                synthetic,
+                synthetic_plan,
+            ),
         ):
             result = run_case(
                 name,

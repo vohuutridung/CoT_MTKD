@@ -17,7 +17,7 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from cot_mtkd.data.prepare import tokenizer_fingerprint
 from cot_mtkd.models.multi_adapter import adapter_parameter_map, extract_adapter_state
-from cot_mtkd.stage2.medoid import build_stage2_medoid
+from cot_mtkd.stage2.council_cache import build_council_cache
 from cot_mtkd.stage2.trainer import (
     METHOD,
     OUTPUT_SPACE_METHOD,
@@ -268,13 +268,13 @@ class Stage2UpdateTest(unittest.TestCase):
         self.assert_state_equal(extract_adapter_state(model, "student"), before)
         self.assertEqual(optimizer.state, {})
 
-    def test_complete_medoid_training_export_and_completed_resume_on_tiny_Qwen(self):
-        self.check_medoid_training_export_and_resume(METHOD)
+    def test_complete_council_training_export_and_completed_resume_on_tiny_Qwen(self):
+        self.check_council_training_export_and_resume(METHOD)
 
-    def test_output_space_medoid_training_export_and_completed_resume_on_tiny_Qwen(self):
-        self.check_medoid_training_export_and_resume(OUTPUT_SPACE_METHOD)
+    def test_output_space_council_training_export_and_completed_resume_on_tiny_Qwen(self):
+        self.check_council_training_export_and_resume(OUTPUT_SPACE_METHOD)
 
-    def check_medoid_training_export_and_resume(self, method):
+    def check_council_training_export_and_resume(self, method):
         tokenizer = CharacterTokenizer()
         context = DistributedContext(0, 0, 1, torch.device("cpu"))
         initial_model, names, _ = tiny_online_council(checkpointing=True)
@@ -303,8 +303,8 @@ class Stage2UpdateTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            prepared, stage1, medoid, output = [
-                root / name for name in ("prepared", "stage1", "medoid", "stage2")
+            prepared, stage1, council, output = [
+                root / name for name in ("prepared", "stage1", "council", "stage2")
             ]
             prepared.mkdir()
             stage1.mkdir()
@@ -389,34 +389,57 @@ class Stage2UpdateTest(unittest.TestCase):
                 "paths": {
                     "prepared": str(prepared),
                     "stage1": str(stage1),
-                    "medoid": str(medoid),
+                    "teacher_cache_dir": str(council),
                     "output": str(output),
                 },
                 "_project_root": str(root),
             }
+            config["aggregation"] = {
+                "js_temperature": 1.0,
+                "kd_temperature": 2.0,
+                "sft_weight": 0.25,
+                "search_k": 512,
+                "k_min": 8,
+                "teacher_execution": "precomputed_support_tail",
+            }
             if method == OUTPUT_SPACE_METHOD:
-                config["aggregation"] = {
-                    "temperature": config["geometry"]["temperature"],
-                    "teacher_execution": "online_full_vocab",
-                }
                 del config["geometry"]
             with (
                 patch(
                     "cot_mtkd.models.multi_adapter.load_base_causal_lm",
                     side_effect=load_fixture_backbone,
                 ),
-                patch("cot_mtkd.stage2.medoid.load_tokenizer", return_value=tokenizer),
+                patch("cot_mtkd.stage2.council_cache.load_tokenizer", return_value=tokenizer),
                 patch("cot_mtkd.stage2.trainer.load_tokenizer", return_value=tokenizer),
             ):
-                medoid_manifest = build_stage2_medoid(config, context)
-                manifest = train_stage2(config, context)
+                council_manifest = build_council_cache(config, context)
+                with patch(
+                    "cot_mtkd.stage2.council_cache.create_multi_adapter_model",
+                    side_effect=AssertionError("Cache hit must not load teachers"),
+                ):
+                    hit = build_council_cache(config, context)
+                self.assertEqual(hit, council_manifest)
+                if method == OUTPUT_SPACE_METHOD:
+                    with (
+                        patch(
+                            "cot_mtkd.stage2.council_cache.compile_record",
+                            side_effect=AssertionError("Training must not preprocess teachers"),
+                        ),
+                        patch(
+                            "cot_mtkd.stage2.online.create_multi_adapter_model",
+                            side_effect=AssertionError("Training must load only student"),
+                        ),
+                    ):
+                        manifest = train_stage2(config, context)
+                else:
+                    manifest = train_stage2(config, context)
                 self.assertEqual(manifest["method"], method)
                 self.assertEqual(manifest["data_step"], 1)
                 self.assertEqual(manifest["global_step"], 1)
                 self.assertEqual(manifest["loss_scalars"]["examples"], 2)
                 self.assertEqual(manifest["loss_scalars"]["reasoning_steps"], 4)
                 self.assertEqual(
-                    manifest["parent_medoid_adapter"], medoid_manifest["functional_medoid_adapter"]
+                    manifest["initial_expert_adapter"], council_manifest["selected_expert"]
                 )
                 bundle = torch.load(output / manifest["adapter_bundle"], weights_only=True)
                 self.assertEqual(set(bundle), {"student"})
@@ -457,30 +480,46 @@ class Stage2UpdateTest(unittest.TestCase):
                         ],
                     )
                     performance_log = output / "performance.jsonl"
-                    perf_rows = [json.loads(line) for line in performance_log.read_text().splitlines()]
+                    perf_rows = [
+                        json.loads(line) for line in performance_log.read_text().splitlines()
+                    ]
                     self.assertEqual(perf_rows[0]["event"], "stage2_performance_session")
-                    self.assertEqual(perf_rows[0]["config_fingerprint"], manifest["config_fingerprint"])
-                    samples = [row for row in perf_rows if row["event"] == "stage2_sample_performance"]
-                    updates = [row for row in perf_rows if row["event"] == "stage2_update_performance"]
+                    self.assertEqual(
+                        perf_rows[0]["config_fingerprint"], manifest["config_fingerprint"]
+                    )
+                    samples = [
+                        row for row in perf_rows if row["event"] == "stage2_sample_performance"
+                    ]
+                    updates = [
+                        row for row in perf_rows if row["event"] == "stage2_update_performance"
+                    ]
                     self.assertEqual(len(samples), 2)
                     self.assertEqual(len(updates), 1)
-                    self.assertEqual({row["sample_id"] for row in samples}, {r.sample_id for r in records})
+                    self.assertEqual(
+                        {row["sample_id"] for row in samples}, {r.sample_id for r in records}
+                    )
                     for row in samples:
                         self.assertEqual(row["prefix_tokens"], 10)
                         self.assertEqual(row["reasoning_tokens"], 5)
-                        self.assertEqual(row["cached_steps"], 0)
-                        self.assertEqual(row["recomputed_steps"], 2)
+                        self.assertEqual(row["cached_steps"], 2)
+                        self.assertEqual(row["recomputed_steps"], 0)
                         self.assertEqual(row["head_chunks"], 3)
-                        self.assertEqual(row["teacher_head_chunk_sweeps"], 6)
+                        self.assertEqual(row["teacher_head_chunk_sweeps"], 0)
                         self.assertIsNone(row["peak_allocated_gib"])
                         self.assertGreaterEqual(row["record_gradient_wall_seconds"], 0)
                     self.assertEqual(updates[0]["local_examples"], 2)
                     self.assertEqual(updates[0]["local_prefix_tokens"], 20)
                     self.assertEqual(updates[0]["eta_remaining_wall_seconds_estimate"], 0)
-                    self.assertEqual(manifest["performance_logs"], [{
-                        "rank": 0, "file": "performance.jsonl",
-                        "sha256": file_sha256(performance_log),
-                    }])
+                    self.assertEqual(
+                        manifest["performance_logs"],
+                        [
+                            {
+                                "rank": 0,
+                                "file": "performance.jsonl",
+                                "sha256": file_sha256(performance_log),
+                            }
+                        ],
+                    )
                 self.assert_state_equal(bundle["student"], checkpoint["student_state"])
                 self.assertTrue(
                     (output / "final" / "adapters" / "student" / "adapter_config.json").is_file()

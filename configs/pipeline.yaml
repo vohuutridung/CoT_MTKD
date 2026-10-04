@@ -4,8 +4,7 @@ paths:
   stage1: artifacts/stage1/main
   stage2_teachers: artifacts/stage1/duyentl04_abc
   supervision: artifacts/supervision/main
-  teacher_cache: artifacts/teacher_cache/top512_tail
-  stage2_medoid: artifacts/stage2_medoid/output_space
+  teacher_cache: artifacts/teacher_cache/output_space
   stage2: artifacts/stage2/output_space
   evaluation: artifacts/evaluation/p_align
 configs:

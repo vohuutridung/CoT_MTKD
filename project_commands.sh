@@ -19,9 +19,9 @@ Commands:
   fetch-teachers Download/import the trained duyentl04/abc experts for Phase 2.
   supervision  Build legacy PAG/features (not used by the new Phase 2).
   cache         Compile legacy Top-512/tail targets (not used by the new Phase 2).
-  stage2-medoid Select the functional medoid without legacy PAG/features.
+  stage2-cache  Precompute support/tail targets and select the best SFT expert.
   stage2-stress Run real/synthetic full-update H200 Phase-2 VRAM checks.
-  stage2        Train the single medoid-initialized student adapter.
+  stage2        Train the cached KD + SFT student adapter.
   evaluate      Generate and grade the P-ALIGN benchmark suite.
   test          Run local unit tests without downloading a model.
   all           Prepare, load trained teachers, run Phase 2 and evaluate.
@@ -46,7 +46,7 @@ case "$command" in
   fetch-teachers) run_step 32_fetch_stage2_teachers.sh ;;
   supervision) run_step 30_build_supervision.sh ;;
   cache) run_step 40_build_teacher_cache.sh ;;
-  stage2-medoid) run_step 35_build_stage2_medoid.sh ;;
+  stage2-cache) run_step 35_build_stage2_cache.sh ;;
   stage2-stress) run_step 45_stress_stage2_memory.sh ;;
   stage2) run_step 50_train_stage2.sh ;;
   evaluate) run_step 60_evaluate.sh ;;
@@ -54,7 +54,7 @@ case "$command" in
   all)
     run_step 10_prepare_data.sh
     run_step 32_fetch_stage2_teachers.sh
-    run_step 35_build_stage2_medoid.sh
+    run_step 35_build_stage2_cache.sh
     run_step 50_train_stage2.sh
     run_step 60_evaluate.sh
     ;;

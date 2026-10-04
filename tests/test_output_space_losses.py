@@ -3,14 +3,14 @@ from __future__ import annotations
 import math
 import unittest
 from decimal import Decimal, localcontext
-from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
-import cot_mtkd.stage2.output_space_losses as losses
 from cot_mtkd.stage2.output_space_losses import (
-    adaptive_kd_hidden_gradient,
+    reduced_log_distribution,
+    reduced_kd_sft_tokens,
+    local_js_log_distribution,
     normalized_js_disagreement,
     power_mean_log_target,
 )
@@ -100,81 +100,121 @@ class OutputSpaceLossTest(unittest.TestCase):
         close = F.log_softmax(close, -1)
         self.assertGreater(float(normalized_js_disagreement(close).max()), 0)
 
-    def test_chunked_step_loss_and_hidden_gradient_match_dense_autograd(self):
-        torch.manual_seed(717)
-        head = torch.nn.Linear(6, 19, bias=False)
-        student = torch.randn(7, 6, requires_grad=True)
-        teachers = [torch.randn(7, 6, requires_grad=True) for _ in range(3)]
-        temperature = 2.0
-        with torch.no_grad():
-            logp = torch.stack(
-                [F.log_softmax(head(h).double() / temperature, -1) for h in teachers]
+    def test_tail_matches_dense_probability_and_has_finite_gradients(self):
+        for logits, ids in (
+            (torch.tensor([[8.0, -8.0, -9.0, -10.0]], dtype=torch.float64), [[0]]),
+            (torch.zeros(1, 4, dtype=torch.float64), [[1]]),
+            (torch.tensor([[1000.0, -1000.0, -1200.0, -1400.0]], dtype=torch.float64), [[0]]),
+            (torch.randn(2, 4, dtype=torch.float64), [[0, 1, 2, 3], [0, 1, 2, 3]]),
+        ):
+            logits.requires_grad_()
+            ids = torch.tensor(ids)
+            mask = torch.ones_like(ids, dtype=torch.bool)
+            anomalies = {}
+            logp = reduced_log_distribution(logits, ids, mask, 2.0, anomalies)
+            dense = F.softmax(logits / 2, -1)
+            selected = dense.gather(-1, ids)
+            outside = dense.clone().scatter(1, ids, 0).sum(-1)
+            torch.testing.assert_close(logp[:, :-1].exp(), selected, atol=1e-14, rtol=1e-12)
+            torch.testing.assert_close(logp[:, -1].exp(), outside, atol=1e-14, rtol=1e-12)
+            torch.testing.assert_close(
+                logp.exp().sum(-1), torch.ones(len(logits), dtype=logp.dtype)
             )
-            probabilities = logp.exp()
-            mixture = probabilities.mean(0)
-            ds = float(
-                (probabilities * (logp - mixture.log())).sum(-1).mean() / math.log(len(teachers))
-            )
-            raw = probabilities.pow(ds).mean(0).pow(1 / ds)
-            target = raw / raw.sum(-1, keepdim=True)
-        log_student = F.log_softmax(head(student).float() / temperature, -1)
-        loss = temperature**2 * (target * (target.log() - log_student)).sum(-1).mean()
-        expected = torch.autograd.grad(loss, student)[0]
-        for chunk in (1, 3, 7, 20):
-            gradient, actual_loss, disagreement = adaptive_kd_hidden_gradient(
-                student, teachers, head, temperature, chunk
-            )
-            torch.testing.assert_close(gradient, expected, atol=2.0e-7, rtol=2.0e-5)
-            self.assertAlmostEqual(actual_loss, float(loss.detach()), delta=2.0e-7)
-            # FP32 head GEMMs can round differently for different chunk shapes.
-            self.assertAlmostEqual(disagreement, ds, delta=2.0e-8)
-            self.assertFalse(gradient.requires_grad)
-        self.assertIsNone(student.grad)
-        self.assertIsNone(head.weight.grad)
-        self.assertTrue(all(value.grad is None for value in teachers))
+            self.assertTrue(bool(torch.isfinite(logp).all()))
+            grad = torch.autograd.grad(logp[:, -1].sum(), logits)[0]
+            self.assertTrue(bool(torch.isfinite(grad).all()))
+        self.assertEqual(anomalies["tail_probability_clamps"], 2)
 
-    def test_invalid_inputs_are_rejected(self):
-        logp = F.log_softmax(torch.zeros(2, 3, 4), -1)
-        for rho in (-0.1, 1.1, float("nan")):
-            with self.assertRaises(ValueError):
-                power_mean_log_target(logp, rho)
-        with self.assertRaises(ValueError):
-            normalized_js_disagreement(logp[:1])
-        with self.assertRaises(ValueError):
-            adaptive_kd_hidden_gradient(
-                torch.zeros(3, 2), [torch.zeros(3, 2)], torch.nn.Linear(2, 4), 2.0, 1
-            )
+    def test_small_support_has_large_tail_and_variable_padding_is_ignored(self):
+        logits = torch.zeros(2, 10)
+        ids = torch.tensor([[0, 0, 0], [0, 1, 2]])
+        mask = torch.tensor([[True, False, False], [True, True, True]])
+        p = reduced_log_distribution(logits, ids, mask, 2.0).exp()
+        torch.testing.assert_close(p[:, -1], torch.tensor([0.9, 0.7]))
+        self.assertEqual(float(p[0, 1:3].sum()), 0.0)
+        torch.testing.assert_close(p.sum(-1), torch.ones(2))
 
-    def test_probability_cache_reuses_head_and_falls_back_at_budget_boundary(self):
-        torch.manual_seed(981)
-        head = torch.nn.Linear(6, 19, bias=False)
-        student = torch.randn(7, 6, requires_grad=True)
-        teachers = [torch.randn(7, 6) for _ in range(3)]
-        required = 3 * 7 * 19 * 8
-        reference = adaptive_kd_hidden_gradient(student, teachers, head, 2.0, 3)
-        # Three chunks: caching projects teachers once each; fallback projects
-        # twice each. The budget must cover the whole step, not just one chunk.
-        for budget, calls in ((0, 6), (required - 1, 6), (required, 3)):
-            metrics = {}
-            with self.subTest(budget=budget), patch.object(
-                losses, "_head_log_probabilities", wraps=losses._head_log_probabilities
-            ) as projection:
-                actual = adaptive_kd_hidden_gradient(
-                    student, teachers, head, 2.0, 3,
-                    teacher_probability_cache_bytes=budget,
-                    execution_metrics=metrics,
-                )
-            self.assertEqual(projection.call_count, calls)
-            torch.testing.assert_close(actual[0], reference[0], atol=0, rtol=0)
-            self.assertEqual(actual[1:], reference[1:])
-            self.assertEqual(metrics["head_chunks"], 3)
-            self.assertEqual(metrics["cached_steps"], int(budget >= required))
-            self.assertEqual(metrics["recomputed_steps"], int(budget < required))
-            self.assertEqual(metrics["teacher_head_chunk_sweeps"], calls)
-        with self.assertRaisesRegex(ValueError, "nonnegative"):
-            adaptive_kd_hidden_gradient(
-                student, teachers, head, 2.0, 3, teacher_probability_cache_bytes=-1
-            )
+    def test_separate_temperature_paths_and_local_js_restriction(self):
+        logits = torch.tensor([[3.0, 0.0, -1.0, -2.0]], dtype=torch.float64)
+        ids = torch.tensor([[0, 2]])
+        mask = torch.ones_like(ids, dtype=torch.bool)
+        js = local_js_log_distribution(logits, ids, mask, 1.0)
+        dense = F.softmax(logits, -1).gather(-1, ids)
+        torch.testing.assert_close(js.exp(), dense / dense.sum(-1, keepdim=True))
+        kd = reduced_log_distribution(logits, ids, mask, 2.0)
+        torch.testing.assert_close(kd[:, :-1].exp(), F.softmax(logits / 2.0, -1).gather(-1, ids))
+        self.assertFalse(torch.allclose(js.exp(), F.softmax(logits[:, [0, 2]] / 2.0, -1)))
+
+    def test_equal_target_zero_kl_and_temperature_squared_compensation(self):
+        logits = torch.tensor([[3.0, 0.0, -1.0, -2.0]], requires_grad=True)
+        ids = torch.tensor([[0, 2]])
+        mask = torch.ones_like(ids, dtype=torch.bool)
+        q = reduced_log_distribution(logits, ids, mask, 2.0).detach()
+        kd, _, _, _ = reduced_kd_sft_tokens(logits, torch.tensor([0]), ids, mask, q, 2.0)
+        self.assertAlmostEqual(float(kd.detach()), 0.0, delta=1e-6)
+        q = torch.tensor([[0.2, 0.3, 0.5]]).log()
+        kd, _, _, _ = reduced_kd_sft_tokens(logits, torch.tensor([0]), ids, mask, q, 2.0)
+        expected = 4 * (q.exp() * (q - reduced_log_distribution(logits, ids, mask, 2.0))).sum(-1)
+        torch.testing.assert_close(kd, expected)
+
+    def test_reduced_power_mean_with_tiny_tail_and_rho_endpoints(self):
+        logits = torch.tensor([[1000.0, -1000.0, -1200.0]], dtype=torch.float64)
+        ids, mask = torch.tensor([[0, 1]]), torch.ones(1, 2, dtype=torch.bool)
+        teacher = torch.stack(
+            [reduced_log_distribution(logits + i, ids, mask, 2.0) for i in range(3)]
+        )
+        for rho in (0.0, 1e-14, 0.5, 1.0):
+            q = power_mean_log_target(teacher, rho)
+            self.assertTrue(bool(torch.isfinite(q).all()))
+            torch.testing.assert_close(q.exp().sum(-1), torch.ones(1, dtype=q.dtype))
+
+    def test_bfloat16_chunked_combined_cotangent_and_step_balanced_sft(self):
+        from cot_mtkd.stage2.output_space_losses import cached_kd_sft_hidden_gradient
+
+        torch.manual_seed(182)
+        head = torch.nn.Linear(4, 13, bias=False).bfloat16()
+        head.requires_grad_(False)
+        hidden = torch.randn(5, 4, dtype=torch.bfloat16, requires_grad=True)
+        gold = torch.tensor([0, 1, 2, 3, 4])
+        ids = torch.tensor([[0, 1, 2, 3, 4]] * 5)
+        mask = torch.ones_like(ids, dtype=torch.bool)
+        target = torch.tensor([[0.1, 0.1, 0.1, 0.1, 0.1, 0.5]] * 5).log()
+        weights = torch.tensor([0.25, 0.25, 1 / 6, 1 / 6, 1 / 6])
+        kd, sft, _, _ = reduced_kd_sft_tokens(head(hidden), gold, ids, mask, target, 2.0)
+        expected_loss = ((kd + 0.25 * sft) * weights).sum()
+        expected_grad = torch.autograd.grad(expected_loss, hidden)[0]
+        gradient, diagnostics = cached_kd_sft_hidden_gradient(
+            hidden, head, gold, ids, mask, target, weights, 2.0, 0.25, 2
+        )
+        torch.testing.assert_close(gradient, expected_grad, atol=2e-3, rtol=2e-2)
+        actual_sft = float((diagnostics["sft"] * weights).sum())
+        expected_sft = float(((sft[:2].mean() + sft[2:].mean()) / 2).detach())
+        self.assertAlmostEqual(actual_sft, expected_sft, delta=2e-6)
+        self.assertTrue(bool(torch.isfinite(gradient).all()))
+        self.assertFalse(gradient.requires_grad)
+        self.assertIsNone(hidden.grad)
+
+    def test_fp32_log_cache_preserves_extreme_power_mean_target(self):
+        from safetensors.torch import save_file, load_file
+        import tempfile
+        from pathlib import Path
+
+        values = F.log_softmax(
+            torch.tensor(
+                [[[0.0, -1000.0, -2000.0]], [[0.0, -1200.0, -2400.0]], [[0.0, -1400.0, -2800.0]]],
+                dtype=torch.float64,
+            ),
+            -1,
+        )
+        for rho in (0.0, 1e-14, 0.25, 1.0):
+            reference = power_mean_log_target(values, rho)
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "target.safetensors"
+                save_file({"logq": reference.float()}, str(path))
+                actual = load_file(str(path))["logq"]
+            self.assertTrue(bool(torch.isfinite(actual).all()))
+            torch.testing.assert_close(actual.double(), reference, atol=1.5e-4, rtol=1e-7)
+            torch.testing.assert_close(actual.exp().sum(-1), torch.ones(1), atol=1e-7, rtol=1e-7)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import math
 import unittest
 from dataclasses import replace
@@ -8,243 +7,258 @@ from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
-from test_stage2_online import CharacterTokenizer, tiny_online_council, two_step_record
 
+from test_stage2_online import tiny_online_council, two_step_record
 from cot_mtkd.cli.stress_stage2_memory import (
-    _optimizer_and_scheduler,
     _run_microbatch,
-    longest_eligible_record,
+    _optimizer_and_scheduler,
     make_synthetic_record,
 )
-from cot_mtkd.models.multi_adapter import extract_adapter_state, set_active_adapter
-from cot_mtkd.stage2.output_space import compute_record_gradient, plan_record, runtime_options
+from cot_mtkd.models.multi_adapter import set_active_adapter
+from cot_mtkd.stage1.kneedle import local_k_from_probe, build_union_support
+from cot_mtkd.stage2.council_cache import compile_record
+from cot_mtkd.stage2.output_space import compute_record_gradient, plan_record
 from cot_mtkd.stage2.trainer import OUTPUT_SPACE_METHOD
 
 
-def dense_reference(model, names, parameters, record, temperature):
-    """Direct full-model PDF reference on the two complete fixture steps."""
-    ids = torch.tensor([record.input_ids[:10]])
-    steps = [[3, 4], [6, 7, 8]]
-    indices = torch.tensor([p for step in steps for p in step]) - 1
-    logps = []
+def output_config():
+    return {
+        "method": OUTPUT_SPACE_METHOD,
+        "aggregation": {
+            "js_temperature": 1.0,
+            "kd_temperature": 2.0,
+            "sft_weight": 0.25,
+            "search_k": 512,
+            "k_min": 8,
+            "teacher_execution": "precomputed_support_tail",
+        },
+        "stage2": {
+            "max_length": 128,
+            "learning_rate": 2e-4,
+            "max_grad_norm": 1.0,
+            "global_batch_size": 16,
+        },
+        "runtime": {"lm_head_chunk_tokens": 2, "preprocessing_hidden_storage": "cpu"},
+        "optimizer": {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0},
+        "scheduler": {"warmup_ratio": 0.1, "min_lr_ratio": 0},
+    }
+
+
+def dense_reference(model, names, parameters, record, config):
+    """Independent full-model and dense softmax reference for new formulation."""
+    plan = plan_record(record, None, config["stage2"]["max_length"])
+    positions = [p for step in plan.step_positions for p in step]
+    indices = torch.tensor(positions) - 1
+    gold = torch.tensor([record.input_ids[p] for p in positions])
+    ids = torch.tensor([plan.input_ids])
+    teachers = []
     for name in names:
         model.set_adapter(name)
         model.requires_grad_(False)
         model.eval()
         with torch.no_grad():
-            logits = model(input_ids=ids, use_cache=False).logits[0, indices]
-            logps.append(F.log_softmax(logits.double() / temperature, -1))
-    logps = torch.stack(logps)
+            teachers.append(model(input_ids=ids, use_cache=False).logits[0, indices].double())
+    z = torch.stack(teachers)
+    non_gold = z.clone()
+    non_gold.scatter_(2, gold[None, :, None].expand(3, -1, -1), -torch.inf)
+    values, top = non_gold.topk(min(512, z.shape[-1] - 1), -1)
+    k = torch.stack([local_k_from_probe(v, 8)[1] for v in values])
+    union, mask = build_union_support(top, k)
+    support = [sorted(set(union[t, mask[t]].tolist()) | {int(gold[t])}) for t in range(len(gold))]
     set_active_adapter(model, "student")
     model.train()
-    logits = model(input_ids=ids, use_cache=False).logits[0, indices]
-    student_logp = F.log_softmax(logits.float() / temperature, -1)
-    cursor, losses, disagreements = 0, [], []
-    for step in steps:
-        end = cursor + len(step)
-        values = logps[:, cursor:end]
-        probs = values.exp()
-        mixture = probs.mean(0)
-        ds = float((probs * (values - mixture.log())).sum(-1).mean() / math.log(len(names)))
-        raw = probs.pow(ds).mean(0).pow(1 / ds)
-        target = raw / raw.sum(-1, keepdim=True)
-        losses.append(
-            temperature**2 * (target * (target.log() - student_logp[cursor:end])).sum(-1).mean()
+    student = model(input_ids=ids, use_cache=False).logits[0, indices].float()
+    cursor = 0
+    kd_steps, sft_steps, js_steps, init_steps = [], [], [], []
+    for step in plan.step_positions:
+        js_tokens, reduced = [], []
+        for t in range(cursor, cursor + len(step)):
+            v = support[t]
+            pi = F.softmax(z[:, t, v], -1)
+            mixture = pi.mean(0)
+            js_tokens.append((pi * (pi.log() - mixture.log())).sum(-1).mean())
+            p = F.softmax(z[:, t] / 2.0, -1)
+            tail = p.clone()
+            tail[:, v] = 0
+            reduced.append(torch.cat([p[:, v], tail.sum(-1, keepdim=True)], -1))
+        ds = torch.stack(js_tokens).mean()
+        rho = float(ds / math.log(3))
+        js_steps.append(float(ds))
+        kd_tokens = []
+        for t, r in zip(range(cursor, cursor + len(step)), reduced, strict=True):
+            q = r.log().mean(0).exp() if rho == 0 else r.pow(rho).mean(0).pow(1 / rho)
+            q = q / q.sum()
+            p = F.softmax(student[t] / 2.0, -1)
+            outside = torch.ones_like(p, dtype=torch.bool)
+            outside[support[t]] = False
+            rs = torch.cat([p[support[t]], p[outside].sum()[None]])
+            kd_tokens.append(4 * (q * (q.log() - rs.log())).sum())
+        kd_steps.append(torch.stack(kd_tokens).mean())
+        sft_steps.append(
+            F.cross_entropy(student[cursor : cursor + len(step)], gold[cursor : cursor + len(step)])
         )
-        disagreements.append(ds)
-        cursor = end
-    loss = torch.stack(losses).mean()
-    gradients = torch.autograd.grad(loss, parameters)
+        init_steps.append(
+            -F.log_softmax(z[:, cursor : cursor + len(step)], -1)
+            .gather(-1, gold[cursor : cursor + len(step)][None, :, None].expand(3, -1, -1))
+            .squeeze(-1)
+            .mean(-1)
+        )
+        cursor += len(step)
+    kd, sft = torch.stack(kd_steps).mean(), torch.stack(sft_steps).mean()
+    loss = kd + config["aggregation"]["sft_weight"] * sft
     return (
         float(loss.detach()),
-        [g.detach() for g in gradients],
-        sum(disagreements),
-        disagreements,
-        [float(value.detach()) for value in losses],
+        [g.detach() for g in torch.autograd.grad(loss, parameters)],
+        js_steps,
+        torch.stack(init_steps).mean(0),
+        float(kd.detach()),
+        float(sft.detach()),
     )
 
 
-class OutputSpaceOnlineTest(unittest.TestCase):
+class CachedOutputSpaceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.thread_count = torch.get_num_threads()
+        cls.threads = torch.get_num_threads()
         torch.set_num_threads(1)
 
     @classmethod
     def tearDownClass(cls):
-        torch.set_num_threads(cls.thread_count)
+        torch.set_num_threads(cls.threads)
 
-    def setUp(self):
-        self.record, self.tokenizer = two_step_record(), CharacterTokenizer()
-        self.config = {
-            "method": OUTPUT_SPACE_METHOD,
-            "aggregation": {"temperature": 2.0, "teacher_execution": "online_full_vocab"},
-            "stage2": {
-                "max_length": 128,
-                "learning_rate": 2.0e-4,
-                "max_grad_norm": 1.0,
-                "global_batch_size": 32,
-            },
-            "runtime": {"lm_head_chunk_tokens": 2},
-            "optimizer": {"betas": [0.9, 0.999], "eps": 1.0e-8, "weight_decay": 0.0},
-            "scheduler": {"warmup_ratio": 0.1, "min_lr_ratio": 0.0},
-        }
-
-    def test_parameter_loss_gradient_and_frozen_council_match_dense_reference(self):
+    def test_cache_training_matches_dense_loss_gradient_js_sft_and_init_scores(self):
+        record, config = two_step_record(), output_config()
         model, names, parameters = tiny_online_council(checkpointing=True)
-        before = {name: p.detach().clone() for name, p in model.named_parameters()}
-        expected_loss, expected_gradients, disagreement, per_step_js, per_step_loss = (
-            dense_reference(model, names, parameters, self.record, 2.0)
-        )
-        with patch("torch.autograd.grad", wraps=torch.autograd.grad) as grad:
-            actual = compute_record_gradient(
+        expected = dense_reference(model, names, parameters, record, config)
+        target, init_scores, _ = compile_record(model, names, record, config, torch.device("cpu"))
+        # Any teacher selection during training fails this test.
+        original = model.set_adapter
+
+        def student_only(name):
+            self.assertEqual(name, "student")
+            return original(name)
+
+        with (
+            patch.object(model, "set_adapter", side_effect=student_only),
+            patch("torch.autograd.grad", wraps=torch.autograd.grad) as grad,
+        ):
+            result = compute_record_gradient(
                 model,
                 names,
                 parameters,
-                self.record,
-                self.tokenizer,
-                self.config,
+                record,
+                None,
+                config,
                 torch.device("cpu"),
+                cached_target=target,
             )
-        parameter_vjps = [call for call in grad.call_args_list if isinstance(call.args[1], list)]
-        self.assertEqual(len(parameter_vjps), 1)
-        self.assertEqual((actual.steps, actual.active_steps, actual.discarded_steps), (2, 2, 0))
-        self.assertAlmostEqual(actual.loss, expected_loss, delta=3.0e-7)
-        self.assertAlmostEqual(actual.metrics["disagreement_sum"], disagreement, delta=1.0e-8)
-        self.assertEqual(len(actual.step_metrics), 2)
-        for index, row in enumerate(actual.step_metrics):
-            self.assertEqual(row["step_id"], index)
-            self.assertEqual(row["n_tokens"], [2, 3][index])
-            self.assertAlmostEqual(row["js_normalized"], per_step_js[index], delta=1.0e-8)
-            self.assertAlmostEqual(row["js_mean"], per_step_js[index] * math.log(3), delta=1.0e-8)
-            self.assertEqual(row["rho"], row["js_normalized"])
-            self.assertAlmostEqual(row["step_kd_loss"], per_step_loss[index], delta=3.0e-7)
-        for value, expected in zip(actual.gradients, expected_gradients, strict=True):
-            torch.testing.assert_close(value, expected, atol=3.0e-7, rtol=3.0e-4)
-        for name, parameter in model.named_parameters():
-            torch.testing.assert_close(parameter, before[name], atol=0, rtol=0)
-            self.assertIsNone(parameter.grad)
-            self.assertEqual(parameter.requires_grad, "lora_" in name and ".student." in name)
+        self.assertEqual(len([c for c in grad.call_args_list if isinstance(c.args[1], list)]), 1)
+        self.assertAlmostEqual(result.loss, expected[0], delta=1e-6)
+        torch.testing.assert_close(
+            target["step_js"], torch.tensor(expected[2], dtype=torch.float64), atol=5e-8, rtol=1e-5
+        )
+        torch.testing.assert_close(init_scores, expected[3], atol=5e-7, rtol=1e-6)
+        for g, e in zip(result.gradients, expected[1], strict=True):
+            torch.testing.assert_close(g, e, atol=5e-7, rtol=3e-4)
+        self.assertAlmostEqual(result.metrics["kd_loss"], expected[4], delta=1e-6)
+        self.assertAlmostEqual(result.metrics["sft_loss"], expected[5], delta=1e-6)
+        self.assertEqual(result.metrics["teacher_head_chunk_sweeps"], 0)
+        self.assertAlmostEqual(
+            result.loss, result.metrics["kd_loss"] + 0.25 * result.metrics["sft_loss"], delta=1e-12
+        )
+        for row in result.step_metrics:
+            self.assertEqual((row["js_temperature"], row["kd_temperature"]), (1.0, 2.0))
+        self.assertEqual(result.metrics["recomputed_steps"], 0)
 
-    def test_planner_retains_complete_steps_without_gold_and_masks_structure(self):
-        long_gold = replace(self.record, solution="gold" * 10000)
-        plan = plan_record(long_gold, None, 10)
-        self.assertEqual(plan.input_ids, self.record.input_ids[:10])
+    def test_zero_sft_weight_is_new_kd_only_and_cache_targets_are_static(self):
+        model, names, params = tiny_online_council(False)
+        record, config = two_step_record(), output_config()
+        target, _, _ = compile_record(model, names, record, config, torch.device("cpu"))
+        config["aggregation"]["sft_weight"] = 0.0
+        config["stage2"]["epochs"] = 99
+        result = compute_record_gradient(
+            model, names, params, record, None, config, torch.device("cpu"), cached_target=target
+        )
+        self.assertEqual(result.loss, result.metrics["kd_loss"])
+        expected = dense_reference(model, names, params, record, config)
+        for g, e in zip(result.gradients, expected[1], strict=True):
+            torch.testing.assert_close(g, e, atol=5e-7, rtol=3e-4)
+
+    def test_planner_uses_only_content_and_complete_steps(self):
+        record = two_step_record()
+        plan = plan_record(replace(record, solution="gold" * 10000), None, 10)
         self.assertEqual(plan.step_positions, [[3, 4], [6, 7, 8]])
         self.assertEqual(plan.solution, [])
-        first = plan_record(self.record, None, 9)
-        self.assertEqual(first.step_positions, [[3, 4]])
-        self.assertEqual((first.num_steps, first.discarded_steps), (1, 1))
-        self.assertEqual(plan_record(self.record, None, 5).num_steps, 0)
+        self.assertEqual(plan_record(record, None, 9).step_positions, [[3, 4]])
+        self.assertEqual(plan_record(record, None, 5).num_steps, 0)
         with self.assertRaisesRegex(ValueError, "prompt/control"):
-            plan_record(self.record, None, 2)
+            plan_record(record, None, 2)
+        synthetic, p = make_synthetic_record(record, None, 32, OUTPUT_SPACE_METHOD)
+        self.assertEqual(len(p.input_ids), 32)
+        self.assertEqual(synthetic.solution, record.solution)
 
-    def test_device_hidden_storage_and_cached_probabilities_match_memory_path(self):
-        model, names, parameters = tiny_online_council(checkpointing=True)
-        reference = compute_record_gradient(
-            model, names, parameters, self.record, None, self.config, torch.device("cpu")
-        )
-        config = copy.deepcopy(self.config)
-        config["runtime"].update(
-            teacher_hidden_storage="device", teacher_probability_cache_gib=1.0,
-            lm_head_chunk_tokens=1024,
-        )
-        actual = compute_record_gradient(
-            model, names, parameters, self.record, None, config, torch.device("cpu")
-        )
-        self.assertAlmostEqual(actual.loss, reference.loss, delta=3.0e-7)
-        self.assertAlmostEqual(
-            actual.metrics["disagreement_sum"], reference.metrics["disagreement_sum"],
-            delta=1.0e-8,
-        )
-        for a, b in zip(actual.gradients, reference.gradients, strict=True):
-            torch.testing.assert_close(a, b, atol=3.0e-7, rtol=3.0e-4)
-        self.assertEqual(len(actual.step_metrics), len(reference.step_metrics))
+    def test_cache_required_and_mapping_mismatch_rejected(self):
+        record, config = two_step_record(), output_config()
+        with self.assertRaisesRegex(RuntimeError, "requires a council cache"):
+            compute_record_gradient(None, [], [], record, None, config, torch.device("cpu"))
+        model, names, params = tiny_online_council(False)
+        target, _, _ = compile_record(model, names, record, config, torch.device("cpu"))
+        target["token_positions"][0] += 1
+        with self.assertRaisesRegex(RuntimeError, "mapping mismatch"):
+            compute_record_gradient(
+                model,
+                names,
+                params,
+                record,
+                None,
+                config,
+                torch.device("cpu"),
+                cached_target=target,
+            )
 
-    def test_runtime_options_reject_invalid_storage_and_cache_limits(self):
-        self.assertEqual(runtime_options({}), ("cpu", 0))
-        self.assertEqual(
-            runtime_options({"teacher_hidden_storage": "device", "teacher_probability_cache_gib": 8}),
-            ("device", 8 * 2**30),
-        )
-        for value in (-1, float("nan"), float("inf")):
-            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "finite and nonnegative"):
-                runtime_options({"teacher_probability_cache_gib": value})
-        with self.assertRaisesRegex(ValueError, "cpu or device"):
-            runtime_options({"teacher_hidden_storage": "disk"})
-
-    def test_gold_metadata_and_legacy_answer_suffix_do_not_change_target_or_gradient(self):
-        model, names, parameters = tiny_online_council(checkpointing=False)
-        original = compute_record_gradient(
-            model, names, parameters, self.record, None, self.config, torch.device("cpu")
-        )
-        altered = copy.deepcopy(self.record)
-        altered.solution = "unrelated gold"
-        altered.input_ids[10:] = [22, 23, 24]
-        actual = compute_record_gradient(
-            model, names, parameters, altered, None, self.config, torch.device("cpu")
-        )
-        self.assertEqual(actual.loss, original.loss)
-        self.assertEqual(actual.metrics, original.metrics)
-        self.assertEqual(actual.step_metrics, original.step_metrics)
-        for a, b in zip(actual.gradients, original.gradients, strict=True):
-            torch.testing.assert_close(a, b, atol=0, rtol=0)
-
-    def test_empty_plan_is_zero_and_synthetic_stress_reaches_reasoning_limit(self):
-        config = copy.deepcopy(self.config)
-        config["stage2"]["max_length"] = 5
-        result = compute_record_gradient(
-            None,
-            ["a", "b"],
-            [torch.nn.Parameter(torch.ones(2))],
-            self.record,
-            None,
-            config,
-            torch.device("cpu"),
-        )
-        self.assertEqual((result.steps, result.active_steps, result.loss), (0, 0, 0.0))
-        self.assertEqual(result.step_metrics, [])
-        torch.testing.assert_close(result.gradients[0], torch.zeros(2))
-        synthetic, plan = make_synthetic_record(self.record, None, 32, OUTPUT_SPACE_METHOD)
-        self.assertEqual((plan.num_steps, plan.discarded_steps), (2, 0))
-        self.assertEqual(len(plan.input_ids), 32)
-        self.assertEqual(synthetic.solution, self.record.solution)
-        selected, selected_plan, counts = longest_eligible_record(
-            [self.record, replace(self.record, solution="gold" * 1000)],
-            None,
-            32,
-            OUTPUT_SPACE_METHOD,
-        )
-        self.assertIs(selected, self.record)
-        self.assertEqual(len(selected_plan.input_ids), 10)
-        self.assertEqual(counts["eligible_examples"], 2)
-
-    def test_stress_uses_output_space_path_and_updates_only_student(self):
-        model, names, parameters = tiny_online_council(checkpointing=True)
-        before_student = [p.detach().clone() for p in parameters]
-        before_teachers = {name: extract_adapter_state(model, name) for name in names}
-        optimizer, scheduler = _optimizer_and_scheduler(parameters, self.config, 10)
+    def test_stress_measures_only_cached_student_path(self):
+        record, config = two_step_record(), output_config()
+        model, names, parameters = tiny_online_council(True)
+        target, _, _ = compile_record(model, names, record, config, torch.device("cpu"))
+        config["_stress_targets"] = {record.sample_id: target}
+        optimizer, scheduler = _optimizer_and_scheduler(parameters, config, 10)
         with patch("torch.cuda.synchronize"):
             result = _run_microbatch(
-                self.record,
+                record,
                 None,
                 model,
                 names,
                 parameters,
                 optimizer,
                 scheduler,
-                self.config,
+                config,
                 torch.device("cpu"),
             )
         self.assertTrue(result["optimizer_update_applied"])
-        self.assertEqual(result["active_steps"], 2)
-        self.assertIn("final_kd_gradient", result["component_seconds"])
-        self.assertNotIn("teacher_kd_gradients", result["component_seconds"])
-        self.assertNotIn("answer_anchor_gradients", result["component_seconds"])
-        self.assertTrue(any(not torch.equal(a, b) for a, b in zip(before_student, parameters)))
-        for name in names:
-            for key, value in extract_adapter_state(model, name).items():
-                torch.testing.assert_close(value, before_teachers[name][key], atol=0, rtol=0)
+        self.assertIn("final_kd_sft_gradient", result["component_seconds"])
+        self.assertNotIn("teacher_forward", result["component_seconds"])
+
+    def test_empty_plan_has_zero_objective_and_never_forwards_any_model(self):
+        record, config = two_step_record(), output_config()
+        config["stage2"]["max_length"] = 5
+        target, scores, stats = compile_record(
+            None, ["a", "b", "c"], record, config, torch.device("cpu")
+        )
+        parameter = torch.nn.Parameter(torch.ones(2))
+        result = compute_record_gradient(
+            None,
+            ["a", "b", "c"],
+            [parameter],
+            record,
+            None,
+            config,
+            torch.device("cpu"),
+            cached_target=target,
+        )
+        self.assertEqual((result.steps, result.active_steps, result.loss), (0, 0, 0.0))
+        self.assertEqual(stats["teacher_forward_count"], 0)
+        torch.testing.assert_close(scores, torch.zeros(3, dtype=torch.float64))
+        torch.testing.assert_close(result.gradients[0], torch.zeros(2))
 
 
 if __name__ == "__main__":

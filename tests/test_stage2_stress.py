@@ -431,7 +431,7 @@ class Stage2StressTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = stress_config()
             config["paths"] = {
-                key: str(Path(temporary) / key) for key in ("prepared", "stage1", "medoid")
+                key: str(Path(temporary) / key) for key in ("prepared", "stage1", "council_cache")
             }
             manifests = {}
             for key, files in (
@@ -449,7 +449,13 @@ class Stage2StressTest(unittest.TestCase):
                         ("config_file", "config_file_sha256", "config.yaml"),
                     ],
                 ),
-                ("medoid", [("config_file", "config_file_sha256", "config.yaml")]),
+                (
+                    "council_cache",
+                    [
+                        ("index_file", "index_file_sha256", "index.json"),
+                        ("best_expert_file", "best_expert_file_sha256", "best.pt"),
+                    ],
+                ),
             ):
                 root = Path(config["paths"][key])
                 root.mkdir()
@@ -458,22 +464,24 @@ class Stage2StressTest(unittest.TestCase):
                     path = root / filename
                     path.write_text(f"{key} {file_key}", encoding="utf-8")
                     manifests[key].update({file_key: filename, hash_key: file_sha256(path)})
-            manifests["medoid"].update(
-                artifact="stage2_medoid",
+            manifests["council_cache"].update(
+                artifact="stage2_council_cache",
+                fingerprint="test-cache-fingerprint",
+                cache_directory=config["paths"]["council_cache"],
                 prepared_manifest_fingerprint=fingerprint(manifests["prepared"]),
                 stage1_manifest_fingerprint=fingerprint(manifests["stage1"]),
             )
             report = {"config_fingerprint": fingerprint(_stable_config(config))}
             _record_provenance(config, report, manifests)
             self.assertEqual(report["source_provenance_status"], "verified")
-            self.assertEqual(len(report["verified_source_files"]), 5)
+            self.assertEqual(len(report["verified_source_files"]), 6)
             expected = fingerprint(
                 {
                     "method": METHOD,
                     "config_fingerprint": report["config_fingerprint"],
                     "prepared_manifest_fingerprint": fingerprint(manifests["prepared"]),
                     "stage1_manifest_fingerprint": fingerprint(manifests["stage1"]),
-                    "medoid_manifest_fingerprint": fingerprint(manifests["medoid"]),
+                    "council_cache_fingerprint": manifests["council_cache"]["fingerprint"],
                     "world_size": 1,
                 }
             )

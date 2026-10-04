@@ -94,7 +94,7 @@ def _validate_stage2_config(config: dict[str, Any]) -> None:
     section = "aggregation" if method == OUTPUT_SPACE_METHOD else "geometry"
     selector = config[section]
     selector_keys = (
-        ("temperature",)
+        ("js_temperature", "kd_temperature")
         if method == OUTPUT_SPACE_METHOD
         else ("temperature", "epsilon_a", "epsilon_u")
     )
@@ -102,20 +102,44 @@ def _validate_stage2_config(config: dict[str, Any]) -> None:
         value = float(selector[key])
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"{section}.{key} must be finite and positive")
-    if selector.get("teacher_execution") != "online_full_vocab":
+    if method != OUTPUT_SPACE_METHOD and selector.get("teacher_execution") != "online_full_vocab":
         raise ValueError("Phase 2 requires online_full_vocab teacher execution")
     if int(config["runtime"]["lm_head_chunk_tokens"]) <= 0:
         raise ValueError("runtime.lm_head_chunk_tokens must be positive")
     if method == OUTPUT_SPACE_METHOD:
-        from .output_space import runtime_options
+        from .council_cache import validate_council_config
 
-        runtime_options(config["runtime"])
+        validate_council_config(config)
     if "hard_loss_weight" in config["stage2"] or "kd_loss_weight" in config["stage2"]:
         raise ValueError("Old hard/KD source weights are not part of the new Phase-2 objective")
     if not isinstance(config.get("logging", {}).get("reasoning_steps", True), bool):
         raise TypeError("logging.reasoning_steps must be a boolean")
     if not isinstance(config.get("logging", {}).get("performance", True), bool):
         raise TypeError("logging.performance must be a boolean")
+
+
+def gradient_accumulation_steps(stage2: dict[str, Any], world_size: int) -> int:
+    """Derive the exact global batch; reject fractional/nondivisible settings."""
+
+    def positive_integer(value, name):
+        if isinstance(value, bool) or int(value) != value or int(value) <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return int(value)
+
+    micro = positive_integer(stage2["micro_batch_size"], "micro_batch_size")
+    global_batch = positive_integer(stage2["global_batch_size"], "global_batch_size")
+    world = positive_integer(world_size, "world_size")
+    divisor = micro * world
+    if global_batch % divisor:
+        raise ValueError("global_batch_size must be divisible by micro_batch_size * world_size")
+    expected = global_batch // divisor
+    explicit = stage2.get("gradient_accumulation_steps")
+    if (
+        explicit is not None
+        and positive_integer(explicit, "gradient_accumulation_steps") != expected
+    ):
+        raise ValueError("Invalid gradient_accumulation_steps for global_batch_size")
+    return expected
 
 
 def _record_collator(records):
@@ -230,12 +254,15 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
         record_gradient = compute_record_gradient
     paths = config["paths"]
     prepared_dir, stage1_dir = Path(paths["prepared"]), Path(paths["stage1"])
-    medoid_dir, output_dir = Path(paths["medoid"]), Path(paths["output"])
+    output_dir = Path(paths["output"])
     prepared = read_json(prepared_dir / "manifest.json")
     from .teachers import ensure_stage2_teachers
 
     stage1 = ensure_stage2_teachers(config)
-    medoid = read_json(medoid_dir / "manifest.json")
+    from .council_cache import load_council_cache
+
+    cache = load_council_cache(config, prepared, stage1)
+    council = cache.manifest
     data_path = require_file_sha256(prepared_dir, prepared, "data_file", "data_file_sha256")
     for root, manifest, pairs in (
         (
@@ -248,14 +275,9 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             stage1,
             [("adapter_bundle", "adapter_bundle_sha256"), ("config_file", "config_file_sha256")],
         ),
-        (medoid_dir, medoid, [("config_file", "config_file_sha256")]),
     ):
         for file_key, hash_key in pairs:
             require_file_sha256(root, manifest, file_key, hash_key)
-    if medoid["prepared_manifest_fingerprint"] != fingerprint(prepared):
-        raise RuntimeError("Medoid/prepared dataset mismatch")
-    if medoid["stage1_manifest_fingerprint"] != fingerprint(stage1):
-        raise RuntimeError("Medoid/Stage-1 checkpoint mismatch")
     tokenizer = load_tokenizer(config["model"])
     if tokenizer_fingerprint(tokenizer) != prepared["tokenizer_fingerprint"]:
         raise RuntimeError("Phase-2 tokenizer does not match prepared tokens")
@@ -265,16 +287,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
     if len(dataset) % distributed.world_size:
         raise ValueError("Prepared record count must divide world_size without sampler padding")
     micro = int(config["stage2"]["micro_batch_size"])
-    global_batch = int(config["stage2"]["global_batch_size"])
-    divisor = micro * distributed.world_size
-    accumulation = config["stage2"].get("gradient_accumulation_steps")
-    if accumulation is None:
-        if global_batch % divisor:
-            raise ValueError("global_batch_size must be divisible by micro_batch_size * world_size")
-        accumulation = global_batch // divisor
-    if int(accumulation) <= 0 or int(accumulation) * divisor != global_batch:
-        raise ValueError("Invalid gradient_accumulation_steps for global_batch_size")
-    accumulation = int(accumulation)
+    accumulation = gradient_accumulation_steps(config["stage2"], distributed.world_size)
     sampler = DistributedSampler(
         dataset,
         num_replicas=distributed.world_size,
@@ -302,7 +315,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             "config_fingerprint": config_hash,
             "prepared_manifest_fingerprint": fingerprint(prepared),
             "stage1_manifest_fingerprint": fingerprint(stage1),
-            "medoid_manifest_fingerprint": fingerprint(medoid),
+            "council_cache_fingerprint": council["fingerprint"],
             "world_size": distributed.world_size,
         }
     )
@@ -310,7 +323,12 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
     if distributed.is_main:
         write_config_snapshot(output_dir / "config.yaml", public_config)
     barrier()
-    model, adapter_names, parameters = create_online_model(config, distributed)
+    if method == OUTPUT_SPACE_METHOD:
+        from .initialization import create_cached_student
+
+        model, adapter_names, parameters = create_cached_student(config, distributed, cache)
+    else:
+        model, adapter_names, parameters = create_online_model(config, distributed)
     opt = config["optimizer"]
     optimizer = torch.optim.AdamW(
         parameters,
@@ -343,6 +361,21 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
     logger = JsonlLogger(
         output_dir / "metrics.jsonl", enabled=distributed.is_main, truncate=not bool(resume)
     )
+    logger.log(
+        "stage2_council_cache",
+        run_fingerprint=run_hash,
+        cache_status="hit",
+        cache_fingerprint=council["fingerprint"],
+        preprocessing_wall_seconds=council["preprocessing_wall_seconds"],
+        disk_bytes=council["disk_bytes"],
+        samples=council["records"],
+        tokens=council["tokens"],
+        steps=council["steps"],
+        expert_sft_scores=council["expert_sft_scores"],
+        selected_expert=council["selected_expert"],
+        tie_breaking=council["tie_breaking"],
+        numerical_anomalies=council["numerical_anomalies"],
+    )
     step_logger = None
     if method == OUTPUT_SPACE_METHOD and config.get("logging", {}).get("reasoning_steps", True):
         step_logger = create_reasoning_logger(
@@ -351,13 +384,20 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
     performance = None
     if method == OUTPUT_SPACE_METHOD and config.get("logging", {}).get("performance", True):
         performance = TrainingPerformanceLogger(
-            output_dir, distributed.device, distributed.rank, distributed.world_size,
-            run_hash, config_hash, public_config, data_step, bool(resume),
+            output_dir,
+            distributed.device,
+            distributed.rank,
+            distributed.world_size,
+            run_hash,
+            config_hash,
+            public_config,
+            data_step,
+            bool(resume),
         )
     buffer = zeros_like_parameters(parameters)
     # Example/step counts and losses; reduction follows fixed K then example mean.
-    # Last four slots hold method-specific detached teacher statistics.
-    totals = torch.zeros(9, device=distributed.device, dtype=torch.float64)
+    # The remaining slots hold method statistics and KD/SFT/tail diagnostics.
+    totals = torch.zeros(18, device=distributed.device, dtype=torch.float64)
     accumulated = 0
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
@@ -367,7 +407,18 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             for sample_index, record in enumerate(records):
                 started = performance.begin_sample() if performance is not None else None
                 result = record_gradient(
-                    model, adapter_names, parameters, record, tokenizer, config, distributed.device
+                    model,
+                    adapter_names,
+                    parameters,
+                    record,
+                    tokenizer,
+                    config,
+                    distributed.device,
+                    **(
+                        {"cached_target": cache.get(record.sample_id)}
+                        if method == OUTPUT_SPACE_METHOD
+                        else {}
+                    ),
                 )
                 record_seconds = time.perf_counter() - started if started is not None else None
                 if step_logger is not None:
@@ -402,11 +453,22 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                         ),
                         result.metrics.get("consensus_sum", 0.0),
                         result.metrics.get("anchor_loss_sum", 0.0),
+                        result.metrics.get("kd_loss", result.loss),
+                        result.metrics.get("sft_loss", 0.0),
+                        result.metrics.get("weighted_sft_loss", 0.0),
+                        result.metrics.get("student_tail_mass", 0.0),
+                        result.metrics.get("target_tail_mass", 0.0),
+                        result.metrics.get("target_entropy", 0.0),
+                        result.metrics.get("tail_probability_clamps", 0),
+                        result.metrics.get("tail_roundoff_corrections", 0),
+                        result.metrics.get("tail_complement_fallbacks", 0),
                     ]
                 )
                 if performance is not None:
                     performance.log_sample(
-                        record.sample_id, record_seconds, result,
+                        record.sample_id,
+                        record_seconds,
+                        result,
                         epoch=epoch,
                         batch_in_epoch=batch_index,
                         sample_in_batch=sample_index,
@@ -436,11 +498,16 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             performance_summary = {}
             if performance is not None:
                 performance_summary = performance.log_update(
-                    data_step, global_step, total_steps,
-                    epoch=epoch, global_examples=int(counts[0]), skipped_update=not updated,
+                    data_step,
+                    global_step,
+                    total_steps,
+                    epoch=epoch,
+                    global_examples=int(counts[0]),
+                    skipped_update=not updated,
                 )
             last_metrics = {
-                "kd_loss": counts[4] / counts[0],
+                "kd_loss": counts[9] / counts[0],
+                "total_loss": counts[4] / counts[0],
                 "examples": int(counts[0]),
                 "reasoning_steps": int(counts[1]),
                 "active_steps": int(counts[2]),
@@ -449,6 +516,16 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             }
             if method == OUTPUT_SPACE_METHOD:
                 last_metrics.update(
+                    sft_loss=counts[10] / counts[0],
+                    weighted_sft_loss=counts[11] / counts[0],
+                    student_tail_mass=counts[12] / counts[0],
+                    target_tail_mass=counts[13] / counts[0],
+                    target_entropy=counts[14] / counts[0],
+                    tail_probability_clamps=int(counts[15]),
+                    tail_roundoff_corrections=int(counts[16]),
+                    tail_complement_fallbacks=int(counts[17]),
+                    js_temperature=float(config["aggregation"]["js_temperature"]),
+                    kd_temperature=float(config["aggregation"]["kd_temperature"]),
                     disagreement_mean=counts[5] / max(counts[1], 1),
                     rho_mean=counts[6] / max(counts[1], 1),
                     js_mean=counts[5] * math.log(len(adapter_names)) / max(counts[1], 1),
@@ -473,10 +550,10 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     **last_metrics,
                 )
                 LOGGER.info(
-                    "Phase 2 batch=%d update=%d KD=%.6f active=%d/%d lr=%.3e%s%s%s",
+                    "Phase 2 batch=%d update=%d loss=%.6f active=%d/%d lr=%.3e%s%s%s",
                     data_step,
                     global_step,
-                    last_metrics["kd_loss"],
+                    last_metrics["total_loss"],
                     int(counts[2]),
                     int(counts[1]),
                     optimizer.param_groups[0]["lr"],
@@ -490,9 +567,11 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                         f" wall={performance_summary['update_window_wall_seconds']:.1f}s"
                         + (
                             f" peak={performance_summary['peak_allocated_gib']:.1f} GiB"
-                            if performance_summary['peak_allocated_gib'] is not None else ""
+                            if performance_summary["peak_allocated_gib"] is not None
+                            else ""
                         )
-                        if performance_summary else ""
+                        if performance_summary
+                        else ""
                     ),
                 )
             if (
@@ -546,12 +625,13 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             "training_checkpoint": checkpoint.name,
             "training_checkpoint_sha256": file_sha256(checkpoint),
             "student_adapter": "student",
-            "parent_medoid_adapter": medoid["functional_medoid_adapter"],
+            "initial_expert_adapter": council["selected_expert"],
+            "expert_sft_scores": council["expert_sft_scores"],
             "adapter_bundle": str(bundle.relative_to(output_dir)),
             "adapter_bundle_sha256": file_sha256(bundle),
             "prepared_manifest_fingerprint": fingerprint(prepared),
             "stage1_manifest_fingerprint": fingerprint(stage1),
-            "medoid_manifest_fingerprint": fingerprint(medoid),
+            "council_cache_fingerprint": council["fingerprint"],
             "config": public_config,
             "config_fingerprint": config_hash,
             "config_file": "config.yaml",

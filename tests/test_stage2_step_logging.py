@@ -73,7 +73,8 @@ class Stage2StepLoggingTest(unittest.TestCase):
                 "js_normalized": 0.2,
                 "rho": 0.2,
                 "step_kd_loss": 0.7,
-                "temperature": 2.0,
+                "js_temperature": 1.0,
+                "kd_temperature": 2.0,
                 "teacher_count": 3,
             },
             {
@@ -87,11 +88,18 @@ class Stage2StepLoggingTest(unittest.TestCase):
                 "js_normalized": 0.4,
                 "rho": 0.4,
                 "step_kd_loss": 0.9,
-                "temperature": 2.0,
+                "js_temperature": 1.0,
+                "kd_temperature": 2.0,
                 "teacher_count": 3,
             },
         ]
-        result = SimpleNamespace(loss=0.8, steps=2, discarded_steps=1, step_metrics=step_values)
+        result = SimpleNamespace(
+            loss=0.8,
+            steps=2,
+            discarded_steps=1,
+            step_metrics=step_values,
+            metrics={"kd_loss": 0.8, "sft_loss": 0.0},
+        )
         metadata = {
             "run_fingerprint": self.run,
             "rank": 1,
@@ -121,6 +129,8 @@ class Stage2StepLoggingTest(unittest.TestCase):
                     "time",
                     "sample_id",
                     "sample_kd_loss",
+                    "sample_sft_loss",
+                    "sample_total_loss",
                     "retained_steps",
                     "discarded_steps",
                     *metadata.keys(),

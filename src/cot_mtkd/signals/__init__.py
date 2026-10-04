@@ -1,1 +1,1 @@
-"""Offline group supervision and functional-medoid scoring."""
+"""Legacy offline group supervision; unused by cached output-space Phase 2."""

@@ -12,22 +12,12 @@ from ..data.token_spans import validate_token_contract
 from ..models.chunked_head import decoder_and_lm_head, forward_hidden
 from ..utils.training import zeros_like_parameters
 from .online import Phase2RecordPlan, RecordGradientResult, _select_adapter
-from .output_space_losses import adaptive_kd_hidden_gradient
+from .output_space_losses import cached_kd_sft_hidden_gradient
 
 
 @dataclass
 class OutputSpaceGradientResult(RecordGradientResult):
     step_metrics: list[dict[str, Any]] = field(default_factory=list)
-
-
-def runtime_options(runtime: dict[str, Any]) -> tuple[str, int]:
-    storage = runtime.get("teacher_hidden_storage", "cpu")
-    if storage not in ("cpu", "device"):
-        raise ValueError("runtime.teacher_hidden_storage must be cpu or device")
-    cache_gib = float(runtime.get("teacher_probability_cache_gib", 0.0))
-    if not math.isfinite(cache_gib) or cache_gib < 0:
-        raise ValueError("runtime.teacher_probability_cache_gib must be finite and nonnegative")
-    return storage, int(cache_gib * 2**30)
 
 
 def plan_record(record: PreparedRecord, tokenizer: Any, max_length: int) -> Phase2RecordPlan:
@@ -67,6 +57,26 @@ def plan_record(record: PreparedRecord, tokenizer: Any, max_length: int) -> Phas
     )
 
 
+def unpack_cached_target(
+    value: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad a single cached sample in RAM; persisted arrays contain no padding."""
+    offsets = value["support_offsets"].long()
+    sizes = offsets.diff()
+    count = len(sizes)
+    width = int(sizes.max()) if count else 0
+    ids = torch.zeros((count, width), dtype=torch.long)
+    mask = torch.arange(width)[None, :] < sizes[:, None]
+    logq = torch.full((count, width + 1), -1e30)
+    for index, (start, end) in enumerate(zip(offsets[:-1], offsets[1:], strict=True)):
+        support = value["support_ids"][start:end].long()
+        ids[index].fill_(int(support[0]))
+        ids[index, : len(support)] = support
+        logq[index, : len(support)] = value["support_log_target"][start:end]
+    logq[:, -1] = value["tail_log_target"]
+    return ids, mask, logq
+
+
 def compute_record_gradient(
     model: torch.nn.Module,
     adapter_names: list[str],
@@ -76,34 +86,14 @@ def compute_record_gradient(
     config: dict[str, Any],
     device: torch.device,
     profile: bool = False,
+    *,
+    cached_target: dict[str, torch.Tensor] | None = None,
 ) -> OutputSpaceGradientResult:
-    """PDF equations (1)--(19), with one final student-LoRA VJP per example.
-
-    Teachers use no-grad forwards with configurable hidden-state storage and
-    bounded probability caching. Head projections are chunked in tokens while
-    retaining full vocabulary. Every retained step contributes equally; the
-    target and its step rho depend only on teachers.
-    """
-    if len(adapter_names) < 2:
-        raise ValueError("Disagreement-adaptive MTKD requires at least two teachers")
-    hidden_storage, cache_bytes = runtime_options(config["runtime"])
+    """Student-only training from validated static support+tail supervision."""
+    if cached_target is None:
+        raise RuntimeError("Output-space training requires a council cache; run stage2-cache")
     plan = plan_record(record, tokenizer, int(config["stage2"]["max_length"]))
-    execution_metrics = {
-        "head_chunks": 0,
-        "cached_steps": 0,
-        "recomputed_steps": 0,
-        "teacher_head_chunk_sweeps": 0,
-    }
     timers: dict[str, float] = {}
-
-    def tick() -> float:
-        if profile and device.type == "cuda":
-            torch.cuda.synchronize(device)
-        return time.perf_counter()
-
-    def elapsed(name: str, started: float) -> None:
-        timers[name] = timers.get(name, 0.0) + tick() - started
-
     if not plan.num_steps:
         return OutputSpaceGradientResult(
             zeros_like_parameters(parameters),
@@ -112,96 +102,123 @@ def compute_record_gradient(
             0,
             plan.discarded_steps,
             {
-                "disagreement_sum": 0.0, "rho_sum": 0.0,
-                "prefix_tokens": 0, "reasoning_tokens": 0, **execution_metrics,
+                "prefix_tokens": len(plan.input_ids),
+                "reasoning_tokens": 0,
+                "head_chunks": 0,
+                "cached_steps": 0,
+                "recomputed_steps": 0,
+                "teacher_head_chunk_sweeps": 0,
             },
             timers,
         )
-    chunk = int(config["runtime"]["lm_head_chunk_tokens"])
-    temperature = float(config["aggregation"]["temperature"])
-    ids = torch.tensor([plan.input_ids], device=device, dtype=torch.long)
     positions = [position for step in plan.step_positions for position in step]
-    hidden_indices = torch.tensor(positions, device=device, dtype=torch.long) - 1
-    teacher_hidden = []
-    started = tick()
-    for name in adapter_names:
-        _select_adapter(model, name, training=False)
-        with torch.no_grad():
-            output = forward_hidden(model, ids, torch.ones_like(ids), use_cache=False)
-            selected = output.last_hidden_state[0].index_select(0, hidden_indices)
-            teacher_hidden.append(
-                selected.detach().cpu() if hidden_storage == "cpu" else selected.detach()
-            )
-        del selected, output
-    elapsed("teacher_forward", started)
+    expected_offsets = [0]
+    for step in plan.step_positions:
+        expected_offsets.append(expected_offsets[-1] + len(step))
+    if (
+        cached_target["token_positions"].tolist() != positions
+        or cached_target["step_offsets"].tolist() != expected_offsets
+    ):
+        raise RuntimeError(f"{record.sample_id}: cache token/step mapping mismatch")
+    support_ids, mask, logq = unpack_cached_target(cached_target)
+    targets = torch.tensor([record.input_ids[p] for p in positions])
+    if not bool(((support_ids == targets[:, None]) & mask).any(-1).all()):
+        raise RuntimeError("Cached support is missing an observed target")
+    weights = torch.cat(
+        [torch.full((len(step),), 1 / (len(step) * plan.num_steps)) for step in plan.step_positions]
+    )
 
-    _select_adapter(model, "student", training=True)
+    def tick() -> float:
+        if profile and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
+
     started = tick()
+    _select_adapter(model, "student", training=True)
+    ids = torch.tensor([plan.input_ids], device=device, dtype=torch.long)
     output = forward_hidden(model, ids, torch.ones_like(ids), use_cache=False)
-    student_hidden = output.last_hidden_state[0].index_select(0, hidden_indices)
+    hidden = output.last_hidden_state[0].index_select(0, torch.tensor(positions, device=device) - 1)
     del output
-    elapsed("student_forward", started)
+    timers["student_forward"] = tick() - started
     _, head = decoder_and_lm_head(model)
-    final_cotangent = torch.zeros_like(student_hidden)
-    cursor, loss, disagreement_sum = 0, 0.0, 0.0
+    aggregation = config["aggregation"]
+    chunk = int(config["runtime"]["lm_head_chunk_tokens"])
+    anomalies: dict[str, int] = {}
+    started = tick()
+    cotangent, tokens = cached_kd_sft_hidden_gradient(
+        hidden,
+        head,
+        targets,
+        support_ids,
+        mask,
+        logq,
+        weights,
+        float(aggregation["kd_temperature"]),
+        float(aggregation["sft_weight"]),
+        chunk,
+        anomalies,
+    )
+    timers["cached_target_and_hidden_gradient"] = tick() - started
+    started = tick()
+    gradients = torch.autograd.grad(hidden, parameters, grad_outputs=cotangent, allow_unused=False)
+    gradients = [g.detach().float() for g in gradients]
+    timers["final_kd_sft_gradient"] = tick() - started
+    if not all(bool(torch.isfinite(g).all()) for g in gradients):
+        raise FloatingPointError(f"Nonfinite cached KD+SFT gradient: {record.sample_id}")
+    kd = float((tokens["kd"] * weights).sum())
+    sft = float((tokens["sft"] * weights).sum())
+    weighted = float(aggregation["sft_weight"]) * sft
     step_metrics = []
-    for step_index, step_positions in enumerate(plan.step_positions):
-        count = len(step_positions)
-        started = tick()
-        cotangent, current_loss, disagreement = adaptive_kd_hidden_gradient(
-            student_hidden[cursor : cursor + count],
-            [hidden[cursor : cursor + count] for hidden in teacher_hidden],
-            head,
-            temperature,
-            chunk,
-            teacher_probability_cache_bytes=cache_bytes,
-            execution_metrics=execution_metrics,
-        )
-        final_cotangent[cursor : cursor + count] = cotangent / plan.num_steps
-        loss += current_loss / plan.num_steps
-        disagreement_sum += disagreement
+    for index, step in enumerate(plan.step_positions):
+        start, end = expected_offsets[index : index + 2]
+        step_kd = float(tokens["kd"][start:end].mean())
+        step_sft = float(tokens["sft"][start:end].mean())
         step_metrics.append(
             {
-                "step_index": step_index,
-                "step_id": record.step_ids[step_positions[0]],
-                "n_tokens": count,
-                "token_start": step_positions[0],
-                "token_end": step_positions[-1] + 1,
-                "js_mean": disagreement * math.log(len(adapter_names)),
+                "step_index": index,
+                "step_id": record.step_ids[step[0]],
+                "n_tokens": len(step),
+                "token_start": step[0],
+                "token_end": step[-1] + 1,
+                "js_mean": float(cached_target["step_js"][index]),
                 "js_units": "nats",
-                "js_normalized": disagreement,
-                "rho": disagreement,
-                "step_kd_loss": current_loss,
-                "temperature": temperature,
+                "rho": float(cached_target["step_rho"][index]),
+                "js_normalized": float(cached_target["step_rho"][index]),
+                "js_temperature": float(aggregation["js_temperature"]),
+                "kd_temperature": float(aggregation["kd_temperature"]),
                 "teacher_count": len(adapter_names),
+                "step_kd_loss": step_kd,
+                "step_sft_loss": step_sft,
+                "weighted_sft_loss": float(aggregation["sft_weight"]) * step_sft,
+                "step_total_loss": step_kd + float(aggregation["sft_weight"]) * step_sft,
+                "target_tail_mass": float(logq[start:end, -1].exp().mean()),
+                "student_tail_mass": float(tokens["student_tail"][start:end].mean()),
+                "target_entropy": float(tokens["entropy"][start:end].mean()),
+                "support_size_mean": float(mask[start:end].sum(-1).float().mean()),
             }
         )
-        cursor += count
-        del cotangent
-        elapsed("target_and_hidden_gradient", started)
-
-    started = tick()
-    gradients = torch.autograd.grad(
-        student_hidden,
-        parameters,
-        grad_outputs=final_cotangent,
-        create_graph=False,
-        allow_unused=False,
-    )
-    result_gradients = [value.detach().float() for value in gradients]
-    elapsed("final_kd_gradient", started)
-    if not all(bool(torch.isfinite(value).all()) for value in result_gradients):
-        raise FloatingPointError(f"Non-finite output-space KD gradient for {record.sample_id}")
     return OutputSpaceGradientResult(
-        result_gradients,
-        loss,
+        gradients,
+        kd + weighted,
         plan.num_steps,
         plan.num_steps,
         plan.discarded_steps,
         {
-            "disagreement_sum": disagreement_sum, "rho_sum": disagreement_sum,
-            "prefix_tokens": len(plan.input_ids), "reasoning_tokens": len(positions),
-            **execution_metrics,
+            "disagreement_sum": float(cached_target["step_rho"].sum()),
+            "rho_sum": float(cached_target["step_rho"].sum()),
+            "kd_loss": kd,
+            "sft_loss": sft,
+            "weighted_sft_loss": weighted,
+            "student_tail_mass": float((tokens["student_tail"] * weights).sum()),
+            "target_tail_mass": float((logq[:, -1].exp() * weights).sum()),
+            "target_entropy": float((tokens["entropy"] * weights).sum()),
+            "prefix_tokens": len(plan.input_ids),
+            "reasoning_tokens": len(positions),
+            "head_chunks": math.ceil(len(positions) / chunk),
+            "cached_steps": plan.num_steps,
+            "recomputed_steps": 0,
+            "teacher_head_chunk_sweeps": 0,
+            **anomalies,
         },
         timers,
         step_metrics,

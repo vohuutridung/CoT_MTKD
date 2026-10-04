@@ -1,1 +1,1 @@
-"""Sparse-target compilation and dual-source student training."""
+"""Cached adaptive support+tail output-space distillation (default)."""

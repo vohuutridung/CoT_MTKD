@@ -7,7 +7,6 @@ model:
   attn_implementation: flash_attention_2
 signals:
   temperature_features: 1.0
-  temperature_medoid: 2.0
   importance_clip: [0.25, 4.0]
   importance_consensus_floor: 0.5
   importance_js_scale: 1.0

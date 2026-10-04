@@ -184,7 +184,7 @@ def require_teacher_dataset(stage1: dict[str, Any], prepared: dict[str, Any]) ->
     if stage1["prepared_manifest_fingerprint"] == fingerprint(prepared):
         return
     if stage1.get("artifact") != "stage1_hub_import":
-        raise RuntimeError("Stage-1 checkpoint/prepared dataset mismatch during medoid preparation")
+        raise RuntimeError("Stage-1 checkpoint/prepared dataset mismatch during council preprocessing")
     # A published PEFT council can be scored on newly prepared data. Keep the
     # original training fingerprint; never pretend that re-preparation matches it.
     require_same_model_source(prepared["config"]["model"], stage1["config"]["model"], "Prepared/Hub teachers")

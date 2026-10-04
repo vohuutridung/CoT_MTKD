@@ -23,7 +23,7 @@ from ..models.multi_adapter import (
     set_active_adapter,
 )
 from ..signals.pag import record_pag_parts
-from ..utils.manifest import fingerprint, read_json, require_file_sha256
+from ..utils.manifest import read_json, require_file_sha256
 from ..utils.training import zeros_like_parameters
 from .geometry import task_anchored_weights
 from .geometry_losses import blended_kd_hidden_gradient, teacher_kd_hidden_gradient
@@ -108,21 +108,18 @@ def _select_adapter(model: torch.nn.Module, name: str, training: bool) -> None:
 
 def create_online_model(config: dict[str, Any], distributed: Any):
     stage1_dir = Path(config["paths"]["stage1"])
-    medoid_dir = Path(config["paths"]["medoid"])
+    from .council_cache import load_council_cache
+
+    prepared = read_json(Path(config["paths"]["prepared"]) / "manifest.json")
     stage1 = read_json(stage1_dir / "manifest.json")
-    medoid = read_json(medoid_dir / "manifest.json")
-    if medoid.get("artifact") != "stage2_medoid":
-        raise RuntimeError("Phase 2 requires the new medoid manifest; run stage2-medoid")
+    cache = load_council_cache(config, prepared, stage1)
     require_file_sha256(stage1_dir, stage1, "adapter_bundle", "adapter_bundle_sha256")
     require_file_sha256(stage1_dir, stage1, "config_file", "config_file_sha256")
-    require_file_sha256(medoid_dir, medoid, "config_file", "config_file_sha256")
-    if medoid["stage1_manifest_fingerprint"] != fingerprint(stage1):
-        raise RuntimeError("Medoid/Stage-1 checkpoint mismatch")
     stage1_config = stage1["config"]
     require_same_model_source(config["model"], stage1_config["model"], "Phase 2/Stage 1")
     for key in ("rank", "alpha", "target_modules"):
         if config["lora"][key] != stage1_config["lora"][key]:
-            raise ValueError(f"Medoid cloning requires matching LoRA {key}")
+            raise ValueError(f"Best-expert cloning requires matching LoRA {key}")
     names = list(stage1["adapter_names"])
     if len(names) < 2:
         raise ValueError("Task-anchored MTKD requires at least two teachers")
@@ -142,10 +139,8 @@ def create_online_model(config: dict[str, Any], distributed: Any):
     base_dtype = next(model.get_base_model().parameters()).dtype
     for parameter in adapter_parameter_map(model, "student").values():
         parameter.data = parameter.data.to(dtype=base_dtype)
-    medoid_name = medoid["functional_medoid_adapter"]
-    if medoid_name not in names:
-        raise RuntimeError("Medoid adapter is not in the teacher council")
-    load_adapter_state(model, "student", bundle[medoid_name])
+    best_name = cache.manifest["selected_expert"]
+    load_adapter_state(model, "student", bundle[best_name])
     if int(config["stage2"]["max_length"]) > int(model.config.max_position_embeddings):
         raise ValueError("Configured Phase-2 context exceeds the model context limit")
     _select_adapter(model, "student", training=True)

@@ -31,7 +31,7 @@ export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space_local.yaml
 ./project_commands.sh prepare
 CUDA_VISIBLE_DEVICES=0 ./project_commands.sh stage1-stress
 ./project_commands.sh stage1
-./project_commands.sh stage2-medoid
+./project_commands.sh stage2-cache
 CUDA_VISIBLE_DEVICES=0 \
   STAGE2_STRESS_OUTPUT=artifacts/stage2/output_space_local_stress_memory.json \
   ./project_commands.sh stage2-stress
@@ -47,7 +47,7 @@ Purpose of each command above:
 
 1. `export STAGE2_CONFIG=...output_space_local.yaml` selects the experts produced
    by Phase 1 in `artifacts/stage1/main`. It also selects separate local-teacher
-   medoid and student output directories.
+   cache and student output directories.
 2. `prepare` downloads the pinned s1K-1.1 dataset and Qwen tokenizer, serializes
    only `deepseek_thinking_trajectory` (including its own final answer), and records
    token regions and reasoning-step boundaries in `artifacts/prepared/s1k_1_1_cot_only`
@@ -63,13 +63,13 @@ Purpose of each command above:
    model and writes `artifacts/stage1/stress_memory.json`.
 4. `stage1` trains the three LoRA experts and saves their adapter bundle,
    checkpoint and manifest in `artifacts/stage1/main`.
-5. `stage2-medoid` scores the frozen local experts on the prepared corpus and
-   selects the adapter to copy into the student. Its manifest is saved in
-   `artifacts/stage2_medoid/output_space_local`.
+5. `stage2-cache` precomputes support/tail targets and SFT scores on the prepared
+   corpus, selecting the best expert to copy into the student. Its manifest is saved in
+   `artifacts/teacher_cache/output_space_local/<fingerprint>`.
 6. `stage2-stress` checks the actual Phase-2 forward, loss, gradients and temporary
    optimizer update at real and synthetic context lengths. The explicit output
    override saves its report as `artifacts/stage2/output_space_local_stress_memory.json`.
-7. `stage2` trains the student for three epochs with output-space KD and writes
+7. `stage2` trains the student for three epochs with cached KD + SFT and writes
    checkpoints, the final student adapter and logs to `artifacts/stage2/output_space_local`.
 8. The final `evaluate` command optionally generates and grades the local
    student on AIME 2025, AIME 2024, AMC and MATH-500. It writes benchmark outputs
@@ -85,7 +85,7 @@ export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space.yaml
 
 ./project_commands.sh prepare
 ./project_commands.sh fetch-teachers
-./project_commands.sh stage2-medoid
+./project_commands.sh stage2-cache
 CUDA_VISIBLE_DEVICES=0 ./project_commands.sh stage2-stress
 ./project_commands.sh stage2
 
@@ -101,8 +101,8 @@ Purpose of each command above:
    on a fresh clone, even when the experts were trained elsewhere.
 3. `fetch-teachers` downloads, verifies and imports the three frozen PEFT adapters
    from the pinned Hub revision into `artifacts/stage1/duyentl04_abc`.
-4. `stage2-medoid` selects the student initialization from those imported experts
-   and saves `artifacts/stage2_medoid/output_space/manifest.json`.
+4. `stage2-cache` precomputes support/tail targets and selects the best SFT expert
+   from the imported council, saving `artifacts/teacher_cache/output_space/<fingerprint>/manifest.json`.
 5. `stage2-stress` checks Phase-2 VRAM and update completion on one H200. Its
    report is `artifacts/stage2/output_space_stress_memory.json`; it does not
    save a trained student.
@@ -120,7 +120,7 @@ needs the legacy `supervision` or `cache` commands for this Phase-2 method.
 ### Shortcuts and tests
 
 With the default Hub-teacher config, `all` runs `prepare`, `fetch-teachers`,
-`stage2-medoid`, `stage2`, and `evaluate`. It skips Phase-1 training and both
+`stage2-cache`, `stage2`, and `evaluate`. It skips Phase-1 training and both
 H200 preflights. `full` runs setup and tests before that same `all` route:
 
 ```bash
@@ -137,17 +137,18 @@ are skipped when CUDA is unavailable:
 
 ## Multi-GPU
 
-Run preparation/import once, and use `NPROC_PER_NODE` for distributed medoid
-selection, training and evaluation. For example, using eight GPUs with the Hub
-experts:
+Run preparation/import once, and use `NPROC_PER_NODE` for distributed council
+preprocessing, training and evaluation. Both global batch and dataset record
+count must divide the GPU count; the current 996-sample corpus supports 1/2/4
+GPUs with the default batch 16. For example, using four GPUs with the Hub experts:
 
 ```bash
 export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space.yaml
 ./project_commands.sh prepare
 ./project_commands.sh fetch-teachers
-NPROC_PER_NODE=8 ./project_commands.sh stage2-medoid
-NPROC_PER_NODE=8 ./project_commands.sh stage2
-NPROC_PER_NODE=8 ./project_commands.sh evaluate
+NPROC_PER_NODE=4 ./project_commands.sh stage2-cache
+NPROC_PER_NODE=4 ./project_commands.sh stage2
+NPROC_PER_NODE=4 ./project_commands.sh evaluate
 ```
 
 The stress commands require one visible H200 rather than a distributed launch.
@@ -277,247 +278,208 @@ and exits with status 2. Both cases must complete before the preflight is ready.
 Stress updates affect only the temporary model in that process; no training
 checkpoint or adapters are saved.
 
-## Phase 2: disagreement-adaptive output-space MTKD
+## Phase 2: cached adaptive support + tail MTKD
 
-The `output-space` branch defaults to disagreement-adaptive distribution
-aggregation from the Phase-2 proposal. Phase 1 is unchanged. Three frozen
-teachers and one student share a single backbone. Teacher forcing uses fixed
-DeepSeek reasoning trajectories; training performs no autoregressive generation.
-Only the student LoRA is updated, with dropout disabled.
+The `output-space` branch defaults to three frozen LoRA experts distilling into
+one student LoRA on fixed teacher-forced trajectories. Phase 1 is unchanged.
+Agreement favors geometric consensus; disagreement moves the generalized power
+mean toward arithmetic coverage. No teacher or student rollout is generated.
 
-Teachers default to [duyentl04/abc](https://huggingface.co/duyentl04/abc/tree/52aff0a878826b09fa62fa5a8229a6d49910ff6a),
-pinned to commit `52aff0a878826b09fa62fa5a8229a6d49910ff6a`. `fetch-teachers`
-downloads the three PEFT adapters (about 242 MB in total) and imports them into
-`artifacts/stage1/duyentl04_abc`. It verifies the pinned weight checksums,
-base-model revision, LoRA configuration, finite tensors and council structure.
-It rebuilds the pipeline's adapter bundle on CPU without downloading the backbone
-or a Phase-1 training checkpoint. The Phase-2 commands also import automatically
-when this directory is absent; subsequent runs verify and reuse the local files,
-including with `HF_HUB_OFFLINE=1`. `all` uses these trained experts and skips
-Phase-1 training. `stage1` remains available for training a new local council.
+Teachers default to the pinned
+[duyentl04/abc council](https://huggingface.co/duyentl04/abc/tree/52aff0a878826b09fa62fa5a8229a6d49910ff6a).
+`fetch-teachers` verifies SHA-256 weights, backbone revision, compatible LoRA
+structure and finite tensors, preserving uploaded source files and historical
+training-data identity. The upload does not contain the original prepared-data
+manifest, so exact historical dataset identity remains unverified. The importer
+records that limitation rather than rewriting the historical fingerprint.
+Local experts use `qwen25_7b_output_space_local.yaml`; remote and local configs
+use separate cache/output roots with identical objective defaults.
 
-The Hub upload omits `adapter_states.pt` and the original prepared-data manifest,
-and its rewritten paths invalidate the original config checksum. The importer
-preserves the uploaded files under `source/`, retains the original training-data
-fingerprint, and writes fresh checksums for its converted bundle/config.
-Exact Phase-1 training-data identity cannot be established from this upload.
-Medoid selection validates the current prepared corpus and tokenizer, records
-this limitation, and binds subsequent Phase-2 training to that corpus and the
-imported teachers. It does not relabel the historical data fingerprint.
+### Support and two temperatures
 
-To use the locally trained council, select
-`configs/stage2/qwen25_7b_output_space_local.yaml` as shown in Run. It uses
-`teacher_source.type: local` and `paths.stage1: artifacts/stage1/main`, with
-separate medoid/output directories. Keep those separate when changing teacher
-sources; old medoid artifacts and checkpoints are rejected.
-
-`stage2-medoid` selects the teacher minimizing the mean full-vocabulary
-`KL(uniform council mixture || teacher)` at temperature 2 over all assistant
-targets in the complete prepared corpus. It does not compute the old PAG or
-static teacher weights. The student copies this adapter.
-
-For each reasoning token, all teachers and the student use the same fixed prefix
-and temperature `T`. The default is `T = 2.0`. Here `M = 3` is the teacher count,
-`z` denotes full-vocabulary logits, and `S` denotes the student. The teacher
-distributions and arithmetic council mean are:
+`stage2-cache` calls the existing Phase-1 `full_vocab_probe`,
+`stage1.kneedle.local_k_from_probe`, and `build_union_support` under `no_grad`.
+For each expert and reasoning-content token it excludes observed gold `y_t`,
+searches `K=min(512,|V|-1)` descending non-target logits, and applies exactly:
 
 ```math
-\begin{aligned}
-p_{m,t} &= \operatorname{softmax}(z_{m,t}/T), \\
-p_{S,t} &= \operatorname{softmax}(z_{S,t}/T), \\
-\bar p_t &= \frac{1}{M}\sum_{m=1}^{M}p_{m,t}.
-\end{aligned}
+x_j=\frac{j-1}{K-1},\quad
+u_j=\frac{z_j^\downarrow-z_K^\downarrow}{z_1^\downarrow-z_K^\downarrow+\epsilon},\quad
+\hat k=1+\arg\max_j[(1-x_j)-u_j],\quad
+k=\min(K,\max(\hat k,8)).
 ```
 
-Every teacher has equal weight. Token disagreement is generalized JSD normalized
-by its upper bound `log(M)`. A single power parameter is shared by every token
-within reasoning step `s`. Let `T_s` be its reasoning-content token positions and
-`n_s = |T_s|`. All logarithms are natural, so raw JSD is measured in nats:
+The shared support is `V_t = union_m S_m,t ∪ {y_t}`. Valid IDs are ascending and
+unique; gold appears exactly once. There is no additional `k_max`. K=1/0 retain
+Phase-1 edge semantics. Sorting, Kneedle and selection receive no gradient.
+
+JSD uses `js_temperature=1`, restricts and renormalizes on `V_t`, and has no tail:
 
 ```math
-\begin{aligned}
-D_t^{\mathrm{JS}}
-  &= \frac{1}{M}\sum_{m=1}^{M}\operatorname{KL}(p_{m,t}\Vert\bar p_t), \\
-d_s
-  &= \frac{1}{n_s}\sum_{t\in T_s}\frac{D_t^{\mathrm{JS}}}{\log M}, \\
-\rho_s &= d_s \in [0,1].
-\end{aligned}
+\pi^{JS}_{m,t}=\operatorname{softmax}_{V_t}(z_{m,t}/T_{JS}),\quad
+\bar\pi_t=\frac13\sum_m\pi^{JS}_{m,t},\quad
+D^{JS}_t=\frac13\sum_m KL(\pi^{JS}_{m,t}\Vert\bar\pi_t).
 ```
 
-For each token, form the power mean and normalize across the full vocabulary
-`V` (152,064 output tokens for the configured model). The zero-power case is
-defined separately to avoid division by zero:
+This equals restriction+renormalization of the full softmax because its partition
+function cancels. Each step shares exactly one scalar:
 
 ```math
-\tilde q_{s,t}(v)=
+D^{JS}_s=\frac1{|T_s|}\sum_{t\in T_s}D^{JS}_t,\qquad
+\rho_s=\operatorname{clamp}(D^{JS}_s/\log 3,0,1).
+```
+
+There is no percentile, threshold, sigmoid or learned calibration.
+
+KD independently uses `kd_temperature=2` and **full-softmax mass**, without
+renormalizing support first. Its categorical space is `V_t ∪ {tail}`:
+
+```math
+\log Z_{m,t}=\operatorname{logsumexp}(z_{m,t}/T_{KD}),\quad
+r_{m,t}(v)=\exp(z_{m,t,v}/T_{KD}-\log Z_{m,t}),\quad
+r_{m,t}(\bot)=1-\sum_{v\in V_t}r_{m,t}(v).
+```
+
+Only support logits are gathered; no full teacher probability vector is kept.
+Tail calculation uses `-expm1(log support mass)`. Near saturation it computes
+outside-support logsumexp, preserving extremely small tails and student gradients.
+An empty complement gets a `1e-30` floor; floors, roundoff corrections and
+complement fallbacks are counted. Reduced distributions are corrected for
+summation roundoff to sum to one. Full-vocabulary logits still occur in bounded
+head chunks to calculate the partition function and hard-label CE.
+
+The target is the normalized, detached **power mean**, on support plus tail:
+
+```math
+q_{s,t}(v)\propto
 \begin{cases}
-\left[\frac{1}{M}\sum_{m=1}^{M}p_{m,t}(v)^{\rho_s}\right]^{1/\rho_s},
-  & \rho_s>0, \\
-\exp\left(\frac{1}{M}\sum_{m=1}^{M}\log p_{m,t}(v)\right),
-  & \rho_s=0.
+[\frac13\sum_m r_{m,t}(v)^{\rho_s}]^{1/\rho_s},&\rho_s>0,\\
+\exp(\frac13\sum_m\log r_{m,t}(v)),&\rho_s=0.
 \end{cases}
 ```
 
-```math
-q_{s,t}(v)=\frac{\tilde q_{s,t}(v)}{\sum_{u\in V}\tilde q_{s,t}(u)}.
-```
+FP64 log-domain pooling retains the positive-power correction near zero; this
+is never linear interpolation. `rho=0` is normalized geometric mean, `rho=1`
+arithmetic mean, both on reduced categories. The student forms `r_S` identically.
 
-At `rho = 0`, the continuous limit is the normalized geometric mean,
-`q(v) ∝ exp(mean_m log p_m(v))`, equivalent to softmax of mean teacher logits.
-At `rho = 1`, it is the arithmetic mean. Intermediate values change the power
-mean operator directly; they are not a linear blend of these two endpoints.
-JSD, `rho` and the target depend only on the frozen teachers and fixed trajectory.
-All are detached during the student update.
-
-The loss direction is `KL(target || student)`. It averages KL over each step's
-tokens, then gives each retained step and each example equal weight. `K` is the
-number of retained steps in that example, `B` is the effective batch, and `sg`
-means stop-gradient:
+### Objective, mask and initialization
 
 ```math
-\begin{aligned}
-\ell_s
-  &= \frac{T^2}{n_s}\sum_{t\in T_s}
-     \operatorname{KL}(\operatorname{sg}(q_{s,t})\Vert p_{S,t}), \\
-L_{\mathrm{example}}
-  &= \frac{1}{K}\sum_{s=1}^{K}\ell_s, \\
-L_B
-  &= \frac{1}{|B|}\sum_{i\in B}L_{\mathrm{example},i}.
-\end{aligned}
+L^{KD}_s=\frac{T_{KD}^2}{|T_s|}\sum_{t\in T_s}KL(\operatorname{sg}(q_{s,t})\Vert r_{S,t}),\qquad
+L^{SFT}_s=\frac1{|T_s|}\sum_{t\in T_s}-\log\operatorname{softmax}(z_{S,t})_{y_t},\qquad
+L=\operatorname{Mean}_{sample}\operatorname{Mean}_{step}(L^{KD}_s+0.25L^{SFT}_s).
 ```
 
-The implementation currently uses reasoning content tokens for `T_s`.
-Delimiters remain in the teacher-forced prefixes but have no KD target; assistant
-control and EOS tokens have no Phase-2 loss. The final answer already inside
-`deepseek_thinking_trajectory` remains reasoning content and participates in KD;
-there is no separate answer block from `deepseek_attempt`. Only complete reasoning
-steps fitting the 32,768-token trajectory context are retained. Gold solutions
-are not used for a task anchor or an SFT objective. Every retained step
-participates in KD, including steps with zero disagreement. An example with no
-retained step contributes zero loss and stays in the batch denominator. If a
-whole effective batch has no retained steps, AdamW and the LR scheduler are both
-skipped while data progress advances.
+KD and SFT share the existing `output_space.plan_record` content mask: retained
+complete `TokenRegion.REASONING` steps only, within the 32,768-token context.
+Delimiters/control/EOS stay in context without a loss; no separate gold-solution
+suffix is added. An answer already inside the reasoning trajectory is reasoning
+content. Empty samples contribute zero and remain in the sample denominator;
+a fully empty batch skips optimizer and scheduler while advancing data progress.
 
-During student training, teachers run sequentially without gradients; their
-selected hidden states stay on the model device by default, avoiding CPU
-transfers. Full-vocabulary logits
-and targets use head chunks of up to 4096 tokens within each reasoning step,
-without Top-K/tail approximation. A step with at most 4096 reasoning tokens
-uses one chunk; 4097--8192 uses two. Longer steps use more chunks to bound the
-full-vocabulary pooling workspace. This does not rerun the decoder.
-Each reasoning step's FP64 teacher log probabilities are retained when they fit
-the 8 GiB cache budget and reused for power pooling after computing the step's
-JSD. Steps exceeding that budget recompute teacher head projections in chunks;
-decoder hidden states are always reused. The budget bounds retained teacher
-probabilities only, not total GPU memory or temporary pooling workspace. For
-three teachers over 152,064 vocabulary entries, a 4096-token FP64 probability
-chunk alone occupies about 13.9 GiB. A step may therefore use one head chunk
-while exceeding the 8 GiB cache budget and requiring two teacher-head sweeps.
-Power pooling is evaluated in the log domain, including a stable evaluation
-near `rho = 0`. Gradient checkpointing remains enabled because long-sequence
-student activations dominate memory without it. Each example needs one student
-trajectory graph and a final student backward; teacher-gradient and gold-anchor
-passes are absent. The GPU probability cache lasts only for the current step;
-the teachers are evaluated again whenever the next example/epoch is processed.
-There is no dataset-wide target cache, and the legacy mixture cache is unused.
+The same preprocessing pass scores each expert with ordinary T=1 NLL using
+exactly token→step→sample means, then picks the lowest corpus SFT score. Ties
+choose the first expert in manifest adapter order. The complete winning adapter
+is copied into the student; no merging or barycenter distance is used.
+The former Stage-2 selection pass and full-vocabulary online output-space KD have
+been removed. The legacy PAG/features tool also no longer computes that selection.
 
-The default training settings are:
+### Static council cache
 
-| Setting | Value | Purpose |
-| --- | --- | --- |
-| `stage2.epochs` | `3` | Number of passes through the prepared dataset. |
-| `stage2.max_length` | `32768` | Maximum trajectory context, including the prompt. |
-| `stage2.micro_batch_size` | `1` | Examples processed at a time on each GPU. |
-| `stage2.global_batch_size` | `32` | Effective examples per optimizer update; accumulation is derived from GPU count. |
-| `runtime.lm_head_chunk_tokens` | `4096` | Maximum tokens projected together inside a reasoning step. |
-| `runtime.teacher_hidden_storage` | `device` | Keep teacher hidden states on the model device; `cpu` enables offload. |
-| `runtime.teacher_probability_cache_gib` | `8.0` | Per-step teacher probability cache budget; `0` always recomputes. |
-| `model.gradient_checkpointing` | `true` | Recompute student activations during backward to reduce memory. |
+Run `./project_commands.sh stage2-cache` **before** `stage2`. Preprocessing does
+one decoder forward per expert per retained sample, a bounded head sweep for
+Phase-1 probes, and a second head sweep for JSD, reduced probabilities and SFT
+scores. Reduced teacher values are retained only within a step until its rho is
+known. Student training loads only the student model, winning adapter and cached
+final targets; it never instantiates teacher adapters or forwards the council.
+A cache miss in training fails with the preprocessing command to run.
 
-The runtime controls affect execution and memory, not the full-vocabulary
-objective. Run the H200 stress command with the chosen configuration; speed
-and peak VRAM require GPU measurement. Changing the configuration requires a
-fresh training run rather than resuming a checkpoint from the old configuration.
+Cache version 1 lives at `paths.teacher_cache_dir/<fingerprint>/`. Each sample
+has a checksummed safetensors file containing:
 
-Training writes aggregate loss, learning rate, preclip gradient norm, example/step
-counts, raw JSD mean (nats), and normalized disagreement/rho to `metrics.jsonl`
-in the Phase-2 output directory. The terminal also reports KD, LR, JSD and rho.
-By default, `logging.reasoning_steps: true` additionally writes every retained
-reasoning step of every sample on every epoch to `reasoning_steps.jsonl`.
-Each row identifies `sample_id`, original `step_id`, epoch, minibatch, rank and
-the completed data/optimizer-step counters before that minibatch. It includes
-the step's reasoning-token count, mean raw JSD in `js_mean` (natural-log nats),
-normalized `js_normalized = js_mean / log(M)`, `rho = js_normalized`, the step KD
-loss, temperature and teacher count. `step_kd_loss` is the token-mean, T-squared
-loss before the equal-step/example averaging; `sample_kd_loss` is the example
-mean. Epoch, step ID and minibatch indices start at zero. Token offsets are
-zero-based in the prepared trajectory, with an exclusive end.
+- Ragged ascending `support_ids` (int32), `support_offsets` (int64), token positions
+  (int32), and reasoning `step_offsets` (int64).
+- Final normalized `support_log_target` and one `tail_log_target` per token (FP32).
+  Log storage preserves tiny mass that FP16 probabilities could underflow. The
+  loaded target is normalized for FP32 serialization roundoff before KL.
+- Raw step JSD/rho (FP64), per-expert raw/selected K (int16), union sizes (int16),
+  and gold-present-before-add flags (bool).
 
-These rows reuse the existing teacher statistics, independent of
-`stage2.log_every_steps`; no additional teacher forward is performed. Context-
-discarded steps have no JSD row because they are not evaluated. With multiple
-GPUs, each rank writes `reasoning_steps.rank00000.jsonl`, etc., so every rank's
-samples are covered without concurrent writes to one file. A fresh run clears
-its logs; resume trims records after the saved checkpoint cursor before
-appending, including interrupted trailing writes. Final manifests record the
-per-rank log filenames and checksums. Set `logging.reasoning_steps: false` to
-disable the detailed step log while retaining aggregate metrics.
+`index.json` owns every sample file/checksum; `manifest.json` owns the index hash,
+expert SFT scores, deterministic winner, statistics and numerical counters.
+`best_expert.pt` owns only the selected LoRA and has its own SHA-256.
+Files and the final manifest are published atomically; incomplete preprocessing
+has no usable manifest and must rerun. Cache hits verify content and skip model
+loading. Training verifies every cache file at startup.
 
-By default, `logging.performance: true` also writes `performance.jsonl` (or
-`performance.rank00000.jsonl`, etc., for multiple GPUs). It records one session
-header, one row per sample, and one row per completed effective-batch window:
+The identity binds teacher bundle/checkpoint SHA-256 and manifest, backbone name,
+revision/precision/attention implementation, prepared manifest/data/tokenizer,
+max length, search_k/k_min, both temperatures, support/mask/storage semantics,
+head chunk size, PyTorch version, and source-file SHA-256 for selection,
+preprocessing, loss, planner and model code. Epoch count, optimizer, global batch,
+resume and SFT weight are excluded because they do not alter static targets.
+Changing any bound field selects a fresh fingerprint directory; an explicitly
+loaded incompatible fingerprint or corrupted cache fails loudly.
 
-- The session header records the configuration/fingerprints, GPU name and total
-  memory, device, PyTorch version, rank and GPU count.
-- Sample rows record prepared/prefix/reasoning token counts, retained/discarded
-  reasoning steps, token-head chunks, steps using the GPU probability cache,
-  steps requiring teacher-head recomputation, and record-gradient wall time.
-- Memory fields record current and peak allocated/reserved PyTorch allocator
-  bytes and GiB on that rank. Sample peaks include gradient accumulation;
-  update peaks take the maximum over all accumulated samples and the optimizer
-  calls. Session peaks exclude the earlier model-loading high-water mark.
-- Update rows record local examples/tokens, wall time, local throughput, session
-  elapsed time and a remaining-time estimate. ETA uses completed data windows
-  after discarding the first two warmup windows of the current process. Skipped
-  optimizer updates still count as processed data windows.
+### Defaults and diagnostics
 
-This monitoring reads host-side allocator counters and uses `perf_counter`.
-It adds no CUDA synchronization, events, profiler, subprocess GPU polling, extra
-teacher/student forwards or distributed reductions. Timings are explicitly
-`host_wall_no_cuda_sync`: CPU-observed wall times, not exact CUDA kernel timings.
-Prefix throughput counts each trajectory token once, not once per teacher.
-Update windows include sample processing, existing logging/gradient accumulation
-and optimizer enqueue time; checkpoint saving and final export are outside those
-windows. CUDA work may still be pending at a measurement boundary. Memory fields
-are null on CPU and do not include allocations outside PyTorch or other processes.
-Monitoring entails a small amount of CPU work and JSONL I/O; no H200 overhead
-percentage is claimed without measurement.
+| Config key | Default |
+| --- | --- |
+| `aggregation.js_temperature` | `1.0` |
+| `aggregation.kd_temperature` | `2.0` |
+| `aggregation.sft_weight` | `0.25` (set `0.5` for an ablation) |
+| `aggregation.search_k` / `k_min` | `512` / `8`, no extra cap |
+| `aggregation.teacher_execution` | `precomputed_support_tail` |
+| `stage2.epochs` | `1` |
+| `stage2.global_batch_size` / `micro_batch_size` | `8` / `1` |
+| `stage2.gradient_accumulation_steps` | `null`: derive `8/(world_size×micro)` |
+| `stage2.max_length` | `32768` |
+| `runtime.lm_head_chunk_tokens` | `4096` |
+| `runtime.preprocessing_hidden_storage` | `cpu` |
+| `model.gradient_checkpointing` | `true` |
 
-Performance rows reuse the checkpoint cursor recovery rules and have per-rank
-checksums in the final manifest. A resumed process starts a new timing session
-and warmup period. Rank-zero update summaries also appear in `metrics.jsonl`;
-the terminal shows wall time and, on CUDA, peak allocated VRAM. Set
-`logging.performance: false` to disable this monitoring.
+Nondivisible global batches or conflicting explicit accumulation fail. A final
+partial effective batch is normalized by its actual sample count. To change the
+SFT anchor, run the training CLI with `--set aggregation.sft_weight=0.5`; the same
+cache is reusable, but a different training configuration requires a new output
+run and cannot resume the old checkpoint.
 
-On one H200, run `stage2-medoid`, then `stage2-stress`, then `stage2`. The stress
-command executes the actual full method on the longest eligible real example
-and a synthetic example reaching the context limit. It reports component times,
-peak VRAM, configuration/source fingerprints and completed optimizer updates
-at `artifacts/stage2/output_space_stress_memory.json`. It updates only a temporary model.
-Missing CUDA/H200 or incomplete update coverage does not establish readiness.
-The single-microbatch measurements do not estimate the whole training run.
-`all` uses the new medoid and trainer; the H200-specific preflight is explicit.
+The current runner processes records sequentially inside each loader microbatch;
+raising `micro_batch_size` does not batch decoder forwards or improve GPU
+parallelism. Keep it at 1 until a batched gradient path is implemented and
+benchmarked. With 996 samples, one epoch and one GPU, the defaults give 125
+optimizer updates, including a final four-sample update. Epoch and batch changes
+reuse the same council cache.
 
-The report measures this method only when its cases actually run successfully;
-no H200 runtime or memory result is supplied by the implementation change.
+The cache manifest records support/union mean, median, p90, p95 and max, per-expert
+raw/selected-K histograms, gold-present rate, raw step JSD/rho histograms and
+quantiles, target tail mass, cache bytes/counts/wall time and anomalies.
+`metrics.jsonl` records cache hit/fingerprint/init scores and winner, KD, SFT,
+weighted SFT, total loss, both temperatures, JSD/rho, target/student tail mass,
+reduced target entropy and numerical counters. `reasoning_steps.jsonl` gives the
+same diagnostics per step, with original sample/step/token offsets and epoch.
+Detailed rows are emitted independently of aggregate logging frequency.
 
-The gradient-space variant remains available with
-`STAGE2_CONFIG=configs/stage2/qwen25_7b_task_geometry.yaml`. Its objective,
-gold-answer anchors and artifact paths remain distinct. Checkpoints bind the
-selected method, configuration and source fingerprints, so an output-space run
-cannot resume a gradient-space or legacy dual-source checkpoint. Evaluation
-defaults to `artifacts/stage2/output_space`; evaluating another variant requires
-setting the corresponding `paths.stage2` in an evaluation config.
+`performance.jsonl` retains host wall timing, chunk counts, cache-hit step counts,
+zero recomputed steps/teacher-head sweeps, throughput and allocator memory.
+Host timing does not synchronize CUDA; CPU memory fields are null. Distributed
+ranks write separate step/performance files. Resume trims rows after the saved
+checkpoint cursor and partial trailing writes; final manifests own log hashes.
+Checkpoints bind the full training config plus council-cache fingerprint.
+
+On one H200, run `stage2-cache`, `stage2-stress`, then `stage2`. The stress command
+precomputes the synthetic trajectory separately, releases teachers, then measures
+cached student-only updates for longest real and full-context synthetic samples.
+Synthetic preprocessing is reported separately and excluded from training timing.
+No 7B/H200 speed, memory, training duration or model-quality claim is established
+by CPU unit/tiny-Qwen tests. Missing H200 yields an unmeasured requirement report.
+
+The older `qwen25_7b_task_geometry.yaml` remains an explicit, separate legacy
+online gradient-space objective. It now uses best-SFT initialization from the
+council preprocessing artifact; its teacher-gradient/answer-anchor objective and
+batch defaults stay separate. Its online full-vocabulary losses are not used by
+the default output-space method. Legacy fixed Top-512/PAG cache tooling is also
+separate and cannot substitute for the new council cache.
 
 ## Resume training
 

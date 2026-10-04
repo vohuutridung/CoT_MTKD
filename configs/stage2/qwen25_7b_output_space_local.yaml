@@ -16,16 +16,20 @@ lora:
   dropout: 0.0
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 aggregation:
-  temperature: 2.0
-  teacher_execution: online_full_vocab
+  js_temperature: 1.0
+  kd_temperature: 2.0
+  sft_weight: 0.25
+  search_k: 512
+  k_min: 8
+  teacher_execution: precomputed_support_tail
 logging:
   reasoning_steps: true
   performance: true
 stage2:
-  epochs: 3
+  epochs: 1
   learning_rate: 2.0e-5
   micro_batch_size: 1
-  global_batch_size: 32
+  global_batch_size: 8
   gradient_accumulation_steps: null
   max_length: 32768
   max_grad_norm: 1.0
@@ -43,11 +47,10 @@ scheduler:
   min_lr_ratio: 0.0
 runtime:
   lm_head_chunk_tokens: 4096
-  teacher_hidden_storage: device
-  teacher_probability_cache_gib: 8.0
+  preprocessing_hidden_storage: cpu
   dataloader_workers: 0
 paths:
   prepared: artifacts/prepared/s1k_1_1_cot_only
   stage1: artifacts/stage1/main
-  medoid: artifacts/stage2_medoid/output_space_local
+  teacher_cache_dir: artifacts/teacher_cache/output_space_local
   output: artifacts/stage2/output_space_local

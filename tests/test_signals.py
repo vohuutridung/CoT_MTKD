@@ -5,7 +5,6 @@ import unittest
 import torch
 
 from cot_mtkd.signals.group_importance import group_step_importance
-from cot_mtkd.signals.medoid import functional_medoid
 from cot_mtkd.signals.teacher_features import reasoning_teacher_weights
 
 
@@ -35,8 +34,6 @@ class SignalTest(unittest.TestCase):
         self.assertAlmostEqual(float(weights.sum()), 1.0, places=6)
         self.assertGreaterEqual(float(weights.min()), 0.02 - 1e-7)
 
-    def test_functional_medoid(self) -> None:
-        self.assertEqual(functional_medoid(torch.tensor([0.4, 0.1, 0.2])), 1)
 
 
 if __name__ == "__main__":

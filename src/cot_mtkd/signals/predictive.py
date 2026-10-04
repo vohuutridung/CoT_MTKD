@@ -26,8 +26,6 @@ class PredictiveSignals:
     token_counts: torch.Tensor
     answer_competence: torch.Tensor
     answer_agreement: torch.Tensor
-    medoid_kl_sum: torch.Tensor
-    medoid_token_count: int
 
 
 def _response_views(record: PreparedRecord, device: torch.device):
@@ -64,14 +62,12 @@ def _stream_full_vocab_statistics(
     targets: torch.Tensor,
     chunk_tokens: int,
     feature_temperature: float,
-    medoid_temperature: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     expert_count = len(hidden_by_expert)
     token_count = hidden_by_expert[0].shape[0]
     nll = torch.empty((expert_count, token_count), dtype=torch.float32)
     agreement_kl = torch.empty((expert_count, token_count), dtype=torch.float32)
     js = torch.empty(token_count, dtype=torch.float32)
-    medoid_sum = torch.zeros(expert_count, dtype=torch.float64)
     device = next(head.parameters()).device
     dtype = next(head.parameters()).dtype
     with torch.no_grad():
@@ -115,22 +111,7 @@ def _stream_full_vocab_statistics(
                 )
                 agreement_kl[expert, start:end] = kl.cpu()
 
-            logp2 = [
-                F.log_softmax(value / medoid_temperature, dim=-1) for value in logits
-            ]
-            p2 = [value.exp() for value in logp2]
-            mixture2 = torch.stack(p2, dim=0).mean(dim=0)
-            log_mixture2 = mixture2.clamp_min(1.0e-30).log()
-            for expert in range(expert_count):
-                medoid_sum[expert] += (
-                    (mixture2 * (log_mixture2 - logp2[expert]))
-                    .sum(dim=-1)
-                    .clamp_min(0.0)
-                    .sum()
-                    .double()
-                    .cpu()
-                )
-    return nll, agreement_kl, js, medoid_sum
+    return nll, agreement_kl, js
 
 
 def _dpp_uniqueness(
@@ -193,20 +174,18 @@ def score_predictive_signals(
     kneedle: dict[str, int],
     dpp_jitter: float,
     feature_temperature: float = 1.0,
-    medoid_temperature: float = 2.0,
 ) -> PredictiveSignals:
     targets, regions, steps, valid = _response_views(record, device)
     hidden_by_expert = _collect_teacher_hidden(
         model, adapter_names, record, valid, device
     )
     _, head = decoder_and_lm_head(model)
-    nll, agreement_kl, js, medoid_sum = _stream_full_vocab_statistics(
+    nll, agreement_kl, js = _stream_full_vocab_statistics(
         hidden_by_expert,
         head,
         targets,
         chunk_tokens,
         feature_temperature,
-        medoid_temperature,
     )
     targets_cpu, regions_cpu, steps_cpu = targets.cpu(), regions.cpu(), steps.cpu()
     reasoning_mask = regions_cpu.eq(int(TokenRegion.REASONING))
@@ -256,6 +235,4 @@ def score_predictive_signals(
         token_counts=torch.tensor(token_counts, dtype=torch.float32),
         answer_competence=-nll[:, answer_mask].mean(dim=-1),
         answer_agreement=-agreement_kl[:, answer_mask].mean(dim=-1),
-        medoid_kl_sum=medoid_sum,
-        medoid_token_count=int(targets.numel()),
     )

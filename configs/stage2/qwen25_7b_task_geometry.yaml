@@ -22,6 +22,13 @@ lora:
   alpha: 16
   dropout: 0.0
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+aggregation:
+  js_temperature: 1.0
+  kd_temperature: 2.0
+  sft_weight: 0.25
+  search_k: 512
+  k_min: 8
+  teacher_execution: precomputed_support_tail
 geometry:
   temperature: 2.0
   epsilon_a: 1.0e-12
@@ -53,5 +60,5 @@ runtime:
 paths:
   prepared: artifacts/prepared/s1k_1_1_cot_only
   stage1: artifacts/stage1/duyentl04_abc
-  medoid: artifacts/stage2_medoid/main
+  teacher_cache_dir: artifacts/teacher_cache/main
   output: artifacts/stage2/task_geometry

@@ -8,7 +8,7 @@ from .common import parsed_config
 
 
 def main() -> None:
-    config = parsed_config("Build PAG, group importance, teacher weights, and medoid")
+    config = parsed_config("Build legacy PAG, group importance and teacher weights")
     distributed = initialize_distributed()
     configure_logging(distributed.rank)
     seed_everything(int(config["seed"]) + distributed.rank)
