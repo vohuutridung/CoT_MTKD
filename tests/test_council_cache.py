@@ -120,9 +120,14 @@ class CouncilCacheTest(unittest.TestCase):
             loaded = CouncilCache(root, key).get("sample")
             for name in value:
                 torch.testing.assert_close(loaded[name], value[name], atol=0, rtol=0)
-            _, _, logq = unpack_cached_target(loaded)
+            _, _, logp = unpack_cached_target(loaded)
+            self.assertEqual(len(logp), len(names))
+            # Every expert's reduced (support + tail) distribution is normalized.
             torch.testing.assert_close(
-                logq.exp().sum(-1), torch.ones(len(logq)), atol=2e-7, rtol=2e-7
+                logp.exp().sum(-1),
+                torch.ones(logp.shape[:2], dtype=logp.dtype),
+                atol=2e-7,
+                rtol=2e-7,
             )
             with self.assertRaisesRegex(RuntimeError, "fingerprint mismatch"):
                 CouncilCache(root, "wrong")
@@ -145,8 +150,19 @@ class CouncilCacheTest(unittest.TestCase):
             changed = copy.deepcopy(config)
             changed["stage2"][field] = value
             self.assertEqual(original, fingerprint(cache_identity(changed, prepared, teachers)))
+        for field, value in (
+            ("sft_weight", 0.5),
+            ("kd_weight", 0.0),
+            ("rho_mapping", "constant"),
+            ("rho_constant", 0.0),
+            ("teachers", "best"),
+            ("loss_normalization", "step"),
+        ):
+            changed = copy.deepcopy(config)
+            changed["aggregation"][field] = value
+            self.assertEqual(original, fingerprint(cache_identity(changed, prepared, teachers)))
         changed = copy.deepcopy(config)
-        changed["aggregation"]["sft_weight"] = 0.5
+        changed["stage2"]["student_init"] = "best_expert"
         self.assertEqual(original, fingerprint(cache_identity(changed, prepared, teachers)))
         for section, field, value in (
             ("aggregation", "js_temperature", 2.0),
@@ -172,27 +188,69 @@ class CouncilCacheTest(unittest.TestCase):
             ("k_max", 64),
             ("sft_weight", -1),
             ("kd_temperature", float("nan")),
+            ("kd_weight", -1),
+            ("rho_mapping", "softmax"),
+            ("rho_constant", 0.5),
+            ("loss_normalization", "sample"),
+            ("teachers", ""),
         ):
             changed = copy.deepcopy(config)
             changed["aggregation"][field] = value
             with self.assertRaises(ValueError):
                 validate_council_config(changed)
+        changed = copy.deepcopy(config)
+        changed["aggregation"].update(rho_mapping="constant", rho_constant=1.5)
+        with self.assertRaises(ValueError):
+            validate_council_config(changed)
+        changed = copy.deepcopy(config)
+        changed["aggregation"].update(kd_weight=0.0, sft_weight=0.0)
+        with self.assertRaises(ValueError):
+            validate_council_config(changed)
+        changed = copy.deepcopy(config)
+        changed["stage2"]["student_init"] = "medoid"
+        with self.assertRaises(ValueError):
+            validate_council_config(changed)
+
+    def test_teacher_selection_resolves_council_best_and_named_expert(self):
+        from cot_mtkd.stage2.council_cache import resolve_teacher_indices
+
+        names = ["expert_0", "expert_1", "expert_2", "expert_3"]
+        self.assertEqual(resolve_teacher_indices("all", names, 2), [0, 1, 2, 3])
+        self.assertEqual(resolve_teacher_indices("best", names, 2), [2])
+        self.assertEqual(resolve_teacher_indices("expert_3", names, 2), [3])
+        with self.assertRaises(ValueError):
+            resolve_teacher_indices("expert_9", names, 2)
 
     def test_default_configs_and_global_batch_boundaries(self):
         import yaml
         from cot_mtkd.stage2.trainer import gradient_accumulation_steps, _validate_stage2_config
 
         root = Path(__file__).resolve().parents[1]
-        for filename in ("qwen25_7b_output_space.yaml", "qwen25_7b_output_space_local.yaml"):
+        outputs = set()
+        for filename in (
+            "qwen25_7b_output_space.yaml",
+            "qwen25_7b_output_space_local.yaml",
+            "qwen25_7b_output_space_geometric.yaml",
+            "qwen25_7b_output_space_arithmetic.yaml",
+            "qwen25_7b_output_space_single.yaml",
+            "qwen25_7b_output_space_sft.yaml",
+        ):
             config = yaml.safe_load((root / "configs" / "stage2" / filename).read_text())
             _validate_stage2_config(config)
             self.assertEqual(config["stage2"]["epochs"], 1)
             self.assertEqual(config["stage2"]["global_batch_size"], 8)
             self.assertEqual(config["stage2"]["micro_batch_size"], 1)
+            self.assertEqual(config["stage2"]["student_init"], "base")
             self.assertEqual(config["aggregation"]["js_temperature"], 1.0)
-            self.assertEqual(config["aggregation"]["kd_temperature"], 2.0)
-            self.assertEqual(config["aggregation"]["sft_weight"], 0.25)
+            self.assertEqual(config["aggregation"]["kd_temperature"], 1.0)
+            self.assertEqual(config["aggregation"]["loss_normalization"], "token")
             self.assertNotIn("medoid", config["paths"])
+            outputs.add(config["paths"]["output"])
+            if filename != "qwen25_7b_output_space_local.yaml":
+                # Controls share the main council cache and differ only at training time.
+                self.assertEqual(
+                    config["paths"]["teacher_cache_dir"], "artifacts/teacher_cache/output_space"
+                )
             for world, expected in ((1, 8), (2, 4), (4, 2), (8, 1)):
                 self.assertEqual(gradient_accumulation_steps(config["stage2"], world), expected)
             for world in (3, 16, 32, 0):
@@ -208,6 +266,7 @@ class CouncilCacheTest(unittest.TestCase):
             changed["micro_batch_size"] = 1.5
             with self.assertRaises(ValueError):
                 gradient_accumulation_steps(changed, 4)
+        self.assertEqual(len(outputs), 6)
 
     def test_initializer_copies_full_winning_adapter_and_instantiates_only_student(self):
         from types import SimpleNamespace
@@ -230,6 +289,8 @@ class CouncilCacheTest(unittest.TestCase):
             )
             config = output_config()
             config["model"], config["lora"], config["seed"] = {}, {}, 42
+            # Default (base): the fresh student LoRA is left untouched.
+            fresh = extract_adapter_state(model, "student")
             with patch(
                 "cot_mtkd.stage2.initialization.create_student_model", return_value=model
             ) as create:
@@ -237,6 +298,13 @@ class CouncilCacheTest(unittest.TestCase):
                     config, SimpleNamespace(device=torch.device("cpu")), cache
                 )
             create.assert_called_once_with({}, {}, torch.device("cpu"), 42)
+            for key, tensor in extract_adapter_state(actual, "student").items():
+                torch.testing.assert_close(tensor, fresh[key], atol=0, rtol=0)
+            config["stage2"]["student_init"] = "best_expert"
+            with patch("cot_mtkd.stage2.initialization.create_student_model", return_value=model):
+                actual, _, _ = create_cached_student(
+                    config, SimpleNamespace(device=torch.device("cpu")), cache
+                )
             for key, tensor in extract_adapter_state(actual, "student").items():
                 torch.testing.assert_close(tensor, winner[key], atol=0, rtol=0)
 

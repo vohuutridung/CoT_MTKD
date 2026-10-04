@@ -630,8 +630,19 @@ def main() -> None:
             # Synthetic trajectories cannot reuse the real record's target.
             # Precompute them separately, before any measured student iteration.
             prep_started = time.perf_counter()
+            from ..stage2.council_cache import resolve_teacher_indices
+
+            council_names = list(cache.manifest["adapter_names"])
+            config["_council"] = {
+                "js_reference": cache.js_reference,
+                "teacher_indices": resolve_teacher_indices(
+                    str(config["aggregation"].get("teachers", "all")),
+                    council_names,
+                    int(cache.manifest["selected_expert_index"]),
+                ),
+            }
             teachers, names = create_multi_adapter_model(
-                config["model"], config["lora"], 3, device, int(config["seed"])
+                config["model"], config["lora"], len(council_names), device, int(config["seed"])
             )
             bundle_path = Path(config["paths"]["stage1"]) / manifests["stage1"]["adapter_bundle"]
             bundle = load_adapter_bundle(bundle_path)

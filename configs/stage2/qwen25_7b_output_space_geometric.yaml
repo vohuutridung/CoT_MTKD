@@ -1,3 +1,5 @@
+# Control: fixed geometric mean (rho = 0) over the council.
+# Shares the council cache of qwen25_7b_output_space.yaml.
 schema_version: 2
 teacher_source:
   type: huggingface
@@ -36,8 +38,8 @@ aggregation:
   # ecdf: rho = rank of the step JS in the corpus, uniform on (0, 1].
   # linear: rho = JS / log M (old; median ~0.02, i.e. always geometric).
   # constant: rho = rho_constant (0 geometric, 1 arithmetic controls).
-  rho_mapping: ecdf
-  rho_constant: null
+  rho_mapping: constant
+  rho_constant: 0.0
   # all = council; best = single-expert control (lowest SFT expert); or an adapter name.
   teachers: all
   # token: each supervised token counts once; step: each step counts once (old).
@@ -75,4 +77,4 @@ paths:
   prepared: artifacts/prepared/s1k_1_1_cot_only
   stage1: artifacts/stage1/duyentl04_abc
   teacher_cache_dir: artifacts/teacher_cache/output_space
-  output: artifacts/stage2/output_space
+  output: artifacts/stage2/output_space_geometric

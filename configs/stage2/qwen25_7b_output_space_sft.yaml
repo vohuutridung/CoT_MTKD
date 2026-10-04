@@ -1,3 +1,5 @@
+# Control: plain SFT student on the same data and budget (no teachers).
+# Shares the council cache of qwen25_7b_output_space.yaml.
 schema_version: 2
 teacher_source:
   type: huggingface
@@ -31,8 +33,8 @@ aggregation:
   k_min: 8
   teacher_execution: precomputed_support_tail
   # Training-time keys (one cache serves every control below).
-  kd_weight: 1.0
-  sft_weight: 0.25
+  kd_weight: 0.0
+  sft_weight: 1.0
   # ecdf: rho = rank of the step JS in the corpus, uniform on (0, 1].
   # linear: rho = JS / log M (old; median ~0.02, i.e. always geometric).
   # constant: rho = rho_constant (0 geometric, 1 arithmetic controls).
@@ -75,4 +77,4 @@ paths:
   prepared: artifacts/prepared/s1k_1_1_cot_only
   stage1: artifacts/stage1/duyentl04_abc
   teacher_cache_dir: artifacts/teacher_cache/output_space
-  output: artifacts/stage2/output_space
+  output: artifacts/stage2/output_space_sft

@@ -27,14 +27,13 @@ from .output_space import plan_record
 from .output_space_losses import (
     local_js_log_distribution,
     normalized_js_disagreement,
-    power_mean_log_target,
     reduced_log_distribution,
     support_from_probes,
 )
 from .teachers import ensure_stage2_teachers, require_teacher_dataset
 
 LOGGER = logging.getLogger(__name__)
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 SUPPORT_SEMANTICS = "phase1-local-nontarget-kneedle-union-plus-gold-ascending-unique-v1"
 MASK_SEMANTICS = "complete-retained-REASONING-content-only-token-step-sample-v1"
 
@@ -50,6 +49,9 @@ def validate_council_config(config: dict[str, Any]) -> None:
         raise ValueError("Phase 2 reuses Phase-1 local Kneedle: search_k=512, k_min=8, no k_max")
     if a.get("teacher_execution") != "precomputed_support_tail":
         raise ValueError("Use precomputed_support_tail teacher execution")
+    validate_training_aggregation(a)
+    if config["stage2"].get("student_init", "base") not in STUDENT_INITS:
+        raise ValueError(f"stage2.student_init must be one of {STUDENT_INITS}")
     if any(key in a for key in ("temperature", "medoid_temperature", "k_max")):
         raise ValueError("Obsolete aggregation configuration")
     if any(
@@ -60,6 +62,44 @@ def validate_council_config(config: dict[str, Any]) -> None:
         raise ValueError("lm_head_chunk_tokens must be positive")
     if config["runtime"].get("preprocessing_hidden_storage", "cpu") not in ("cpu", "device"):
         raise ValueError("preprocessing_hidden_storage must be cpu or device")
+
+
+RHO_MAPPINGS = ("ecdf", "linear", "constant")
+LOSS_NORMALIZATIONS = ("token", "step")
+STUDENT_INITS = ("base", "best_expert")
+
+
+def validate_training_aggregation(a: dict[str, Any]) -> None:
+    """Training-time aggregation keys; none of them changes the cached teacher values."""
+    mapping = a.get("rho_mapping", "ecdf")
+    if mapping not in RHO_MAPPINGS:
+        raise ValueError(f"aggregation.rho_mapping must be one of {RHO_MAPPINGS}")
+    constant = a.get("rho_constant")
+    if (mapping == "constant") != (constant is not None):
+        raise ValueError("aggregation.rho_constant is required exactly for rho_mapping: constant")
+    if constant is not None and not (math.isfinite(float(constant)) and 0 <= float(constant) <= 1):
+        raise ValueError("aggregation.rho_constant must be in [0, 1]")
+    teachers = a.get("teachers", "all")
+    if not isinstance(teachers, str) or not teachers:
+        raise ValueError("aggregation.teachers must be 'all', 'best' or one adapter name")
+    weight = float(a.get("kd_weight", 1.0))
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError("aggregation.kd_weight must be finite and nonnegative")
+    if weight == 0 and float(a["sft_weight"]) == 0:
+        raise ValueError("aggregation.kd_weight and sft_weight cannot both be zero")
+    if a.get("loss_normalization", "token") not in LOSS_NORMALIZATIONS:
+        raise ValueError(f"aggregation.loss_normalization must be one of {LOSS_NORMALIZATIONS}")
+
+
+def resolve_teacher_indices(teachers: str, names: list[str], selected_index: int) -> list[int]:
+    """'all' is the council; 'best' or one adapter name is the single-teacher control."""
+    if teachers == "all":
+        return list(range(len(names)))
+    if teachers == "best":
+        return [int(selected_index)]
+    if teachers not in names:
+        raise ValueError(f"aggregation.teachers={teachers!r} is not a council adapter {names}")
+    return [names.index(teachers)]
 
 
 def cache_identity(config: dict[str, Any], prepared: dict, teachers: dict) -> dict:
@@ -96,7 +136,7 @@ def cache_identity(config: dict[str, Any], prepared: dict, teachers: dict) -> di
         "lm_head_chunk_tokens": int(config["runtime"]["lm_head_chunk_tokens"]),
         "support_semantics": SUPPORT_SEMANTICS,
         "mask_semantics": MASK_SEMANTICS,
-        "storage": "int32-ragged-support-float32-log-target-float64-js-rho-v1",
+        "storage": "int32-ragged-support-float32-expert-log-probs-float64-js-v2",
         "torch_version": str(torch.__version__),
     }
 
@@ -133,15 +173,17 @@ def distribution_summary(values: torch.Tensor) -> dict:
 def compile_record(
     model, names, record, config, device
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict]:
-    """One decoder forward/expert/sample; SFT scoring shares the q pass.
+    """One decoder forward/expert/sample; SFT scoring shares the reduced pass.
 
     The first bounded head sweep reuses full_vocab_probe (gold exclusion) and
     Phase-1 Kneedle. A second head sweep computes logZ and reduced categories.
-    Reduced teacher values survive only within one step until its rho is known.
-    No full teacher probability vector is constructed or persisted.
+    Each expert's reduced (support + tail) distribution is persisted, so the
+    rho mapping, the aggregation and the teacher subset are chosen at training
+    time without another teacher pass. No full probability vector is stored.
     """
-    if len(names) != 3:
-        raise ValueError("Phase 2 requires exactly three frozen experts")
+    if len(names) < 2:
+        raise ValueError("Phase 2 requires a council of at least two frozen experts")
+    experts = len(names)
     plan = plan_record(record, None, int(config["stage2"]["max_length"]))
     positions = [p for step in plan.step_positions for p in step]
     step_offsets = [0]
@@ -152,16 +194,15 @@ def compile_record(
         "step_offsets": torch.tensor(step_offsets, dtype=torch.int64),
         "support_offsets": torch.zeros(len(positions) + 1, dtype=torch.int64),
         "support_ids": torch.empty(0, dtype=torch.int32),
-        "support_log_target": torch.empty(0, dtype=torch.float32),
-        "tail_log_target": torch.empty(len(positions), dtype=torch.float32),
+        "expert_support_log_probs": torch.empty((experts, 0), dtype=torch.float32),
+        "expert_tail_log_probs": torch.empty((experts, len(positions)), dtype=torch.float32),
         "step_js": torch.empty(plan.num_steps, dtype=torch.float64),
-        "step_rho": torch.empty(plan.num_steps, dtype=torch.float64),
-        "raw_k": torch.empty((3, len(positions)), dtype=torch.int16),
-        "selected_k": torch.empty((3, len(positions)), dtype=torch.int16),
+        "raw_k": torch.empty((experts, len(positions)), dtype=torch.int16),
+        "selected_k": torch.empty((experts, len(positions)), dtype=torch.int16),
         "union_sizes": torch.empty(len(positions), dtype=torch.int16),
         "gold_present_before_add": torch.empty(len(positions), dtype=torch.bool),
     }
-    scores = torch.zeros(3, dtype=torch.float64)
+    scores = torch.zeros(experts, dtype=torch.float64)
     stats: dict[str, Any] = {"discarded_steps": plan.discarded_steps, "teacher_forward_count": 0}
     if not positions:
         return tensors, scores, stats
@@ -183,7 +224,7 @@ def compile_record(
     parameter = next(head.parameters())
     chunk = int(config["runtime"]["lm_head_chunk_tokens"])
     a = config["aggregation"]
-    all_ids, all_logq = [], []
+    all_ids, all_logp = [], []
     cursor = 0
     for step_index, step in enumerate(plan.step_positions):
         targets = torch.tensor([record.input_ids[p] for p in step], device=parameter.device)
@@ -205,7 +246,6 @@ def compile_record(
             int(a["k_min"]),
         )
         del probes
-        step_reduced = []
         js_sum = 0.0
         for start in range(0, len(step), chunk):
             end = min(len(step), start + chunk)
@@ -230,20 +270,20 @@ def compile_record(
                 ).squeeze(-1)
                 scores[expert] += nll.double().sum().cpu() / (len(step) * plan.num_steps)
                 del logits
-            js_sum += float(normalized_js_disagreement(torch.stack(js_values)).sum()) * math.log(3)
-            step_reduced.append(torch.stack(reduced).cpu())
-        js = js_sum / len(step)
-        rho = min(1.0, max(0.0, js / math.log(3)))
-        tensors["step_js"][step_index], tensors["step_rho"][step_index] = js, rho
-        # Ragged persistence: concatenate only valid support categories; tail
-        # remains one FP32 log probability per supervised token.
-        for chunk_index, start in enumerate(range(0, len(step), chunk)):
-            end = min(len(step), start + chunk)
-            q = power_mean_log_target(step_reduced[chunk_index], rho)
-            valid = mask[start:end].cpu()
-            all_ids.append(support[start:end].cpu()[valid].int())
-            all_logq.append(q[:, :-1][valid].float())
-            tensors["tail_log_target"][cursor + start : cursor + end] = q[:, -1].float()
+            js_sum += float(normalized_js_disagreement(torch.stack(js_values)).sum()) * math.log(
+                experts
+            )
+            # Ragged persistence: only valid support categories; the tail stays
+            # one FP32 log probability per expert and supervised token.
+            reduced = torch.stack(reduced).cpu()
+            valid = local_mask.cpu()
+            all_ids.append(local_ids.cpu()[valid].int())
+            all_logp.append(reduced[:, :, :-1][:, valid].float())
+            tensors["expert_tail_log_probs"][:, cursor + start : cursor + end] = reduced[
+                :, :, -1
+            ].float()
+            del reduced
+        tensors["step_js"][step_index] = js_sum / len(step)
         tensors["raw_k"][:, cursor : cursor + len(step)] = metadata["raw_k"].cpu().short()
         tensors["selected_k"][:, cursor : cursor + len(step)] = metadata["selected_k"].cpu().short()
         tensors["union_sizes"][cursor : cursor + len(step)] = metadata["union_sizes"].cpu().short()
@@ -256,7 +296,7 @@ def compile_record(
         ][cursor] + sizes.cumsum(0)
         cursor += len(step)
     tensors["support_ids"] = torch.cat(all_ids)
-    tensors["support_log_target"] = torch.cat(all_logq)
+    tensors["expert_support_log_probs"] = torch.cat(all_logp, dim=1)
     return tensors, scores, stats
 
 
@@ -293,6 +333,12 @@ class CouncilCache:
                 or self.manifest["selected_expert"] != self.manifest["adapter_names"][best]
             ):
                 raise RuntimeError("Council cache initialization selection mismatch")
+        self.js_reference = None
+        if "js_reference_file" in self.manifest:
+            path = require_file_sha256(
+                self.directory, self.manifest, "js_reference_file", "js_reference_file_sha256"
+            )
+            self.js_reference = load_file(str(path))["step_js_sorted"]
         self.verified: set[str] = set()
 
     def get(self, sample_id: str) -> dict[str, torch.Tensor]:
@@ -364,8 +410,8 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
     ):
         raise RuntimeError("Council tokenizer mismatch with prepared data/teachers")
     names = list(teachers["adapter_names"])
-    if len(names) != 3 or len(set(names)) != 3:
-        raise ValueError("Phase 2 requires three distinct experts")
+    if len(names) < 2 or len(set(names)) != len(names):
+        raise ValueError("Phase 2 requires at least two distinct experts")
     dataset = JsonlRecordDataset(data_path)
     if not len(dataset) or len(dataset) != int(prepared["records"]):
         raise RuntimeError("Prepared dataset record count mismatch")
@@ -384,7 +430,7 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
     for name in names:
         load_adapter_state(model, name, bundle[name])
     del bundle
-    sums = torch.zeros(3, device=distributed.device, dtype=torch.float64)
+    sums = torch.zeros(len(names), device=distributed.device, dtype=torch.float64)
     counts = torch.zeros(4, device=distributed.device, dtype=torch.int64)
     index = {}
     rank_stats = {}
@@ -439,8 +485,7 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
                 "support_size",
                 "union_size",
                 "js",
-                "rho",
-                "target_tail_mass",
+                "expert_tail_mass",
                 "raw_k",
                 "selected_k",
                 "gold_present",
@@ -452,8 +497,7 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
                 "support_size": v["support_offsets"].diff(),
                 "union_size": v["union_sizes"],
                 "js": v["step_js"],
-                "rho": v["step_rho"],
-                "target_tail_mass": v["tail_log_target"].exp(),
+                "expert_tail_mass": v["expert_tail_log_probs"].exp().flatten(),
                 "raw_k": v["raw_k"],
                 "selected_k": v["selected_k"],
                 "gold_present": v["gold_present_before_add"],
@@ -471,6 +515,12 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
             diagnostics[key + "_histogram_by_expert"] = [
                 torch.bincount(row.long(), minlength=513).tolist() for row in per_expert
             ]
+        # The corpus distribution of step JS defines the ECDF rho mapping.
+        js_reference = root / "js_reference.safetensors"
+        save_file(
+            {"step_js_sorted": torch.cat(summaries["js"]).double().sort().values.contiguous()},
+            str(js_reference),
+        )
         scores = sums / len(dataset)
         best = select_best_expert(scores)
         best_path = root / "best_expert.pt"
@@ -496,6 +546,8 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
             "initialization_scoring": MASK_SEMANTICS + "-temperature1",
             "index_file": "index.json",
             "index_file_sha256": file_sha256(root / "index.json"),
+            "js_reference_file": js_reference.name,
+            "js_reference_file_sha256": file_sha256(js_reference),
             "best_expert_file": best_path.name,
             "best_expert_file_sha256": file_sha256(best_path),
             "prepared_manifest_fingerprint": fingerprint(prepared),

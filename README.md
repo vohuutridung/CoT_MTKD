@@ -101,3 +101,45 @@ Meaning of each command:
 
 For either route, the student output directory contains `final/adapters/student/`,
 `checkpoint.pt`, `metrics.jsonl`, `performance.jsonl` and `reasoning_steps.jsonl`.
+
+### Phase 2 objective and controls
+
+The cache (version 2) stores every expert's reduced distribution (support + one
+tail bucket) and the step JS. The target is built at training time, so all
+runs below share one `stage2-cache`:
+
+- `rho_mapping: ecdf` sets ρ_s to the rank of the step JS among all corpus
+  steps, uniform on (0, 1]. The raw JS / log M of the `duyentl04/abc` council
+  has median ≈ 0.02, which makes the power mean the geometric mean on almost
+  every step.
+- `kd_temperature: 1`. At T = 2 about 64% of the target mass falls in the tail
+  bucket, so most of the KD signal only matches a single lumped probability.
+- `loss_normalization: token`. Equal step weights gave steps of ≤ 10 tokens
+  (2.8% of tokens, mostly "Wait," / "Hmm.") 18% of the loss.
+  ρ is still defined per step.
+- `student_init: base` starts the student from a fresh LoRA for one pass.
+  `best_expert` continues the lowest-SFT expert, which already saw the same
+  data for three epochs.
+
+Controls (same data, budget and cache; only the output directory differs):
+
+| Config | Target |
+| --- | --- |
+| `qwen25_7b_output_space.yaml` | council, ECDF ρ (method) |
+| `qwen25_7b_output_space_geometric.yaml` | council, ρ = 0 |
+| `qwen25_7b_output_space_arithmetic.yaml` | council, ρ = 1 |
+| `qwen25_7b_output_space_single.yaml` | lowest-SFT expert only (M = 1) |
+| `qwen25_7b_output_space_sft.yaml` | gold tokens only (plain SFT) |
+
+```bash
+export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space.yaml
+./project_commands.sh stage2-cache
+for c in "" _geometric _arithmetic _single _sft; do
+  STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space$c.yaml ./project_commands.sh stage2
+done
+```
+
+The old behaviour is `rho_mapping: linear`, `kd_temperature: 2.0`,
+`loss_normalization: step`, `student_init: best_expert` and `learning_rate: 2.0e-5`.
+Changing `kd_temperature` or `js_temperature` builds a new cache.
+The council size is read from the Phase-1 manifest (any M ≥ 2).

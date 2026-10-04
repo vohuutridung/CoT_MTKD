@@ -439,7 +439,8 @@ class Stage2UpdateTest(unittest.TestCase):
                 self.assertEqual(manifest["loss_scalars"]["examples"], 2)
                 self.assertEqual(manifest["loss_scalars"]["reasoning_steps"], 4)
                 self.assertEqual(
-                    manifest["initial_expert_adapter"], council_manifest["selected_expert"]
+                    manifest["initial_expert_adapter"],
+                    None if method == OUTPUT_SPACE_METHOD else council_manifest["selected_expert"],
                 )
                 bundle = torch.load(output / manifest["adapter_bundle"], weights_only=True)
                 self.assertEqual(set(bundle), {"student"})
@@ -460,13 +461,19 @@ class Stage2UpdateTest(unittest.TestCase):
                         self.assertEqual(row["run_fingerprint"], manifest["run_fingerprint"])
                         self.assertEqual(row["data_step_before"], 0)
                         self.assertEqual(row["global_step_before"], 0)
-                        self.assertEqual(row["rho"], row["js_normalized"])
-                        self.assertAlmostEqual(row["js_mean"], row["rho"] * math.log(3))
+                        self.assertAlmostEqual(row["js_mean"], row["js_normalized"] * math.log(3))
+                        # ECDF rho is the step's rank among the corpus step JS values.
+                        reference = council_manifest["diagnostics"]["js"]
+                        self.assertGreater(row["rho"], 0.0)
+                        self.assertLessEqual(row["rho"], 1.0)
+                        self.assertEqual(reference["count"], 4)
                     for record in records:
                         sample_rows = [row for row in rows if row["sample_id"] == record.sample_id]
                         self.assertEqual(len(sample_rows), 2)
+                        # Token normalization: the sample KD is the token-weighted step mean.
                         self.assertAlmostEqual(
-                            sum(row["step_kd_loss"] for row in sample_rows) / 2,
+                            sum(row["step_kd_loss"] * row["n_tokens"] for row in sample_rows)
+                            / sum(row["n_tokens"] for row in sample_rows),
                             sample_rows[0]["sample_kd_loss"],
                         )
                     self.assertEqual(

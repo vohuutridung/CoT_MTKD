@@ -1,3 +1,5 @@
+# Control: KD from the single lowest-SFT expert (M = 1), same budget.
+# Shares the council cache of qwen25_7b_output_space.yaml.
 schema_version: 2
 teacher_source:
   type: huggingface
@@ -39,7 +41,7 @@ aggregation:
   rho_mapping: ecdf
   rho_constant: null
   # all = council; best = single-expert control (lowest SFT expert); or an adapter name.
-  teachers: all
+  teachers: best
   # token: each supervised token counts once; step: each step counts once (old).
   loss_normalization: token
 logging:
@@ -75,4 +77,4 @@ paths:
   prepared: artifacts/prepared/s1k_1_1_cot_only
   stage1: artifacts/stage1/duyentl04_abc
   teacher_cache_dir: artifacts/teacher_cache/output_space
-  output: artifacts/stage2/output_space
+  output: artifacts/stage2/output_space_single

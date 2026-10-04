@@ -21,16 +21,25 @@ from cot_mtkd.stage2.output_space import compute_record_gradient, plan_record
 from cot_mtkd.stage2.trainer import OUTPUT_SPACE_METHOD
 
 
+# Corpus step-JS reference (nats) for the ECDF rho mapping in unit tests.
+JS_REFERENCE = torch.tensor([0.0, 1.0e-4, 1.0e-3, 1.0e-2, 5.0e-2, 0.1, 0.3], dtype=torch.float64)
+
+
 def output_config():
     return {
         "method": OUTPUT_SPACE_METHOD,
         "aggregation": {
             "js_temperature": 1.0,
             "kd_temperature": 2.0,
-            "sft_weight": 0.25,
             "search_k": 512,
             "k_min": 8,
             "teacher_execution": "precomputed_support_tail",
+            "kd_weight": 1.0,
+            "sft_weight": 0.25,
+            "rho_mapping": "ecdf",
+            "rho_constant": None,
+            "teachers": "all",
+            "loss_normalization": "token",
         },
         "stage2": {
             "max_length": 128,
@@ -41,11 +50,25 @@ def output_config():
         "runtime": {"lm_head_chunk_tokens": 2, "preprocessing_hidden_storage": "cpu"},
         "optimizer": {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0},
         "scheduler": {"warmup_ratio": 0.1, "min_lr_ratio": 0},
+        "_council": {"js_reference": JS_REFERENCE},
     }
 
 
+def reference_rho(ds, aggregation, experts, js_reference):
+    mapping = aggregation["rho_mapping"]
+    if mapping == "constant":
+        return float(aggregation["rho_constant"])
+    if mapping == "linear":
+        return min(1.0, float(ds / math.log(experts)))
+    return float((js_reference <= ds).sum()) / len(js_reference)
+
+
 def dense_reference(model, names, parameters, record, config):
-    """Independent full-model and dense softmax reference for new formulation."""
+    """Independent full-model and dense softmax reference for every aggregation mode."""
+    aggregation = config["aggregation"]
+    council = config.get("_council", {})
+    chosen = council.get("teacher_indices", list(range(len(names))))
+    temperature = aggregation["kd_temperature"]
     plan = plan_record(record, None, config["stage2"]["max_length"])
     positions = [p for step in plan.step_positions for p in step]
     indices = torch.tensor(positions) - 1
@@ -60,7 +83,7 @@ def dense_reference(model, names, parameters, record, config):
             teachers.append(model(input_ids=ids, use_cache=False).logits[0, indices].double())
     z = torch.stack(teachers)
     non_gold = z.clone()
-    non_gold.scatter_(2, gold[None, :, None].expand(3, -1, -1), -torch.inf)
+    non_gold.scatter_(2, gold[None, :, None].expand(len(names), -1, -1), -torch.inf)
     values, top = non_gold.topk(min(512, z.shape[-1] - 1), -1)
     k = torch.stack([local_k_from_probe(v, 8)[1] for v in values])
     union, mask = build_union_support(top, k)
@@ -69,7 +92,7 @@ def dense_reference(model, names, parameters, record, config):
     model.train()
     student = model(input_ids=ids, use_cache=False).logits[0, indices].float()
     cursor = 0
-    kd_steps, sft_steps, js_steps, init_steps = [], [], [], []
+    kd_steps, sft_steps, js_steps, init_steps, rho_steps = [], [], [], [], []
     for step in plan.step_positions:
         js_tokens, reduced = [], []
         for t in range(cursor, cursor + len(step)):
@@ -77,35 +100,48 @@ def dense_reference(model, names, parameters, record, config):
             pi = F.softmax(z[:, t, v], -1)
             mixture = pi.mean(0)
             js_tokens.append((pi * (pi.log() - mixture.log())).sum(-1).mean())
-            p = F.softmax(z[:, t] / 2.0, -1)
+            p = F.softmax(z[:, t] / temperature, -1)
             tail = p.clone()
             tail[:, v] = 0
             reduced.append(torch.cat([p[:, v], tail.sum(-1, keepdim=True)], -1))
         ds = torch.stack(js_tokens).mean()
-        rho = float(ds / math.log(3))
+        rho = reference_rho(ds, aggregation, len(names), council.get("js_reference"))
         js_steps.append(float(ds))
+        rho_steps.append(rho)
         kd_tokens = []
         for t, r in zip(range(cursor, cursor + len(step)), reduced, strict=True):
-            q = r.log().mean(0).exp() if rho == 0 else r.pow(rho).mean(0).pow(1 / rho)
+            r = r[chosen]
+            if len(chosen) == 1:
+                q = r[0]
+            else:
+                q = r.log().mean(0).exp() if rho == 0 else r.pow(rho).mean(0).pow(1 / rho)
             q = q / q.sum()
-            p = F.softmax(student[t] / 2.0, -1)
+            p = F.softmax(student[t] / temperature, -1)
             outside = torch.ones_like(p, dtype=torch.bool)
             outside[support[t]] = False
             rs = torch.cat([p[support[t]], p[outside].sum()[None]])
-            kd_tokens.append(4 * (q * (q.log() - rs.log())).sum())
-        kd_steps.append(torch.stack(kd_tokens).mean())
+            kd_tokens.append(temperature**2 * (q * (q.log() - rs.log())).sum())
+        kd_steps.append(torch.stack(kd_tokens))
         sft_steps.append(
-            F.cross_entropy(student[cursor : cursor + len(step)], gold[cursor : cursor + len(step)])
+            F.cross_entropy(
+                student[cursor : cursor + len(step)],
+                gold[cursor : cursor + len(step)],
+                reduction="none",
+            )
         )
         init_steps.append(
             -F.log_softmax(z[:, cursor : cursor + len(step)], -1)
-            .gather(-1, gold[cursor : cursor + len(step)][None, :, None].expand(3, -1, -1))
+            .gather(-1, gold[cursor : cursor + len(step)][None, :, None].expand(len(names), -1, -1))
             .squeeze(-1)
             .mean(-1)
         )
         cursor += len(step)
-    kd, sft = torch.stack(kd_steps).mean(), torch.stack(sft_steps).mean()
-    loss = kd + config["aggregation"]["sft_weight"] * sft
+    if aggregation["loss_normalization"] == "token":
+        kd, sft = torch.cat(kd_steps).mean(), torch.cat(sft_steps).mean()
+    else:
+        kd = torch.stack([v.mean() for v in kd_steps]).mean()
+        sft = torch.stack([v.mean() for v in sft_steps]).mean()
+    loss = aggregation["kd_weight"] * kd + aggregation["sft_weight"] * sft
     return (
         float(loss.detach()),
         [g.detach() for g in torch.autograd.grad(loss, parameters)],
@@ -113,6 +149,7 @@ def dense_reference(model, names, parameters, record, config):
         torch.stack(init_steps).mean(0),
         float(kd.detach()),
         float(sft.detach()),
+        rho_steps,
     )
 
 
@@ -183,6 +220,81 @@ class CachedOutputSpaceTest(unittest.TestCase):
         expected = dense_reference(model, names, params, record, config)
         for g, e in zip(result.gradients, expected[1], strict=True):
             torch.testing.assert_close(g, e, atol=5e-7, rtol=3e-4)
+
+    def test_every_aggregation_mode_matches_dense_reference(self):
+        record = two_step_record()
+        model, names, params = tiny_online_council(False)
+        base = output_config()
+        target, _, _ = compile_record(model, names, record, base, torch.device("cpu"))
+        variants = {
+            "old_linear_step": {"rho_mapping": "linear", "loss_normalization": "step"},
+            "geometric": {"rho_mapping": "constant", "rho_constant": 0.0},
+            "arithmetic": {"rho_mapping": "constant", "rho_constant": 1.0},
+            "single_expert": {"teachers": "expert_1"},
+            "sft_only": {"kd_weight": 0.0, "sft_weight": 1.0},
+            "kd_temperature_1": {"kd_temperature": 1.0},
+        }
+        for label, changes in variants.items():
+            with self.subTest(label):
+                config = output_config()
+                config["aggregation"].update(changes)
+                if label == "single_expert":
+                    config["_council"]["teacher_indices"] = [1]
+                cached = target
+                if label == "kd_temperature_1":
+                    cached, _, _ = compile_record(model, names, record, config, torch.device("cpu"))
+                result = compute_record_gradient(
+                    model,
+                    names,
+                    params,
+                    record,
+                    None,
+                    config,
+                    torch.device("cpu"),
+                    cached_target=cached,
+                )
+                expected = dense_reference(model, names, params, record, config)
+                self.assertAlmostEqual(result.loss, expected[0], delta=1e-6)
+                rows = result.step_metrics
+                for actual, wanted in zip([row["rho"] for row in rows], expected[6], strict=True):
+                    self.assertAlmostEqual(actual, wanted, delta=1e-9)
+                for g, e in zip(result.gradients, expected[1], strict=True):
+                    torch.testing.assert_close(g, e, atol=5e-7, rtol=3e-4)
+                if label == "single_expert":
+                    self.assertEqual({row["teacher_count"] for row in result.step_metrics}, {1})
+
+    def test_council_size_is_not_fixed_to_three(self):
+        record, config = two_step_record(), output_config()
+        model, names, params = tiny_online_council(False)
+        pair = names[:2]
+        target, scores, _ = compile_record(model, pair, record, config, torch.device("cpu"))
+        self.assertEqual(target["expert_support_log_probs"].shape[0], 2)
+        self.assertEqual(target["raw_k"].shape[0], 2)
+        self.assertEqual(len(scores), 2)
+        result = compute_record_gradient(
+            model, pair, params, record, None, config, torch.device("cpu"), cached_target=target
+        )
+        expected = dense_reference(model, pair, params, record, config)
+        self.assertAlmostEqual(result.loss, expected[0], delta=1e-6)
+        for g, e in zip(result.gradients, expected[1], strict=True):
+            torch.testing.assert_close(g, e, atol=5e-7, rtol=3e-4)
+        with self.assertRaisesRegex(ValueError, "at least two"):
+            compile_record(model, names[:1], record, config, torch.device("cpu"))
+
+    def test_ecdf_rho_is_rank_uniform_whatever_the_js_scale(self):
+        from cot_mtkd.stage2.output_space import map_step_rho
+
+        aggregation = {"rho_mapping": "ecdf"}
+        reference = torch.tensor([1e-4, 2e-4, 3e-4, 4e-4], dtype=torch.float64)
+        queries = torch.tensor([1e-4, 2.5e-4, 4e-4, 1.0], dtype=torch.float64)
+        rho = map_step_rho(queries, aggregation, 3, reference)
+        torch.testing.assert_close(rho, torch.tensor([0.25, 0.5, 1.0, 1.0], dtype=torch.float64))
+        # The same ranks at a 1000x larger scale give the same rho.
+        torch.testing.assert_close(
+            map_step_rho(queries * 1000, aggregation, 3, reference * 1000), rho
+        )
+        with self.assertRaisesRegex(RuntimeError, "JS reference"):
+            map_step_rho(torch.tensor([0.1]), aggregation, 3, None)
 
     def test_planner_uses_only_content_and_complete_steps(self):
         record = two_step_record()

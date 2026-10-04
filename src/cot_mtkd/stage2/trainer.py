@@ -263,6 +263,18 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
 
     cache = load_council_cache(config, prepared, stage1)
     council = cache.manifest
+    if method == OUTPUT_SPACE_METHOD:
+        from .council_cache import resolve_teacher_indices
+
+        # Runtime-only state ("_" keys never enter the config fingerprint).
+        config["_council"] = {
+            "js_reference": cache.js_reference,
+            "teacher_indices": resolve_teacher_indices(
+                str(config["aggregation"].get("teachers", "all")),
+                list(council["adapter_names"]),
+                int(council["selected_expert_index"]),
+            ),
+        }
     data_path = require_file_sha256(prepared_dir, prepared, "data_file", "data_file_sha256")
     for root, manifest, pairs in (
         (
@@ -324,7 +336,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
         write_config_snapshot(output_dir / "config.yaml", public_config)
     barrier()
     if method == OUTPUT_SPACE_METHOD:
-        from .initialization import create_cached_student
+        from .initialization import create_cached_student, initial_adapter_name
 
         model, adapter_names, parameters = create_cached_student(config, distributed, cache)
     else:
@@ -625,7 +637,11 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             "training_checkpoint": checkpoint.name,
             "training_checkpoint_sha256": file_sha256(checkpoint),
             "student_adapter": "student",
-            "initial_expert_adapter": council["selected_expert"],
+            "initial_expert_adapter": (
+                initial_adapter_name(config, council)
+                if method == OUTPUT_SPACE_METHOD
+                else council["selected_expert"]
+            ),
             "expert_sft_scores": council["expert_sft_scores"],
             "adapter_bundle": str(bundle.relative_to(output_dir)),
             "adapter_bundle_sha256": file_sha256(bundle),

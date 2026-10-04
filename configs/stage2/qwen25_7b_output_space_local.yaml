@@ -16,18 +16,33 @@ lora:
   dropout: 0.0
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 aggregation:
+  # Cache keys (changing them rebuilds the teacher cache).
   js_temperature: 1.0
-  kd_temperature: 2.0
-  sft_weight: 0.25
+  # T=1: at T=2 about 64% of the target mass sat in the single tail bucket.
+  kd_temperature: 1.0
   search_k: 512
   k_min: 8
   teacher_execution: precomputed_support_tail
+  # Training-time keys (one cache serves every control below).
+  kd_weight: 1.0
+  sft_weight: 0.25
+  # ecdf: rho = rank of the step JS in the corpus, uniform on (0, 1].
+  # linear: rho = JS / log M (old; median ~0.02, i.e. always geometric).
+  # constant: rho = rho_constant (0 geometric, 1 arithmetic controls).
+  rho_mapping: ecdf
+  rho_constant: null
+  # all = council; best = single-expert control (lowest SFT expert); or an adapter name.
+  teachers: all
+  # token: each supervised token counts once; step: each step counts once (old).
+  loss_normalization: token
 logging:
   reasoning_steps: true
   performance: true
 stage2:
+  # base: fresh LoRA, one pass; best_expert: continue the lowest-SFT expert (old).
+  student_init: base
   epochs: 1
-  learning_rate: 2.0e-5
+  learning_rate: 5.0e-5
   micro_batch_size: 1
   global_batch_size: 8
   gradient_accumulation_steps: null

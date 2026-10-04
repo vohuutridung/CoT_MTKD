@@ -265,6 +265,8 @@ def cached_kd_sft_hidden_gradient(
     sft_weight: float,
     chunk_tokens: int,
     anomalies: dict[str, int] | None = None,
+    *,
+    kd_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Bounded head chunks, one combined KD+SFT hidden cotangent per sample.
 
@@ -274,6 +276,8 @@ def cached_kd_sft_hidden_gradient(
     """
     if chunk_tokens < 1 or not math.isfinite(sft_weight) or sft_weight < 0:
         raise ValueError("Invalid chunk_tokens or sft_weight")
+    if not math.isfinite(kd_weight) or kd_weight < 0:
+        raise ValueError("Invalid kd_weight")
     parameter = next(head.parameters())
     gradient = torch.zeros_like(student_hidden)
     diagnostics: dict[str, list[torch.Tensor]] = {
@@ -297,7 +301,9 @@ def cached_kd_sft_hidden_gradient(
             kd_temperature,
             anomalies,
         )
-        objective = ((kd + sft_weight * sft) * token_weights[start:end].to(parameter.device)).sum()
+        objective = (
+            (kd_weight * kd + sft_weight * sft) * token_weights[start:end].to(parameter.device)
+        ).sum()
         gradient[start:end] = torch.autograd.grad(objective, hidden)[0].to(gradient.dtype)
         for key, value in zip(diagnostics, (kd, sft, tail, entropy), strict=True):
             diagnostics[key].append(value.detach().cpu())
