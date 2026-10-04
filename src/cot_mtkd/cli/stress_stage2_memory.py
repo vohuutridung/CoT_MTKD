@@ -13,6 +13,7 @@ from typing import Any
 import torch
 
 from ..config import load_config
+from .common import set_process_title
 from ..data.dataset import JsonlRecordDataset
 from ..data.prepare import tokenizer_fingerprint
 from ..data.schema import PreparedRecord, TokenRegion
@@ -499,6 +500,7 @@ def main() -> None:
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--min-headroom-gib", type=float, default=12.0)
     arguments = parser.parse_args()
+    set_process_title()
     if arguments.warmup < 0 or arguments.repetitions <= 0:
         parser.error("--warmup must be nonnegative and --repetitions must be positive")
     if not math.isfinite(arguments.min_headroom_gib) or arguments.min_headroom_gib < 0:

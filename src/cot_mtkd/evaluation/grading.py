@@ -1,100 +1,84 @@
+"""Answer grading identical to the exp_s1k P-ALIGN evaluation (``eval/grade.py``).
+
+The reference answer is wrapped in ``\\boxed{}`` before ``math_verify`` parses it,
+because raw LaTeX such as ``\\left( 3, \\frac{\\pi}{2} \\right)`` is otherwise
+parsed incompletely and correct predictions are rejected. When ``math_verify``
+does not confirm a match, a normalized string comparison of the last boxed
+answer (or the last number) is used.
+"""
+
 from __future__ import annotations
 
-import contextlib
+import math
 import re
-import signal
-import threading
-from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Optional, Sequence
+
+_BOXED = re.compile(r"\\boxed\s*{")
+_NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+
+try:
+    from math_verify import parse as mv_parse
+    from math_verify import verify as mv_verify
+
+    HAS_MATH_VERIFY = True
+except Exception:  # pragma: no cover - math-verify is a declared dependency
+    HAS_MATH_VERIFY = False
 
 
-class GradingTimeout(TimeoutError):
-    pass
-
-
-@contextlib.contextmanager
-def grading_deadline(seconds: float):
-    """Bound symbolic grading on Unix while remaining safe off the main thread."""
-    can_alarm = (
-        seconds > 0
-        and threading.current_thread() is threading.main_thread()
-        and hasattr(signal, "setitimer")
-    )
-    if not can_alarm:
-        yield
-        return
-
-    def _raise_timeout(signum, frame):
-        del signum, frame
-        raise GradingTimeout("Mathematical grading exceeded its deadline")
-
-    previous_handler = signal.getsignal(signal.SIGALRM)
-    previous_timer = signal.getitimer(signal.ITIMER_REAL)
-    signal.signal(signal.SIGALRM, _raise_timeout)
-    signal.setitimer(signal.ITIMER_REAL, float(seconds))
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
-        signal.signal(signal.SIGALRM, previous_handler)
-
-
-def extract_boxed(text: str) -> str | None:
-    marker = r"\boxed{"
-    start = text.rfind(marker)
-    if start < 0:
+def extract_boxed(text: str) -> Optional[str]:
+    """Return the content of the last ``\\boxed{...}``, matching nested braces."""
+    matches = list(_BOXED.finditer(text))
+    if not matches:
         return None
-    cursor = start + len(marker)
-    depth = 1
-    while cursor < len(text):
-        if text[cursor] == "{":
+    start = matches[-1].end()
+    depth, out = 1, []
+    for char in text[start:]:
+        if char == "{":
             depth += 1
-        elif text[cursor] == "}":
+        elif char == "}":
             depth -= 1
             if depth == 0:
-                return text[start + len(marker) : cursor].strip()
-        cursor += 1
-    return None
+                break
+        out.append(char)
+    return "".join(out).strip() or None
 
 
-def normalize_answer(value: Any) -> str:
-    text = str(value).strip()
-    boxed = extract_boxed(text)
-    if boxed is not None:
-        text = boxed
-    text = text.replace("$", "").replace("\\,", "").strip()
-    text = re.sub(r"\s+", "", text)
-    text = text.removeprefix("Answer:").removeprefix("answer:")
-    return text
-
-
-def _equivalent_normalized_numbers(left: str, right: str) -> bool:
+def normalize(value: str) -> str:
+    value = value.strip().rstrip(".").replace(" ", "").replace(",", "")
+    value = value.replace("\\left", "").replace("\\right", "")
+    value = value.replace("\\!", "").replace("\\,", "").replace("$", "")
+    value = re.sub(r"\\text\{([^}]*)\}", r"\1", value)
+    if value.endswith("%"):
+        value = value[:-1]
     try:
-        return Decimal(left) == Decimal(right)
-    except InvalidOperation:
-        return False
+        number = float(value)
+        if math.isinf(number) or math.isnan(number):
+            return value
+        return str(int(number)) if number == int(number) else str(number)
+    except (ValueError, OverflowError):
+        return value
 
 
-def grade_math(
-    candidate: str,
-    reference: Any,
-    prefer_math_verify: bool = True,
-    timeout_seconds: float = 10.0,
-) -> bool:
-    if prefer_math_verify:
+def grade_answer(prediction: str, gold: Any) -> bool:
+    """True when ``prediction`` contains an answer equivalent to ``gold``."""
+    gold = str(gold)
+    if HAS_MATH_VERIFY:
         try:
-            from math_verify import parse, verify
-
-            with grading_deadline(timeout_seconds):
-                reference_parsed = parse(str(reference))
-                candidate_parsed = parse(candidate)
-                if reference_parsed and candidate_parsed:
-                    return bool(verify(reference_parsed, candidate_parsed))
-        except (ImportError, RuntimeError, ValueError, TypeError, GradingTimeout):
+            gold_parsed = mv_parse(gold if "\\boxed" in gold else f"\\boxed{{{gold}}}")
+            pred_parsed = mv_parse(prediction)
+            if gold_parsed and pred_parsed and mv_verify(gold_parsed, pred_parsed):
+                return True
+        except Exception:
             pass
-    normalized_candidate = normalize_answer(candidate)
-    normalized_reference = normalize_answer(reference)
-    return (
-        normalized_candidate == normalized_reference
-        or _equivalent_normalized_numbers(normalized_candidate, normalized_reference)
-    )
+    pred_boxed = extract_boxed(prediction)
+    if pred_boxed is None:
+        numbers = _NUMBER.findall(prediction)
+        pred_boxed = numbers[-1] if numbers else None
+    if pred_boxed is None:
+        return False
+    gold_boxed = extract_boxed(gold) or gold
+    return normalize(pred_boxed) == normalize(gold_boxed)
+
+
+def grade_samples(predictions: Sequence[str], gold: Any) -> list[bool]:
+    return [grade_answer(prediction, gold) for prediction in predictions]

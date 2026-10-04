@@ -15,6 +15,13 @@ else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
 
+# Evaluation uses its own venv (vLLM pins its own torch); fall back to the training one.
+if [[ -x "$PROJECT_ROOT/.venv-eval/bin/python" ]]; then
+  EVAL_PYTHON_BIN="$PROJECT_ROOT/.venv-eval/bin/python"
+else
+  EVAL_PYTHON_BIN="$PYTHON_BIN"
+fi
+
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 
 run_distributed() {
