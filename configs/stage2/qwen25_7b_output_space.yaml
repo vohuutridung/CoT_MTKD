@@ -54,7 +54,7 @@ runtime:
   teacher_probability_cache_gib: 8.0
   dataloader_workers: 0
 paths:
-  prepared: artifacts/prepared/s1k_1_1
+  prepared: artifacts/prepared/s1k_1_1_cot_only
   stage1: artifacts/stage1/duyentl04_abc
   medoid: artifacts/stage2_medoid/output_space
   output: artifacts/stage2/output_space

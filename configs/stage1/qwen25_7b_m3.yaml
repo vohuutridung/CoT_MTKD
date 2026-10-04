@@ -13,25 +13,25 @@ lora:
   dropout: 0.05
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 stage1:
+  objective: sft_dpp_rbf
   num_experts: 3
   forward_mode: one_pass
   epochs: 3
   learning_rate: 5.0e-5
   micro_batch_size: 1
-  global_batch_size: 32
+  global_batch_size: 16
   gradient_accumulation_steps: null
   dpp_weight: 0.2
-  rbf_weight: 1.0
-  interaction_off_until: 0.10
-  interaction_ramp_until: 0.30
+  # Starting value for the uncapped mean-pair RBF loss; tune using gradient ratios.
+  rbf_weight: 0.01
+  interaction_mode: full
   max_grad_norm: 1.0
   checkpoint_every_steps: 10
   log_every_steps: 1
   resume_from: null
 kneedle:
-  probe_k: 512
-  min_k: 3
-  max_k: 128
+  search_k: 512
+  k_min: 8
 dpp:
   jitter: 1.0e-4
   max_jitter: 1.0e-2
@@ -54,5 +54,5 @@ runtime:
   probe_hidden_device: cuda
   deterministic_algorithms: false
 paths:
-  prepared: artifacts/prepared/s1k_1_1
+  prepared: artifacts/prepared/s1k_1_1_cot_only
   output: artifacts/stage1/main

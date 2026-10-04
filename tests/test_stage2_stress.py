@@ -62,7 +62,6 @@ def stress_record() -> PreparedRecord:
         step_ids=[-1] * 3 + [0] * 5 + [1] * 3 + [-1] * 3,
         question="question",
         thinking="first\n\nsecond",
-        attempt="non-gold attempt",
         solution="gold",
         deepseek_grade=None,
         original_length=len(ids),
@@ -203,7 +202,6 @@ class Stage2StressTest(unittest.TestCase):
         original = plan_record(record, tokenizer, 32)
         synthetic, plan = make_synthetic_record(record, tokenizer, 32)
         self.assertEqual(synthetic.solution, record.solution)
-        self.assertEqual(synthetic.attempt, record.attempt)
         self.assertEqual(plan.solution, original.solution)
         self.assertEqual(plan.num_steps, 2)
         self.assertEqual(plan.discarded_steps, 0)

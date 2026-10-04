@@ -1,4 +1,4 @@
-# GAC-CoT-MTKD
+# CoT-MTKD
 
 Train three LoRA experts and distill them into one student adapter.
 
@@ -49,10 +49,17 @@ Purpose of each command above:
    by Phase 1 in `artifacts/stage1/main`. It also selects separate local-teacher
    medoid and student output directories.
 2. `prepare` downloads the pinned s1K-1.1 dataset and Qwen tokenizer, serializes
-   the fixed DeepSeek trajectories, and records token regions and reasoning-step
-   boundaries in `artifacts/prepared/s1k_1_1` for both phases.
+   only `deepseek_thinking_trajectory` (including its own final answer), and records
+   token regions and reasoning-step boundaries in `artifacts/prepared/s1k_1_1_cot_only`
+   for both phases. It excludes the four verified incomplete trajectories
+   `s1k-0135`, `s1k-0324`, `s1k-0392`, and `s1k-0438`, retaining 996 samples
+   with their original IDs. `deepseek_attempt` is never read or appended.
+   Responses end directly with EOS after the CoT; prompt tokens remain masked.
+   The 32,768-token limit rejects oversized responses to preserve their final
+   answer. Rerun `prepare` after this change; old artifacts containing `attempt`
+   are rejected, and checkpoints tied to the old corpus cannot be resumed.
 3. `stage1-stress` checks Phase-1 VRAM on the longest real example and synthetic
-   32k examples, including SFT, ramp and full training paths. It uses a temporary
+   32k examples, with every Phase-1 interaction enabled. It uses a temporary
    model and writes `artifacts/stage1/stress_memory.json`.
 4. `stage1` trains the three LoRA experts and saves their adapter bundle,
    checkpoint and manifest in `artifacts/stage1/main`.
@@ -145,20 +152,99 @@ NPROC_PER_NODE=8 ./project_commands.sh evaluate
 
 The stress commands require one visible H200 rather than a distributed launch.
 
+## Phase 1 adaptive non-target support
+
+Phase 1 uses **local Kneedle over the top-512 non-target logits**. Each expert
+excludes the observed target and probes `K = min(search_k, vocabulary_size - 1)`
+descending candidates. For one-based rank `j`, both axes use that same window:
+
+```text
+x_j = (j - 1) / (K - 1)
+u_j = (z_j - z_K) / (z_1 - z_K + epsilon)
+raw_k = 1 + argmax((1 - x) - u)       # argmax uses zero-based indices
+k = min(K, max(raw_k, k_min))
+```
+
+The default configuration is `kneedle.search_k: 512`, `kneedle.k_min: 8`.
+There is no additional upper clipping. A single candidate gives `raw_k = k = 1`;
+when `K < 8`, all available candidates are retained. Flat logits select the
+first raw rank before applying the lower bound; ties select the first maximum.
+Each expert retains its own top-`k` candidates, then DPP uses the detached union
+of these supports. With three experts, this union can contain up to 1,536 token
+identities. The step-level DPP objective uses this shared union support.
+
+`artifacts/stage1/main/metrics.jsonl` records `mean_raw_k`, `mean_selected_k`,
+`raw_k_histogram`, `selected_k_histogram`, `support_selection_count`, and
+`probe_saturation_rate`. Histogram index is the raw/final support size; counts
+sum across experts, accumulated microbatches and distributed ranks for that
+optimizer update. Batches with no reasoning tokens have zero counts. Saturation counts raw knees
+at the last available candidate, including windows smaller than 512.
+
+This support-selection change alters the training method and its configuration
+fingerprint; start a new Phase-1 run rather than resuming a checkpoint produced
+with the earlier criterion. Check H200 memory again for the larger union support.
+
+## Phase 1 scalar objective
+
+Phase 1 minimizes the sum of the three experts' SFT losses plus output-space
+DPP and effective-update RBF repulsion:
+
+```math
+L = \sum_{m=1}^{M} L_{\mathrm{SFT}}^{(m)}
+  + 0.2 L_{\mathrm{DPP}} + 0.01 L_{\mathrm{RBF}},
+\qquad
+L_{\mathrm{RBF}} = \frac{1}{\binom{M}{2}}\sum_{m<q}e^{-D_{mq}/h}.
+```
+
+For each LoRA module, `Delta W = (alpha/r) B A`. `D_mq` is the mean across
+modules of squared Frobenius distances divided by the module's output/input
+dimension product. The low-rank calculation keeps both A and B in the autograd
+graph without materializing a full `B A` matrix. Minimizing the mean pairwise
+kernel produces repulsion through each expert's own factors.
+
+SFT keeps its global response-token mean per expert. DPP keeps its step means
+within each reasoning-bearing example, then its global example mean. RBF is
+evaluated once per optimizer window, after task-gradient accumulation and
+distributed reduction; its gradient is added once without a microbatch/world-size
+multiplier. Each expert receives its own SFT/DPP gradient plus the weighted RBF
+loss gradient, followed by total-gradient norm clipping at `1.0` and AdamW.
+
+`h` uses the existing median-distance/log(M+1) heuristic, EMA decay `0.9`, and
+floor `1e-12`. The EMA estimate is detached and fixed during each backward, so
+this is a scalar objective conditional on that update's bandwidth. With all
+initial B factors zero, effective updates coincide: RBF loss is 1 and its gradient
+is zero on the initial update; the loss remains enabled throughout training.
+
+`stage1.rbf_weight: 0.01` is a conservative starting value for the uncapped loss,
+not a tuned result. Logs include `rbf_loss`, `weighted_rbf_loss`, `phase1_loss`,
+`task_gradient_norms`, `rbf_gradient_norms`, `weighted_rbf_gradient_norms`, and
+`rbf_task_gradient_ratios`. The ratio for expert m is
+`||lambda_R grad L_RBF|| / max(||grad(SFT_m + lambda_D DPP)||, 1e-12)` before
+final clipping. Use it with competence/diversity metrics when tuning lambda_R.
+`sft_nll` is the average expert NLL for logging; `phase1_loss` uses their sum.
+The scalar-objective identity is included in the run fingerprint and manifest.
+
+The corpus has 996 fixed CoT-only examples. With three epochs, global batch 16,
+microbatch 1, and accumulation crossing epoch boundaries, the default run has
+187 optimizer updates. Expert seeds remain 42/43/44, lambda_D remains 0.2, and
+the local Kneedle/union support and Phase-2 objectives keep their current definitions.
+
 ## Phase 1 forward mode and H200 memory check
 
 Phase 1 uses one forward per expert by default. The existing two-pass replay
 remains available with `STAGE1_FORWARD_MODE=two_pass ./project_commands.sh stage1`.
-The first 10% of optimizer updates use SFT alone. During the 10–30% ramp,
-SFT and DPP use separate transformer VJPs; after 30%, they share one VJP.
-The combined path preserves the original global token and sample normalizers.
+Phase 1 uses `stage1.interaction_mode: full`: SFT, DPP, and RBF loss are active
+from the first optimizer update through the last, with interaction strength 1.
+SFT and weighted DPP share one transformer VJP, preserving the original global
+token and sample normalizers. The cosine learning-rate schedule and its 10%
+warm-up are unchanged; they do not disable any objective or interaction.
 
 After preparing the dataset and before full H200 training, run
 `./project_commands.sh stage1-stress` with exactly one H200 visible. It executes
-six cases: SFT, ramp, and full paths for both the longest prepared real sample
-and a synthetic 32,768-token extension of its reasoning. SFT skips probe/DPP/RBF;
-ramp retains separate SFT/DPP transformer VJPs and gradient buffers; full uses
-the normalized combined task gradient and one transformer VJP. The default
+two full-interaction cases: the longest prepared real sample and a synthetic
+32,768-token extension of its reasoning. Both use the normalized combined task
+gradient and one transformer VJP, with DPP and RBF loss active from the first
+warm-up iteration. The default
 config keeps gradient checkpointing enabled, places probe/support on CUDA, and
 uses `lm_head_chunk_tokens: 32768` while retaining configurable head chunking.
 
@@ -168,11 +254,11 @@ repetitions must be positive). The report at `artifacts/stage1/stress_memory.jso
 records peak allocated/reserved VRAM across warm-up and measurement, plus measured
 times and completion counters. Times are for **one sample/microbatch including
 an optimizer update**, not a training update accumulating the global batch of
-32 samples. These longest-sample timings do not estimate the complete training run.
+16 samples. These longest-sample timings do not estimate the complete training run.
 
 A worst reserved peak below 110 GiB is marked ready for one-pass; 110–120 GiB
 asks for review; 120 GiB or more, or any CUDA OOM, recommends the two-pass fallback
-and exits with status 2. All six cases must complete before the preflight is ready.
+and exits with status 2. Both cases must complete before the preflight is ready.
 Stress updates affect only the temporary model in that process; no training
 checkpoint or adapters are saved.
 
@@ -287,7 +373,9 @@ L_B
 
 The implementation currently uses reasoning content tokens for `T_s`.
 Delimiters remain in the teacher-forced prefixes but have no KD target; assistant
-control, answer and EOS tokens have no Phase-2 loss. Only complete reasoning
+control and EOS tokens have no Phase-2 loss. The final answer already inside
+`deepseek_thinking_trajectory` remains reasoning content and participates in KD;
+there is no separate answer block from `deepseek_attempt`. Only complete reasoning
 steps fitting the 32,768-token trajectory context are retained. Gold solutions
 are not used for a task anchor or an SFT objective. Every retained step
 participates in KD, including steps with zero disagreement. An example with no

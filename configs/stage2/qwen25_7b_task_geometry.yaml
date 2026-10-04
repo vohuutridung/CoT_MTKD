@@ -51,7 +51,7 @@ runtime:
   lm_head_chunk_tokens: 64
   dataloader_workers: 0
 paths:
-  prepared: artifacts/prepared/s1k_1_1
+  prepared: artifacts/prepared/s1k_1_1_cot_only
   stage1: artifacts/stage1/duyentl04_abc
   medoid: artifacts/stage2_medoid/main
   output: artifacts/stage2/task_geometry

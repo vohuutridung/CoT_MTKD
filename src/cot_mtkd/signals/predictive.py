@@ -14,7 +14,7 @@ from ..models.chunked_head import (
 )
 from ..models.multi_adapter import set_active_adapter
 from ..stage1.dpp import marginal_log_uniqueness, normalized_support_features
-from ..stage1.kneedle import build_union_support, capped_k_from_probe
+from ..stage1.kneedle import build_union_support, local_k_from_probe
 
 
 @dataclass
@@ -143,35 +143,24 @@ def _dpp_uniqueness(
     jitter: float,
 ) -> torch.Tensor:
     expert_count = len(hidden_by_expert)
-    steps = sorted(set(int(value) for value in step_ids.tolist()))
+    steps = sorted({int(value) for value in step_ids.tolist()})
     if not steps:
         return torch.empty((0, expert_count), dtype=torch.float32)
-    values_by_expert, ids_by_expert, min_by_expert, max_by_expert = [], [], [], []
+    values_by_expert, ids_by_expert = [], []
     for hidden in hidden_by_expert:
-        values, ids, minimum, maximum = full_vocab_probe(
+        values, ids = full_vocab_probe(
             hidden,
             head,
             targets.cpu(),
-            int(kneedle["probe_k"]),
+            int(kneedle.get("search_k", 512)),
             chunk_tokens,
         )
         values_by_expert.append(values)
         ids_by_expert.append(ids)
-        min_by_expert.append(minimum)
-        max_by_expert.append(maximum)
     selected_k = torch.stack(
         [
-            capped_k_from_probe(
-                values,
-                minimum,
-                maximum,
-                head.weight.shape[0],
-                int(kneedle["min_k"]),
-                int(kneedle["max_k"]),
-            )
-            for values, minimum, maximum in zip(
-                values_by_expert, min_by_expert, max_by_expert, strict=True
-            )
+            local_k_from_probe(values, k_min=int(kneedle.get("k_min", 8)))[1]
+            for values in values_by_expert
         ]
     )
     support, support_mask = build_union_support(torch.stack(ids_by_expert), selected_k)
@@ -233,7 +222,7 @@ def score_predictive_signals(
         kneedle,
         dpp_jitter,
     )
-    unique_steps = sorted(set(int(value) for value in reasoning_steps.tolist()))
+    unique_steps = sorted({int(value) for value in reasoning_steps.tolist()})
     competence_rows: list[torch.Tensor] = []
     agreement_rows: list[torch.Tensor] = []
     js_rows: list[torch.Tensor] = []

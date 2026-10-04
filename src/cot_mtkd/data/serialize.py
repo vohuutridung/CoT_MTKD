@@ -5,9 +5,7 @@ from dataclasses import dataclass
 
 from .schema import CharacterSegment, TokenRegion
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-)
+DEFAULT_SYSTEM_PROMPT = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 DEFAULT_STEP_PATTERN = r"\r?\n[ \t]*\r?\n+"
 
 
@@ -16,7 +14,7 @@ class SerializedResponse:
     text: str
     segments: tuple[CharacterSegment, ...]
     reasoning_start_char: int
-    answer_start_char: int
+    response_end_char: int
     step_count: int
 
 
@@ -26,9 +24,7 @@ class _Builder:
         self.length = 0
         self.segments: list[CharacterSegment] = []
 
-    def append(
-        self, text: str, region: TokenRegion, step_id: int = -1
-    ) -> tuple[int, int]:
+    def append(self, text: str, region: TokenRegion, step_id: int = -1) -> tuple[int, int]:
         start = self.length
         self.parts.append(text)
         self.length += len(text)
@@ -36,17 +32,13 @@ class _Builder:
             self.segments.append(CharacterSegment(start, self.length, region, step_id))
         return start, self.length
 
-    def append_reasoning(
-        self, reasoning: str, step_pattern: str
-    ) -> tuple[int, int, int]:
+    def append_reasoning(self, reasoning: str, step_pattern: str) -> tuple[int, int, int]:
         start = self.length
         self.parts.append(reasoning)
         self.length += len(reasoning)
         relative = reasoning_character_segments(reasoning, step_pattern)
         self.segments.extend(
-            CharacterSegment(
-                start + item.start, start + item.end, item.region, item.step_id
-            )
+            CharacterSegment(start + item.start, start + item.end, item.region, item.step_id)
             for item in relative
         )
         step_count = 0 if not relative else max(item.step_id for item in relative) + 1
@@ -82,50 +74,38 @@ def reasoning_character_segments(
 
     segments: list[CharacterSegment] = []
     if content_spans[0][0] > 0:
-        segments.append(
-            CharacterSegment(0, content_spans[0][0], TokenRegion.DELIMITER, 0)
-        )
+        segments.append(CharacterSegment(0, content_spans[0][0], TokenRegion.DELIMITER, 0))
     for step_id, (start, end) in enumerate(content_spans):
         segments.append(CharacterSegment(start, end, TokenRegion.REASONING, step_id))
         next_start = (
-            content_spans[step_id + 1][0]
-            if step_id + 1 < len(content_spans)
-            else len(reasoning)
+            content_spans[step_id + 1][0] if step_id + 1 < len(content_spans) else len(reasoning)
         )
         if end < next_start:
-            segments.append(
-                CharacterSegment(end, next_start, TokenRegion.DELIMITER, step_id)
-            )
+            segments.append(CharacterSegment(end, next_start, TokenRegion.DELIMITER, step_id))
     return tuple(segments)
 
 
 def serialize_record(
     question: str,
     thinking: str,
-    attempt: str,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     step_pattern: str = DEFAULT_STEP_PATTERN,
 ) -> SerializedResponse:
+    """Serialize the complete fixed CoT, including its own final answer, then EOS."""
     builder = _Builder()
     builder.append(
         f"<|im_start|>system\n{system_prompt}\n<|im_end|>\n"
         f"<|im_start|>user\n{question}\n<|im_end|>\n",
         TokenRegion.PROMPT,
     )
-    builder.append(
-        "<|im_start|>assistant\n<|im_start|>think\n", TokenRegion.ASSISTANT_CONTROL
-    )
+    builder.append("<|im_start|>assistant\n<|im_start|>think\n", TokenRegion.ASSISTANT_CONTROL)
     reasoning_start, _, step_count = builder.append_reasoning(thinking, step_pattern)
-    answer_start, _ = builder.append(
-        "\n<|im_start|>answer\nAnswer: ", TokenRegion.ANSWER_MARKER
-    )
-    builder.append(attempt, TokenRegion.ANSWER)
-    builder.append("\n<|im_end|>", TokenRegion.EOS)
+    response_end, _ = builder.append("\n<|im_end|>", TokenRegion.EOS)
     return SerializedResponse(
         text=builder.build(),
         segments=tuple(builder.segments),
         reasoning_start_char=reasoning_start,
-        answer_start_char=answer_start,
+        response_end_char=response_end,
         step_count=step_count,
     )
 

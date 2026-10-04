@@ -23,14 +23,13 @@ from ..models.multi_adapter import (
     require_same_model_source,
     set_all_adapters_trainable,
 )
-from ..stage1.gac_gradient import stable_gac_gradients
-from ..stage1.rbf import BandwidthEMA, effective_update_distances, repulsion_updates
+from ..stage1.objective import compose_objective_gradients
+from ..stage1.rbf import BandwidthEMA, effective_update_distances, rbf_repulsion_gradients
 from ..stage1.trainer import (
     _batch_to_device,
     _optimizer_and_scheduler,
     _run_compatible_config,
     one_pass_expert_gradients,
-    sft_only_expert_gradients,
 )
 from ..utils.manifest import fingerprint, read_json, require_file_sha256
 from ..utils.seed import seed_everything
@@ -43,7 +42,7 @@ from ..utils.training import (
 
 TARGET_LENGTH = 32_768
 GIB = 1024**3
-PHASES = ("sft", "ramp", "full")
+PHASES = ("full",)
 
 
 def extend_reasoning(record: PreparedRecord, target_length: int) -> PreparedRecord:
@@ -114,91 +113,56 @@ def _run_microbatch(
     device: torch.device,
     iteration: int,
 ) -> dict[str, Any]:
-    """Exercise one optimizer update using the trainer's phase-specific path.
+    """Exercise one optimizer update using the trainer's full interaction path.
 
     This is a single-sample optimizer window. Its token/sample normalizers
     match training, but its time is not a global-batch optimizer-step time.
     """
     if phase not in PHASES:
         raise ValueError(f"Unknown Stage-1 stress phase: {phase}")
-    sft_buffers = [zeros_like_parameters(current) for current in parameters]
-    dpp_buffers = (
-        [zeros_like_parameters(current) for current in parameters] if phase == "ramp" else None
-    )
+    task_buffers = [zeros_like_parameters(current) for current in parameters]
     batch = _batch_to_device(collator([record]), device)
     views = shifted_token_views(batch)
     sft_tokens = int(views["response_targets"].numel())
     dpp_samples = int(torch.unique(views["reasoning_batch_indices"]).numel())
     if sft_tokens <= 0:
         raise ValueError("Stress sample has no labeled response tokens")
-    combined_dpp_scale = None
-    if phase == "sft":
-        results = (
-            sft_only_expert_gradients(
-                model,
-                name,
-                expert,
-                current,
-                batch,
-                iteration,
-                iteration,
-                int(config["seed"]),
-                int(config["runtime"]["lm_head_chunk_tokens"]),
-                device,
-            )
-            for expert, (name, current) in enumerate(zip(names, parameters, strict=True))
-        )
-    else:
-        if phase == "full":
-            combined_dpp_scale = (
-                float(config["stage1"]["dpp_weight"]) * sft_tokens / dpp_samples
-                if dpp_samples
-                else 0.0
-            )
-        probe, results = one_pass_expert_gradients(
-            model,
-            names,
-            parameters,
-            batch,
-            iteration,
-            iteration,
-            int(config["seed"]),
-            config,
-            device,
-            combined_dpp_scale=combined_dpp_scale,
-        )
-        if probe.dpp_sample_count != dpp_samples:
-            raise RuntimeError("Stress DPP sample count differs from its planned denominator")
-    for expert, (sft, dpp, _, _) in enumerate(results):
-        add_gradients_(sft_buffers[expert], sft)
-        if dpp_buffers is not None:
-            add_gradients_(dpp_buffers[expert], dpp)
-    for values in sft_buffers:
+    combined_dpp_scale = (
+        float(config["stage1"]["dpp_weight"]) * sft_tokens / dpp_samples
+        if dpp_samples
+        else 0.0
+    )
+    probe, results = one_pass_expert_gradients(
+        model,
+        names,
+        parameters,
+        batch,
+        iteration,
+        iteration,
+        int(config["seed"]),
+        config,
+        device,
+        combined_dpp_scale=combined_dpp_scale,
+    )
+    if probe.dpp_sample_count != dpp_samples:
+        raise RuntimeError("Stress DPP sample count differs from its planned denominator")
+    for expert, (task, _dpp, _, _) in enumerate(results):
+        add_gradients_(task_buffers[expert], task)
+    for values in task_buffers:
         for value in values:
-            value.div_(max(sft_tokens, 1))
-    if dpp_buffers is not None:
-        for values in dpp_buffers:
-            for value in values:
-                value.div_(max(dpp_samples, 1))
-    if phase == "sft":
-        final = sft_buffers
-    else:
-        set_all_adapters_trainable(model, names)
-        scaling = float(config["lora"]["alpha"]) / float(config["lora"]["rank"])
-        distances_for_step = effective_update_distances(groups, scaling)
-        current_bandwidth = bandwidth.update(distances_for_step)
-        repulsion, kernel, _ = repulsion_updates(
-            groups, scaling, current_bandwidth, distances=distances_for_step
-        )
-        final, _ = stable_gac_gradients(
-            sft_buffers,
-            dpp_buffers,
-            repulsion,
-            kernel,
-            0.5 if phase == "ramp" else 1.0,
-            float(config["stage1"]["dpp_weight"]),
-            float(config["stage1"]["rbf_weight"]),
-        )
+            value.div_(sft_tokens)
+    set_all_adapters_trainable(model, names)
+    scaling = float(config["lora"]["alpha"]) / float(config["lora"]["rank"])
+    distances_for_step = effective_update_distances(groups, scaling)
+    current_bandwidth = bandwidth.update(distances_for_step)
+    rbf = rbf_repulsion_gradients(
+        groups, scaling, current_bandwidth, distances=distances_for_step
+    )
+    final, diagnostics = compose_objective_gradients(
+        task_buffers,
+        rbf.gradients,
+        float(config["stage1"]["rbf_weight"]),
+    )
     for values, current, optimizer, scheduler in zip(
         final, parameters, optimizers, schedulers, strict=True
     ):
@@ -211,8 +175,10 @@ def _run_microbatch(
         optimizer.zero_grad(set_to_none=True)
     return {
         "response_tokens": sft_tokens,
-        "dpp_samples": dpp_samples if phase != "sft" else 0,
+        "dpp_samples": dpp_samples,
         "combined_dpp_scale": combined_dpp_scale,
+        "rbf_loss": rbf.loss,
+        "rbf_task_gradient_ratios": list(diagnostics.rbf_task_ratios),
     }
 
 
@@ -319,7 +285,7 @@ def memory_recommendation(cases: list[dict[str, Any]]) -> tuple[str, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Stress SFT/ramp/full Phase-1 paths on two long samples with warm-up"
+        description="Stress full Phase-1 interactions on two long samples with warm-up"
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", default="artifacts/stage1/stress_memory.json")

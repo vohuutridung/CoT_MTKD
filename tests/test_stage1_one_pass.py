@@ -40,7 +40,6 @@ class Stage1OnePassTest(unittest.TestCase):
                     step_ids=[-1] + ([0] if reasoning else [-1]) + [-1] * (tokens - 1),
                     question="",
                     thinking="",
-                    attempt="",
                     solution="",
                     deepseek_grade=None,
                     original_length=tokens + 1,
@@ -55,16 +54,12 @@ class Stage1OnePassTest(unittest.TestCase):
             )
         sampler = DistributedSampler(records, num_replicas=1, rank=0, shuffle=False)
         self.assertEqual(
-            _planned_window_counts(
-                records, sampler, epochs=2, micro_batch=1, accumulation_steps=2
-            ),
+            _planned_window_counts(records, sampler, epochs=2, micro_batch=1, accumulation_steps=2),
             [(5, 1), (6, 2), (7, 1)],
         )
 
     def test_forward_mode_does_not_block_resume(self) -> None:
-        first = {
-            "stage1": {"forward_mode": "one_pass", "resume_from": None, "epochs": 3}
-        }
+        first = {"stage1": {"forward_mode": "one_pass", "resume_from": None, "epochs": 3}}
         second = {
             "stage1": {
                 "forward_mode": "two_pass",
@@ -85,7 +80,6 @@ class Stage1OnePassTest(unittest.TestCase):
             step_ids=[-1, -1, 0, 0, 1, -1, -1, -1],
             question="",
             thinking="",
-            attempt="",
             solution="",
             deepseek_grade=None,
             original_length=8,
@@ -124,9 +118,7 @@ class Stage1OnePassTest(unittest.TestCase):
                 max_position_embeddings=32,
             )
         )
-        base.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         base.enable_input_require_grads()
         lora = {
             "rank": 2,
@@ -142,28 +134,20 @@ class Stage1OnePassTest(unittest.TestCase):
                 "down_proj",
             ],
         }
-        with patch(
-            "cot_mtkd.models.multi_adapter.load_base_causal_lm", return_value=base
-        ):
+        with patch("cot_mtkd.models.multi_adapter.load_base_causal_lm", return_value=base):
             model, names = create_multi_adapter_model({}, lora, 3, torch.device("cpu"))
-        parameters = [
-            list(group.values()) for group in adapter_parameter_groups(model, names)
-        ]
+        parameters = [list(group.values()) for group in adapter_parameter_groups(model, names)]
         ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]])
         batch = {
             "input_ids": ids,
             "attention_mask": torch.ones_like(ids),
-            "labels": torch.tensor(
-                [[-100, -100, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]]
-            ),
+            "labels": torch.tensor([[-100, -100, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]]),
             "region_ids": torch.tensor([[0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 4, 5, 6]]),
-            "step_ids": torch.tensor(
-                [[-1, -1, -1, 0, 0, 0, 0, 1, 1, 1, 1, -1, -1, -1]]
-            ),
+            "step_ids": torch.tensor([[-1, -1, -1, 0, 0, 0, 0, 1, 1, 1, 1, -1, -1, -1]]),
         }
         config = {
             "runtime": {"lm_head_chunk_tokens": 4, "probe_hidden_device": "cpu"},
-            "kneedle": {"probe_k": 6, "min_k": 3, "max_k": 4},
+            "kneedle": {"search_k": 6, "k_min": 8},
             "dpp": {"jitter": 1.0e-4, "max_jitter": 1.0e-2},
         }
         device = torch.device("cpu")
@@ -172,26 +156,18 @@ class Stage1OnePassTest(unittest.TestCase):
             replay_expert_gradients(
                 model, name, index, parameter, batch, old_probe, 0, 0, 42, 4, device
             )
-            for index, (name, parameter) in enumerate(
-                zip(names, parameters, strict=True)
-            )
+            for index, (name, parameter) in enumerate(zip(names, parameters, strict=True))
         ]
         original_grad = torch.autograd.grad
         transformer_vjps: list[int] = []
 
         def count_transformer_vjp(outputs, inputs, *args, **kwargs):
-            if (
-                isinstance(inputs, list)
-                and isinstance(outputs, torch.Tensor)
-                and outputs.ndim == 2
-            ):
+            if isinstance(inputs, list) and isinstance(outputs, torch.Tensor) and outputs.ndim == 2:
                 transformer_vjps.append(1)
             return original_grad(outputs, inputs, *args, **kwargs)
 
         with (
-            patch(
-                "cot_mtkd.stage1.trainer.forward_hidden", wraps=forward_hidden
-            ) as traced,
+            patch("cot_mtkd.stage1.trainer.forward_hidden", wraps=forward_hidden) as traced,
             patch("torch.autograd.grad", side_effect=count_transformer_vjp),
         ):
             new_probe, new_results = one_pass_expert_gradients(
@@ -201,6 +177,11 @@ class Stage1OnePassTest(unittest.TestCase):
         self.assertEqual(len(transformer_vjps), 6)
         self.assertTrue(torch.equal(old_probe.support_ids, new_probe.support_ids))
         self.assertTrue(torch.equal(old_probe.support_mask, new_probe.support_mask))
+        self.assertEqual(new_probe.selection_count, 24)
+        self.assertEqual(new_probe.mean_selected_k, 6)
+        self.assertEqual(new_probe.selected_k_histogram.tolist(), [0] * 6 + [24])
+        self.assertEqual(int(new_probe.raw_k_histogram.sum()), 24)
+        self.assertTrue(torch.equal(old_probe.raw_k_histogram, new_probe.raw_k_histogram))
         self.assertTrue(
             torch.allclose(
                 old_probe.dpp_logit_gradients,
@@ -216,9 +197,7 @@ class Stage1OnePassTest(unittest.TestCase):
             for old_set, new_set in zip(old[:2], new[:2], strict=True):
                 for old_gradient, new_gradient in zip(old_set, new_set, strict=True):
                     self.assertTrue(
-                        torch.allclose(
-                            old_gradient, new_gradient, atol=2.0e-5, rtol=1.0e-4
-                        )
+                        torch.allclose(old_gradient, new_gradient, atol=2.0e-5, rtol=1.0e-4)
                     )
         large_config = {**config, "runtime": {**config["runtime"], "lm_head_chunk_tokens": 32768}}
         large_probe, large_results = one_pass_expert_gradients(
@@ -227,8 +206,10 @@ class Stage1OnePassTest(unittest.TestCase):
         self.assertTrue(torch.equal(new_probe.support_ids, large_probe.support_ids))
         self.assertTrue(torch.equal(new_probe.support_mask, large_probe.support_mask))
         torch.testing.assert_close(
-            new_probe.dpp_logit_gradients, large_probe.dpp_logit_gradients,
-            atol=1e-6, rtol=1e-5,
+            new_probe.dpp_logit_gradients,
+            large_probe.dpp_logit_gradients,
+            atol=1e-6,
+            rtol=1e-5,
         )
         self.assertAlmostEqual(new_probe.dpp_loss_sum, large_probe.dpp_loss_sum, places=6)
         for small, large in zip(new_results, large_results, strict=True):
@@ -236,9 +217,7 @@ class Stage1OnePassTest(unittest.TestCase):
             self.assertEqual(small[3], large[3])
             for small_set, large_set in zip(small[:2], large[:2], strict=True):
                 for small_gradient, large_gradient in zip(small_set, large_set, strict=True):
-                    torch.testing.assert_close(
-                        small_gradient, large_gradient, atol=2e-5, rtol=1e-4
-                    )
+                    torch.testing.assert_close(small_gradient, large_gradient, atol=2e-5, rtol=1e-4)
         scale = 0.75
         transformer_vjps.clear()
         with patch("torch.autograd.grad", side_effect=count_transformer_vjp):
@@ -258,9 +237,7 @@ class Stage1OnePassTest(unittest.TestCase):
         for old, combined in zip(old_results, combined_results, strict=True):
             self.assertEqual(combined[1], [])
             for sft, dpp, actual in zip(old[0], old[1], combined[0], strict=True):
-                self.assertTrue(
-                    torch.allclose(actual, sft + scale * dpp, atol=2.0e-5, rtol=1.0e-4)
-                )
+                self.assertTrue(torch.allclose(actual, sft + scale * dpp, atol=2.0e-5, rtol=1.0e-4))
         fallback_combined = replay_expert_gradients(
             model,
             names[0],
@@ -278,14 +255,10 @@ class Stage1OnePassTest(unittest.TestCase):
         for sft, dpp, actual in zip(
             old_results[0][0], old_results[0][1], fallback_combined[0], strict=True
         ):
-            self.assertTrue(
-                torch.allclose(actual, sft + scale * dpp, atol=2.0e-5, rtol=1.0e-4)
-            )
+            self.assertTrue(torch.allclose(actual, sft + scale * dpp, atol=2.0e-5, rtol=1.0e-4))
         keep = [index for index in range(ids.shape[1]) if index not in (5, 6)]
         short_batch = {key: value[:, keep] for key, value in batch.items()}
-        short_probe = probe_stage1_dpp(
-            model, names, short_batch, 0, 1, 42, config, device
-        )
+        short_probe = probe_stage1_dpp(model, names, short_batch, 0, 1, 42, config, device)
         short_separate = [
             replay_expert_gradients(
                 model,
@@ -300,9 +273,7 @@ class Stage1OnePassTest(unittest.TestCase):
                 4,
                 device,
             )
-            for index, (name, parameter) in enumerate(
-                zip(names, parameters, strict=True)
-            )
+            for index, (name, parameter) in enumerate(zip(names, parameters, strict=True))
         ]
         total_tokens = old_results[0][3] + short_separate[0][3]
         total_dpp_samples = old_probe.dpp_sample_count + short_probe.dpp_sample_count
@@ -355,12 +326,8 @@ class Stage1OnePassTest(unittest.TestCase):
                     dpp_long + dpp_short
                 ) / total_dpp_samples
                 actual = (combined_long + combined_short) / total_tokens
-                self.assertTrue(
-                    torch.allclose(expected, actual, atol=2.0e-5, rtol=1.0e-4)
-                )
-        with patch(
-            "cot_mtkd.stage1.trainer.full_vocab_probe", side_effect=AssertionError
-        ):
+                self.assertTrue(torch.allclose(expected, actual, atol=2.0e-5, rtol=1.0e-4))
+        with patch("cot_mtkd.stage1.trainer.full_vocab_probe", side_effect=AssertionError):
             warmup = sft_only_expert_gradients(
                 model, names[0], 0, parameters[0], batch, 0, 0, 42, 4, device
             )

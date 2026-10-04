@@ -19,16 +19,6 @@ def cosine_warmup_lambda(
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
 
-def interaction_scale(
-    progress: float, off_until: float = 0.1, ramp_until: float = 0.3
-) -> float:
-    if progress < off_until:
-        return 0.0
-    if progress >= ramp_until:
-        return 1.0
-    return (progress - off_until) / max(ramp_until - off_until, 1.0e-12)
-
-
 def zeros_like_parameters(
     parameters: Sequence[torch.nn.Parameter], dtype: torch.dtype = torch.float32
 ):

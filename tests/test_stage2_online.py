@@ -63,7 +63,6 @@ def two_step_record() -> PreparedRecord:
         step_ids=[-1, -1, -1, 0, 0, 0, 1, 1, 1, 1, -1, -1, -1],
         question="question",
         thinking="step one\n\nstep two",
-        attempt="wrong attempt",
         solution="42",
         deepseek_grade="No",
         original_length=len(ids),

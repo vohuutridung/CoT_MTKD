@@ -173,13 +173,13 @@ class OutputSpaceOnlineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cpu or device"):
             runtime_options({"teacher_hidden_storage": "disk"})
 
-    def test_gold_and_final_answer_do_not_change_training_target_or_gradient(self):
+    def test_gold_metadata_and_legacy_answer_suffix_do_not_change_target_or_gradient(self):
         model, names, parameters = tiny_online_council(checkpointing=False)
         original = compute_record_gradient(
             model, names, parameters, self.record, None, self.config, torch.device("cpu")
         )
         altered = copy.deepcopy(self.record)
-        altered.solution, altered.attempt = "unrelated gold", "unrelated answer"
+        altered.solution = "unrelated gold"
         altered.input_ids[10:] = [22, 23, 24]
         actual = compute_record_gradient(
             model, names, parameters, altered, None, self.config, torch.device("cpu")

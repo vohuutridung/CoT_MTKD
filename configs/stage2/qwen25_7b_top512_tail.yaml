@@ -44,7 +44,7 @@ runtime:
   dataloader_workers: 0
   pin_memory: true
 paths:
-  prepared: artifacts/prepared/s1k_1_1
+  prepared: artifacts/prepared/s1k_1_1_cot_only
   stage1: artifacts/stage1/main
   supervision: artifacts/supervision/main
   cache: artifacts/teacher_cache/top512_tail

@@ -72,7 +72,6 @@ class CacheBuilderTest(unittest.TestCase):
             step_ids=[-1, -1, -1, 0, 0, -1, -1],
             question="q",
             thinking="r",
-            attempt="a",
             solution="a",
             deepseek_grade="Yes",
             original_length=7,

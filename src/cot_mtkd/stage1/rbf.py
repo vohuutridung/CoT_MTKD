@@ -98,27 +98,55 @@ class BandwidthEMA:
         self.value = None if value.get("value") is None else float(value["value"])
 
 
-def repulsion_updates(
+def rbf_repulsion_loss(
+    distances: torch.Tensor, bandwidth: torch.Tensor | float
+) -> torch.Tensor:
+    """Mean unordered-pair kernel potential; minimize it to separate updates.
+
+    Bandwidth is held constant during differentiation, including when the
+    caller supplies a tensor estimated from current effective-update distances.
+    """
+    if distances.ndim != 2 or distances.shape[0] != distances.shape[1] or distances.shape[0] < 2:
+        raise ValueError("RBF repulsion requires a square distance matrix for at least two experts")
+    fixed_bandwidth = float(bandwidth.detach().item()) if isinstance(bandwidth, torch.Tensor) else float(bandwidth)
+    if not math.isfinite(fixed_bandwidth) or fixed_bandwidth <= 0.0:
+        raise ValueError("RBF bandwidth must be finite and positive")
+    kernel = rbf_kernel(distances, fixed_bandwidth)
+    upper = torch.triu_indices(kernel.shape[0], kernel.shape[0], offset=1, device=kernel.device)
+    return kernel[upper[0], upper[1]].mean()
+
+
+@dataclass(frozen=True)
+class RBFGradients:
+    gradients: list[list[torch.Tensor]]
+    loss: float
+    kernel: torch.Tensor
+    distances: torch.Tensor
+
+
+def rbf_repulsion_gradients(
     groups: list[OrderedDict[str, torch.nn.Parameter]],
     scaling: float,
     bandwidth: float,
     distances: torch.Tensor | None = None,
-) -> tuple[list[list[torch.Tensor]], torch.Tensor, torch.Tensor]:
-    """Return outward update directions `-grad(sum pairwise RBF)` for each expert."""
+) -> RBFGradients:
+    """Differentiate the scalar RBF loss into each expert's own A/B factors.
+
+    Returns positive loss gradients for addition to the SFT/DPP gradients.
+    No full-size BA matrix, task-gradient sharing, or special norm cap is used.
+    """
     if distances is None:
         distances = effective_update_distances(groups, scaling)
     kernel = rbf_kernel(distances, bandwidth)
-    count = len(groups)
-    upper = torch.triu_indices(count, count, offset=1, device=kernel.device)
-    potential = kernel[upper[0], upper[1]].mean()
+    potential = rbf_repulsion_loss(distances, bandwidth)
     flat_parameters = [parameter for group in groups for parameter in group.values()]
     gradients = torch.autograd.grad(potential, flat_parameters, allow_unused=False)
-    updates: list[list[torch.Tensor]] = []
+    grouped_gradients: list[list[torch.Tensor]] = []
     cursor = 0
     for group in groups:
         current: list[torch.Tensor] = []
         for _ in group.values():
-            current.append(-gradients[cursor].detach().float())
+            current.append(gradients[cursor].detach().float())
             cursor += 1
-        updates.append(current)
-    return updates, kernel.detach(), distances.detach()
+        grouped_gradients.append(current)
+    return RBFGradients(grouped_gradients, float(potential.detach().item()), kernel.detach(), distances.detach())

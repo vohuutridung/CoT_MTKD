@@ -19,12 +19,19 @@ from .schema import PreparedRecord, TokenRegion
 from .serialize import serialize_record
 from .token_spans import (
     assign_token_regions,
-    complete_step_truncate,
     first_region_index,
     validate_token_contract,
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def source_sample_id(raw: dict[str, Any], sample_index: int) -> str:
+    """Keep canonical IDs tied to the original source order, before filtering."""
+    identifier = raw.get("id")
+    if identifier is None:
+        identifier = raw.get("problem_id")
+    return str(identifier if identifier is not None else f"s1k-{sample_index:04d}")
 
 
 def tokenizer_fingerprint(tokenizer: Any) -> str:
@@ -48,16 +55,11 @@ def prepare_one(
     tokenizer_hash: str,
 ) -> PreparedRecord:
     question = str(raw["question"])
-    thinking = (
-        str(raw["deepseek_thinking_trajectory"])
-        .replace("\r\n", "\n")
-        .replace("\r", "\n")
-    )
-    attempt = str(raw["deepseek_attempt"])
+    thinking = str(raw["deepseek_thinking_trajectory"]).replace("\r\n", "\n").replace("\r", "\n")
     solution = str(raw["solution"])
-    serialized = serialize_record(
-        question, thinking, attempt, system_prompt, step_pattern
-    )
+    if not thinking.strip():
+        raise ValueError(f"Empty CoT for {source_sample_id(raw, sample_index)}")
+    serialized = serialize_record(question, thinking, system_prompt, step_pattern)
     encoded = tokenizer(
         serialized.text,
         add_special_tokens=False,
@@ -72,29 +74,18 @@ def prepare_one(
         token if region != int(TokenRegion.PROMPT) else -100
         for token, region in zip(input_ids, regions)
     ]
-    original_answer_start = first_region_index(
-        regions, TokenRegion.ANSWER_MARKER, len(input_ids)
-    )
     original_length = len(input_ids)
-    input_ids, labels, regions, steps, stats = complete_step_truncate(
-        input_ids, labels, regions, steps, max_length
-    )
-    if bool(stats["truncated"]):
-        suffix_length = original_length - original_answer_start
-        prefix_length = len(input_ids) - suffix_length
-        offsets = offsets[:prefix_length] + offsets[original_answer_start:]
+    if original_length > max_length:
+        raise ValueError(
+            f"CoT-only sample {source_sample_id(raw, sample_index)} has "
+            f"{original_length} tokens, exceeding max_length={max_length}; "
+            "refusing to truncate its final answer"
+        )
     validate_token_contract(input_ids, labels, regions, steps)
     if len(offsets) != len(input_ids):
-        raise RuntimeError("Offset mapping became misaligned during truncation")
-    identifier = raw.get("id")
-    if identifier is None:
-        identifier = raw.get("problem_id")
-    if identifier is None:
-        identifier = f"s1k-{sample_index:04d}"
-    sample_id = str(identifier)
-    answer_start = first_region_index(
-        regions, TokenRegion.ANSWER_MARKER, len(input_ids)
-    )
+        raise RuntimeError("Tokenization returned misaligned offset mappings")
+    sample_id = source_sample_id(raw, sample_index)
+    answer_start = first_region_index(regions, TokenRegion.EOS, len(input_ids))
     reasoning_start = first_region_index(regions, TokenRegion.REASONING, answer_start)
     return PreparedRecord(
         sample_id=sample_id,
@@ -106,18 +97,15 @@ def prepare_one(
         step_ids=steps,
         question=question,
         thinking=thinking,
-        attempt=attempt,
         solution=solution,
         deepseek_grade=(
-            None
-            if raw.get("deepseek_grade") is None
-            else str(raw.get("deepseek_grade"))
+            None if raw.get("deepseek_grade") is None else str(raw.get("deepseek_grade"))
         ),
-        original_length=int(stats["original_length"]),
-        kept_length=int(stats["kept_length"]),
-        original_steps=int(stats["original_steps"]),
-        kept_steps=int(stats["kept_steps"]),
-        truncated=bool(stats["truncated"]),
+        original_length=original_length,
+        kept_length=original_length,
+        original_steps=serialized.step_count,
+        kept_steps=serialized.step_count,
+        truncated=False,
         answer_start=answer_start,
         reasoning_start=reasoning_start,
         tokenizer_fingerprint=tokenizer_hash,
@@ -128,9 +116,7 @@ def write_prepared_dataset(
     records: Iterable[dict[str, Any]], tokenizer: Any, config: dict[str, Any]
 ) -> dict[str, Any]:
     if config["dataset"].get("keep_all_grades") is not True:
-        raise ValueError(
-            "Canonical s1K-1.1 preprocessing requires keep_all_grades: true"
-        )
+        raise ValueError("Canonical s1K-1.1 preprocessing requires keep_all_grades: true")
     tokenization = config["tokenization"]
     if tokenization.get("padding_side") != "right":
         raise ValueError("Canonical preprocessing requires right padding")
@@ -138,24 +124,35 @@ def write_prepared_dataset(
         raise ValueError("Canonical preprocessing does not permit sequence packing")
     if tokenization.get("add_special_tokens") is not False:
         raise ValueError("Canonical serialization already contains its special tokens")
-    if tokenization.get("truncation") != "complete_reasoning_step_prefix":
+    if tokenization.get("truncation") != "reject_overlength":
         raise ValueError("Unsupported truncation policy")
+    if config["serialization"].get("response_field") != "deepseek_thinking_trajectory":
+        raise ValueError("Training responses must use only deepseek_thinking_trajectory")
     if int(tokenization["max_length"]) <= 0:
         raise ValueError("tokenization.max_length must be positive")
     destination = Path(config["output_dir"])
     destination.mkdir(parents=True, exist_ok=True)
-    public_config = {
-        key: value for key, value in config.items() if not key.startswith("_")
-    }
+    public_config = {key: value for key, value in config.items() if not key.startswith("_")}
     config_path = write_config_snapshot(destination / "config.yaml", public_config)
     output_file = destination / "data.jsonl"
     temporary = output_file.with_suffix(".jsonl.tmp")
     tokenizer_hash = tokenizer_fingerprint(tokenizer)
     count = truncated_count = token_count = 0
+    source_count = 0
+    excluded = {str(value) for value in config["dataset"].get("exclude_sample_ids", [])}
+    excluded_ids: list[str] = []
     sample_ids: list[str] = []
     seen_sample_ids: set[str] = set()
     with temporary.open("w", encoding="utf-8") as handle:
         for index, raw in enumerate(tqdm(records, desc="Preparing s1K-1.1")):
+            source_count += 1
+            sample_id = source_sample_id(raw, index)
+            if sample_id in seen_sample_ids:
+                raise ValueError(f"Duplicate sample id in source dataset: {sample_id}")
+            seen_sample_ids.add(sample_id)
+            if sample_id in excluded:
+                excluded_ids.append(sample_id)
+                continue
             prepared = prepare_one(
                 raw,
                 tokenizer,
@@ -165,32 +162,37 @@ def write_prepared_dataset(
                 str(config["serialization"]["step_pattern"]),
                 tokenizer_hash,
             )
-            if prepared.sample_id in seen_sample_ids:
-                raise ValueError(
-                    f"Duplicate sample id in source dataset: {prepared.sample_id}"
-                )
-            seen_sample_ids.add(prepared.sample_id)
             handle.write(json.dumps(prepared.to_dict(), ensure_ascii=False) + "\n")
             count += 1
             truncated_count += int(prepared.truncated)
             token_count += prepared.kept_length
             sample_ids.append(prepared.sample_id)
     expected_records = config["dataset"].get("expected_records")
-    if expected_records is not None and count != int(expected_records):
+    if expected_records is not None and source_count != int(expected_records):
         raise RuntimeError(
-            f"Expected {int(expected_records)} source records, but prepared {count}"
+            f"Expected {int(expected_records)} source records, but read {source_count}"
+        )
+    if set(excluded_ids) != excluded:
+        raise RuntimeError(
+            f"Excluded sample IDs missing from source: {sorted(excluded - set(excluded_ids))}"
+        )
+    expected_prepared = config["dataset"].get("expected_prepared_records")
+    if expected_prepared is not None and count != int(expected_prepared):
+        raise RuntimeError(
+            f"Expected {int(expected_prepared)} prepared records, but prepared {count}"
         )
     temporary.replace(output_file)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact": "prepared_dataset",
+        "training_target": "deepseek_thinking_trajectory",
+        "source_records": source_count,
+        "excluded_sample_ids": excluded_ids,
         "records": count,
         "tokens": token_count,
         "truncated_records": truncated_count,
         "tokenizer_fingerprint": tokenizer_hash,
-        "sample_order_fingerprint": hashlib.sha256(
-            "\n".join(sample_ids).encode()
-        ).hexdigest(),
+        "sample_order_fingerprint": hashlib.sha256("\n".join(sample_ids).encode()).hexdigest(),
         "data_file": output_file.name,
         "data_file_sha256": file_sha256(output_file),
         "config": public_config,
@@ -201,6 +203,7 @@ def write_prepared_dataset(
     }
     write_json(destination / "manifest.json", manifest)
     LOGGER.info(
-        "Prepared %d records (%d truncated) at %s", count, truncated_count, destination
+        "Prepared %d of %d source records (%d excluded, %d truncated) at %s",
+        count, source_count, len(excluded_ids), truncated_count, destination,
     )
     return manifest

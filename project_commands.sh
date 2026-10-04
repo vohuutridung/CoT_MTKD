@@ -14,8 +14,8 @@ Usage: ./project_commands.sh COMMAND
 Commands:
   setup         Create .venv and install the local project.
   prepare       Download/read and preprocess s1K-1.1.
-  stage1        Train the three GAC-CoT LoRA experts.
-  stage1-stress Run six H200 SFT/ramp/full VRAM stress cases before Phase 1.
+  stage1        Train three CoT LoRA experts with SFT/DPP/RBF.
+  stage1-stress Run two full-interaction H200 VRAM stress cases before Phase 1.
   fetch-teachers Download/import the trained duyentl04/abc experts for Phase 2.
   supervision  Build legacy PAG/features (not used by the new Phase 2).
   cache         Compile legacy Top-512/tail targets (not used by the new Phase 2).

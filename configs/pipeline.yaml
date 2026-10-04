@@ -1,6 +1,6 @@
 schema_version: 1
 paths:
-  prepared: artifacts/prepared/s1k_1_1
+  prepared: artifacts/prepared/s1k_1_1_cot_only
   stage1: artifacts/stage1/main
   stage2_teachers: artifacts/stage1/duyentl04_abc
   supervision: artifacts/supervision/main

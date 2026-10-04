@@ -56,17 +56,27 @@ def full_vocab_probe(
     probe_k: int,
     chunk_tokens: int,
     output_device: torch.device | str = "cpu",
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return non-target Top-k and full min/max on the requested output device.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return descending top-K non-target logits/ids for local Kneedle.
 
+    K = min(probe_k, vocabulary_size - 1); gold targets are excluded first.
+    Local Kneedle normalizes within this window, without vocabulary extrema.
     CPU remains the default for offline signal extraction. Stage 1 requests its
     training device so selection and support construction stay on CUDA.
     """
+    if probe_k < 1 or chunk_tokens < 1:
+        raise ValueError("probe_k and chunk_tokens must be positive")
+    if head.weight.shape[0] < 2:
+        raise ValueError("Non-target probing requires at least two vocabulary tokens")
     count = hidden.shape[0]
     all_values: list[torch.Tensor] = []
     all_ids: list[torch.Tensor] = []
-    all_min: list[torch.Tensor] = []
-    all_max: list[torch.Tensor] = []
+    if count == 0:
+        window = min(probe_k, head.weight.shape[0] - 1)
+        return (
+            torch.empty((0, window), dtype=torch.float32, device=output_device),
+            torch.empty((0, window), dtype=torch.int32, device=output_device),
+        )
     head_device = next(head.parameters()).device
     head_dtype = next(head.parameters()).dtype
     with torch.no_grad():
@@ -76,24 +86,15 @@ def full_vocab_probe(
             logits = head(current).float()
             target = targets[start:end].to(logits.device)
             row = torch.arange(end - start, device=logits.device)
-            target_values = logits[row, target].clone()
             logits[row, target] = -torch.inf
             values, ids = torch.topk(
                 logits, k=min(probe_k, logits.shape[-1] - 1), dim=-1
             )
-            maximum = values[:, 0]
-            logits[row, target] = torch.inf
-            minimum = logits.min(dim=-1).values
-            logits[row, target] = target_values
             all_values.append(values.to(output_device))
             all_ids.append(ids.to(device=output_device, dtype=torch.int32))
-            all_min.append(minimum.to(output_device))
-            all_max.append(maximum.to(output_device))
     return (
         torch.cat(all_values),
         torch.cat(all_ids),
-        torch.cat(all_min),
-        torch.cat(all_max),
     )
 
 

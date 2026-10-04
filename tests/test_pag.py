@@ -70,7 +70,6 @@ class PAGTest(unittest.TestCase):
             step_ids=steps,
             question="q",
             thinking="r",
-            attempt="a",
             solution="gold",
             deepseek_grade="Yes",
             original_length=len(input_ids),

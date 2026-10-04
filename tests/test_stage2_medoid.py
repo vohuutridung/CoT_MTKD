@@ -37,7 +37,6 @@ def prepared_record(sample_id: str, token_ids: list[int]) -> PreparedRecord:
         step_ids=[-1] * length,
         question="question",
         thinking="",
-        attempt="attempt",
         solution="gold solution",
         deepseek_grade="No",
         original_length=length,

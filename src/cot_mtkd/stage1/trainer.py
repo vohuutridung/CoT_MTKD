@@ -58,14 +58,12 @@ from ..utils.training import (
     cosine_warmup_lambda,
     divide_gradients_,
     global_clip_grad_list_,
-    interaction_scale,
-    vector_norm,
     zeros_like_parameters,
 )
 from .dpp import DPPMetrics, normalized_support_features, step_dpp_loss
-from .gac_gradient import GACDiagnostics, stable_gac_gradients
-from .kneedle import build_union_support, capped_k_from_probe
-from .rbf import BandwidthEMA, effective_update_distances, repulsion_updates
+from .objective import STAGE1_METHOD, compose_objective_gradients
+from .kneedle import build_union_support, local_k_from_probe
+from .rbf import BandwidthEMA, effective_update_distances, rbf_repulsion_gradients
 
 LOGGER = logging.getLogger(__name__)
 
@@ -79,9 +77,11 @@ class ProbeResult:
     dpp_sample_count: int
     dpp_metrics: DPPMetrics
     mean_selected_k: float
-    cap_rate: float
+    mean_raw_k: float
     probe_saturation_rate: float
     selection_count: int
+    raw_k_histogram: torch.Tensor
+    selected_k_histogram: torch.Tensor
 
 
 def _batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -106,9 +106,11 @@ def _empty_probe(device: torch.device, expert_count: int) -> ProbeResult:
         dpp_sample_count=0,
         dpp_metrics=DPPMetrics(0, 0, 0, 1.0e-4),
         mean_selected_k=0.0,
-        cap_rate=0.0,
+        mean_raw_k=0.0,
         probe_saturation_rate=0.0,
         selection_count=0,
+        raw_k_histogram=torch.zeros(0, dtype=torch.long, device=device),
+        selected_k_histogram=torch.zeros(0, dtype=torch.long, device=device),
     )
 
 
@@ -137,10 +139,8 @@ def probe_stage1_dpp(
     hidden_by_expert: list[torch.Tensor] = []
     top_values: list[torch.Tensor] = []
     top_ids: list[torch.Tensor] = []
-    minima: list[torch.Tensor] = []
-    maxima: list[torch.Tensor] = []
     chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
-    probe_k = int(config["kneedle"]["probe_k"])
+    search_k = int(config["kneedle"].get("search_k", 512))
     if reasoning_hidden_by_expert is not None and len(
         reasoning_hidden_by_expert
     ) != len(adapter_names):
@@ -168,33 +168,24 @@ def probe_stage1_dpp(
             selected_hidden = (
                 reasoning_hidden_by_expert[expert].detach().to(probe_hidden_device)
             )
-        values, ids, minimum, maximum = full_vocab_probe(
+        values, ids = full_vocab_probe(
             selected_hidden,
             head,
             views["reasoning_targets"],
-            probe_k,
+            search_k,
             chunk_tokens,
             output_device=device,
         )
         hidden_by_expert.append(selected_hidden)
         top_values.append(values)
         top_ids.append(ids)
-        minima.append(minimum)
-        maxima.append(maximum)
 
-    selected_k = torch.stack(
-        [
-            capped_k_from_probe(
-                values,
-                minimum,
-                maximum,
-                vocab_size=head.weight.shape[0],
-                min_k=int(config["kneedle"]["min_k"]),
-                max_k=int(config["kneedle"]["max_k"]),
-            )
-            for values, minimum, maximum in zip(top_values, minima, maxima, strict=True)
-        ]
-    )
+    selections = [
+        local_k_from_probe(values, k_min=int(config["kneedle"].get("k_min", 8)))
+        for values in top_values
+    ]
+    raw_k = torch.stack([raw for raw, _ in selections])
+    selected_k = torch.stack([selected for _, selected in selections])
     support_ids, support_mask = build_union_support(
         torch.stack(top_ids), selected_k
     )
@@ -218,21 +209,7 @@ def probe_stage1_dpp(
         reduction="sum",
     )
     gradients = torch.autograd.grad(loss, support_logits)[0].detach()
-    cap = int(config["kneedle"]["max_k"])
-    probe_limit = int(config["kneedle"]["probe_k"])
-    raw_elbow = torch.stack(
-        [
-            capped_k_from_probe(
-                values,
-                minimum,
-                maximum,
-                vocab_size=head.weight.shape[0],
-                min_k=1,
-                max_k=probe_limit,
-            )
-            for values, minimum, maximum in zip(top_values, minima, maxima, strict=True)
-        ]
-    )
+    window = top_values[0].shape[-1]
     return ProbeResult(
         support_ids=support_ids,
         support_mask=support_mask,
@@ -241,9 +218,11 @@ def probe_stage1_dpp(
         dpp_sample_count=metrics.samples,
         dpp_metrics=metrics,
         mean_selected_k=float(selected_k.float().mean().item()),
-        cap_rate=float((raw_elbow > cap).float().mean().item()),
-        probe_saturation_rate=float((raw_elbow == probe_limit).float().mean().item()),
+        mean_raw_k=float(raw_k.float().mean().item()),
+        probe_saturation_rate=float((raw_k == window).float().mean().item()),
         selection_count=int(selected_k.numel()),
+        raw_k_histogram=torch.bincount(raw_k.flatten(), minlength=search_k + 1),
+        selected_k_histogram=torch.bincount(selected_k.flatten(), minlength=search_k + 1),
     )
 
 
@@ -436,7 +415,7 @@ def sft_only_expert_gradients(
     chunk_tokens: int,
     device: torch.device,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], float, int]:
-    """Warm-up path: one expert forward and one SFT transformer VJP."""
+    """SFT-only reference helper for gradient checks, outside the training loop."""
     views = shifted_token_views(batch)
     set_active_adapter(model, adapter_name)
     model.train()
@@ -506,10 +485,13 @@ def _run_compatible_config(config: dict[str, Any]) -> dict[str, Any]:
     value = _stable_config(config)
     if isinstance(value.get("stage1"), dict):
         value["stage1"].pop("forward_mode", None)
+        value["stage1"].setdefault("objective", STAGE1_METHOD)
     return value
 
 
 def _validate_stage1_config(config: dict[str, Any]) -> None:
+    if config["stage1"].get("objective", STAGE1_METHOD) != STAGE1_METHOD:
+        raise ValueError(f"stage1.objective must be {STAGE1_METHOD}")
     if config["stage1"].get("forward_mode", "one_pass") not in {"one_pass", "two_pass"}:
         raise ValueError("stage1.forward_mode must be one_pass or two_pass")
     if str(config["optimizer"].get("name", "")).lower() != "adamw":
@@ -522,24 +504,31 @@ def _validate_stage1_config(config: dict[str, Any]) -> None:
         raise ValueError("stage1.learning_rate must be positive")
     if float(config["stage1"]["dpp_weight"]) < 0.0:
         raise ValueError("stage1.dpp_weight must be non-negative")
-    if float(config["stage1"]["rbf_weight"]) < 0.0:
-        raise ValueError("stage1.rbf_weight must be non-negative")
+    rbf_weight = float(config["stage1"]["rbf_weight"])
+    if not math.isfinite(rbf_weight) or rbf_weight < 0.0:
+        raise ValueError("stage1.rbf_weight must be finite and non-negative")
     if float(config["stage1"]["max_grad_norm"]) <= 0.0:
         raise ValueError("stage1.max_grad_norm must be positive")
     experts = int(config["stage1"]["num_experts"])
-    probe_k = int(config["kneedle"]["probe_k"])
-    min_k = int(config["kneedle"]["min_k"])
-    max_k = int(config["kneedle"]["max_k"])
+    unexpected_keys = set(config["kneedle"]) - {"search_k", "k_min"}
+    if unexpected_keys:
+        raise ValueError(f"Unsupported Kneedle settings: {sorted(unexpected_keys)}")
+    search_k = int(config["kneedle"].get("search_k", 512))
+    k_min = int(config["kneedle"].get("k_min", 8))
     if experts < 2:
-        raise ValueError("GAC Stage 1 requires at least two experts")
-    if not (experts <= min_k <= max_k <= probe_k):
+        raise ValueError("SFT/DPP/RBF Stage 1 requires at least two experts")
+    if not (1 <= search_k <= 512) or k_min < 1:
+        raise ValueError("Kneedle requires 1 <= search_k <= 512 and positive k_min")
+    if config["stage1"].get("interaction_mode", "full") != "full":
+        raise ValueError("Stage 1 requires interaction_mode: full from the first update")
+    old_interaction_settings = [
+        key for key in config["stage1"]
+        if key.startswith("interaction_") and key != "interaction_mode"
+    ]
+    if old_interaction_settings:
         raise ValueError(
-            "Kneedle must satisfy num_experts <= min_k <= max_k <= probe_k"
+            f"Remove obsolete interaction schedule settings: {old_interaction_settings}"
         )
-    off = float(config["stage1"]["interaction_off_until"])
-    ramp = float(config["stage1"]["interaction_ramp_until"])
-    if not (0.0 <= off < ramp <= 1.0):
-        raise ValueError("Interaction schedule must satisfy 0 <= off < ramp <= 1")
     jitter = float(config["dpp"]["jitter"])
     maximum_jitter = float(config["dpp"]["max_jitter"])
     if not (0.0 < jitter <= maximum_jitter):
@@ -776,10 +765,8 @@ def train_stage1(
         int(config["seed"]),
     )
     _, stage1_head = decoder_and_lm_head(model)
-    if int(config["kneedle"]["probe_k"]) > int(stage1_head.weight.shape[0]) - 1:
-        raise ValueError(
-            "kneedle.probe_k cannot exceed vocabulary_size - 1 non-target tokens"
-        )
+    if int(stage1_head.weight.shape[0]) < 2:
+        raise ValueError("Stage 1 requires at least one non-target vocabulary token")
     groups = adapter_parameter_groups(model, adapter_names)
     parameter_lists = [list(group.values()) for group in groups]
     optimizers_and_schedulers = [
@@ -835,18 +822,22 @@ def train_stage1(
     scaling = float(config["lora"]["alpha"]) / float(config["lora"]["rank"])
 
     # Accumulation deliberately crosses epoch boundaries. For the canonical
-    # 1,000 x 3 run this produces ceil(3,000 / 32) = 94 optimizer updates,
+    # 996 x 3 run this produces ceil(2,988 / 16) = 187 optimizer updates,
     # instead of flushing three undersized batches at each epoch boundary.
-    sft_buffers = [zeros_like_parameters(parameters) for parameters in parameter_lists]
-    dpp_buffers: list[list[torch.Tensor]] | None = None
+    task_buffers = [zeros_like_parameters(parameters) for parameters in parameter_lists]
     full_window_counts: tuple[int, int] | None = None
     sft_token_count = 0
     dpp_sample_count = 0
     accumulated_microbatches = 0
     accumulated_sft_loss = 0.0
     accumulated_dpp_loss = 0.0
-    selected_k_sum = cap_hits = saturation_hits = 0.0
+    selected_k_sum = raw_k_sum = saturation_hits = 0.0
     support_selection_count = cholesky_fallbacks = 0
+    support_histograms = torch.zeros(
+        (2, int(config["kneedle"].get("search_k", 512)) + 1),
+        dtype=torch.long,
+        device=distributed.device,
+    )
 
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
@@ -859,59 +850,29 @@ def train_stage1(
             rng_stream = (
                 epoch * len(dataloader) + batch_index
             ) * distributed.world_size + distributed.rank
-            progress = global_step / max(total_steps - 1, 1)
-            gamma = interaction_scale(
-                progress,
-                float(config["stage1"]["interaction_off_until"]),
-                float(config["stage1"]["interaction_ramp_until"]),
+            # Every optimizer window uses the full interaction. Precombine SFT
+            # and weighted DPP before the VJP, retaining their global denominators.
+            if full_window_counts is None:
+                local_counts = torch.tensor(
+                    planned_counts[global_step],
+                    device=distributed.device,
+                    dtype=torch.float64,
+                )
+                all_reduce_tensor(local_counts)
+                full_window_counts = (
+                    int(local_counts[0].item()),
+                    int(local_counts[1].item()),
+                )
+            if full_window_counts[0] <= 0:
+                raise ValueError("An optimizer window has no SFT tokens")
+            combined_dpp_scale = (
+                float(config["stage1"]["dpp_weight"])
+                * full_window_counts[0]
+                / full_window_counts[1]
+                if full_window_counts[1] > 0
+                else 0.0
             )
-            phase = "sft" if gamma == 0.0 else "full" if gamma == 1.0 else "ramp"
-            combined_dpp_scale: float | None = None
-            if phase == "full":
-                if full_window_counts is None:
-                    local_counts = torch.tensor(
-                        planned_counts[global_step],
-                        device=distributed.device,
-                        dtype=torch.float64,
-                    )
-                    all_reduce_tensor(local_counts)
-                    full_window_counts = (
-                        int(local_counts[0].item()),
-                        int(local_counts[1].item()),
-                    )
-                if full_window_counts[0] <= 0:
-                    raise ValueError("A full-phase optimizer window has no SFT tokens")
-                combined_dpp_scale = (
-                    float(config["stage1"]["dpp_weight"])
-                    * full_window_counts[0]
-                    / full_window_counts[1]
-                    if full_window_counts[1] > 0
-                    else 0.0
-                )
-            elif phase == "ramp" and dpp_buffers is None:
-                dpp_buffers = [
-                    zeros_like_parameters(parameters) for parameters in parameter_lists
-                ]
-            if phase == "sft":
-                probe = _empty_probe(distributed.device, len(adapter_names))
-                expert_results = (
-                    sft_only_expert_gradients(
-                        model,
-                        adapter_name,
-                        expert,
-                        parameters,
-                        batch,
-                        global_step,
-                        rng_stream,
-                        int(config["seed"]),
-                        chunk_tokens,
-                        distributed.device,
-                    )
-                    for expert, (adapter_name, parameters) in enumerate(
-                        zip(adapter_names, parameter_lists, strict=True)
-                    )
-                )
-            elif forward_mode == "one_pass":
+            if forward_mode == "one_pass":
                 probe, expert_results = one_pass_expert_gradients(
                     model,
                     adapter_names,
@@ -955,20 +916,20 @@ def train_stage1(
                     )
                 )
             selected_k_sum += probe.mean_selected_k * probe.selection_count
-            cap_hits += probe.cap_rate * probe.selection_count
+            raw_k_sum += probe.mean_raw_k * probe.selection_count
             saturation_hits += probe.probe_saturation_rate * probe.selection_count
             support_selection_count += probe.selection_count
+            if probe.selection_count:
+                support_histograms[0].add_(probe.raw_k_histogram)
+                support_histograms[1].add_(probe.selected_k_histogram)
             cholesky_fallbacks += probe.dpp_metrics.cholesky_fallbacks
             for expert, (
-                sft_gradient,
-                dpp_gradient,
+                task_gradient,
+                _dpp_gradient,
                 sft_loss,
                 token_count,
             ) in enumerate(expert_results):
-                add_gradients_(sft_buffers[expert], sft_gradient)
-                if phase == "ramp":
-                    assert dpp_buffers is not None
-                    add_gradients_(dpp_buffers[expert], dpp_gradient)
+                add_gradients_(task_buffers[expert], task_gradient)
                 accumulated_sft_loss += sft_loss
                 sft_token_count += token_count if expert == 0 else 0
             accumulated_dpp_loss += probe.dpp_loss_sum
@@ -983,10 +944,7 @@ def train_stage1(
             if not boundary:
                 continue
 
-            all_reduce_grad_lists(sft_buffers)
-            if phase == "ramp":
-                assert dpp_buffers is not None
-                all_reduce_grad_lists(dpp_buffers)
+            all_reduce_grad_lists(task_buffers)
             counts = torch.tensor(
                 [sft_token_count, dpp_sample_count],
                 device=distributed.device,
@@ -1002,7 +960,7 @@ def train_stage1(
             probe_statistics = torch.tensor(
                 [
                     selected_k_sum,
-                    cap_hits,
+                    raw_k_sum,
                     saturation_hits,
                     support_selection_count,
                     cholesky_fallbacks,
@@ -1011,48 +969,30 @@ def train_stage1(
                 dtype=torch.float64,
             )
             all_reduce_tensor(probe_statistics)
-            if (
-                phase == "full"
-                and (int(counts[0].item()), int(counts[1].item())) != full_window_counts
-            ):
+            all_reduce_tensor(support_histograms)
+            if (int(counts[0].item()), int(counts[1].item())) != full_window_counts:
                 raise RuntimeError(
                     "Precomputed full-phase loss denominators do not match"
                 )
-            for values in sft_buffers:
+            for values in task_buffers:
                 divide_gradients_(values, float(counts[0].item()))
-            if phase == "ramp":
-                assert dpp_buffers is not None
-                for values in dpp_buffers:
-                    divide_gradients_(values, float(counts[1].item()))
-
-            distances: torch.Tensor | None = None
-            current_bandwidth: float | None = None
-            if phase == "sft":
-                final_gradients = sft_buffers
-                task_norms = tuple(
-                    float(vector_norm(values).item()) for values in sft_buffers
-                )
-                diagnostics = GACDiagnostics(0.0, task_norms, (), (), (), task_norms)
-            else:
-                set_all_adapters_trainable(model, adapter_names)
-                distances_for_step = effective_update_distances(groups, scaling)
-                current_bandwidth = bandwidth.update(distances_for_step)
-                repulsion, kernel, distances = repulsion_updates(
-                    groups, scaling, current_bandwidth, distances=distances_for_step
-                )
-                final_gradients, diagnostics = stable_gac_gradients(
-                    sft_buffers,
-                    dpp_buffers if phase == "ramp" else None,
-                    repulsion,
-                    kernel,
-                    gamma,
-                    float(config["stage1"]["dpp_weight"]),
-                    float(config["stage1"]["rbf_weight"]),
-                )
+            set_all_adapters_trainable(model, adapter_names)
+            distances_for_step = effective_update_distances(groups, scaling)
+            current_bandwidth = bandwidth.update(distances_for_step)
+            rbf = rbf_repulsion_gradients(
+                groups, scaling, current_bandwidth, distances=distances_for_step
+            )
+            final_gradients, diagnostics = compose_objective_gradients(
+                task_buffers,
+                rbf.gradients,
+                float(config["stage1"]["rbf_weight"]),
+            )
             preclip_norms = [
                 global_clip_grad_list_(values, float(config["stage1"]["max_grad_norm"]))
                 for values in final_gradients
             ]
+            if not all(math.isfinite(norm) for norm in preclip_norms):
+                raise FloatingPointError("Phase-1 scalar objective produced a non-finite gradient")
             for parameters, gradients, optimizer, scheduler in zip(
                 parameter_lists, final_gradients, optimizers, schedulers, strict=True
             ):
@@ -1067,12 +1007,12 @@ def train_stage1(
                 and global_step % int(config["stage1"]["log_every_steps"]) == 0
             ):
                 off_diagonal = (
-                    distances[
+                    rbf.distances[
                         torch.triu_indices(
                             len(adapter_names), len(adapter_names), 1
                         ).unbind()
                     ]
-                    if distances is not None
+                    if rbf.distances is not None
                     else None
                 )
                 metrics.log(
@@ -1080,18 +1020,24 @@ def train_stage1(
                     step=global_step,
                     epoch=epoch,
                     forward_mode=forward_mode,
-                    interaction_phase=phase,
-                    task_gradient_kind=(
-                        "sft_plus_weighted_dpp" if phase == "full" else "sft"
-                    ),
-                    probe_computed=phase != "sft",
-                    rbf_computed=phase != "sft",
+                    interaction_phase="full",
+                    task_gradient_kind="sft_plus_weighted_dpp",
+                    objective=STAGE1_METHOD,
+                    probe_computed=True,
+                    rbf_computed=True,
                     sft_nll=float(
                         losses[0].item()
                         / max(counts[0].item() * len(adapter_names), 1.0)
                     ),
                     dpp_loss=float(losses[1].item() / max(counts[1].item(), 1.0)),
-                    interaction=gamma,
+                    rbf_loss=rbf.loss,
+                    weighted_rbf_loss=float(config["stage1"]["rbf_weight"]) * rbf.loss,
+                    phase1_loss=(
+                        float(losses[0].item() / max(counts[0].item(), 1.0))
+                        + float(config["stage1"]["dpp_weight"]) * float(losses[1].item() / max(counts[1].item(), 1.0))
+                        + float(config["stage1"]["rbf_weight"]) * rbf.loss
+                    ),
+                    interaction=1.0,
                     learning_rate=optimizers[0].param_groups[0]["lr"],
                     bandwidth=current_bandwidth,
                     mean_delta_w_distance=(
@@ -1108,7 +1054,7 @@ def train_stage1(
                         probe_statistics[0].item()
                         / max(probe_statistics[3].item(), 1.0)
                     ),
-                    k_cap_rate=float(
+                    mean_raw_k=float(
                         probe_statistics[1].item()
                         / max(probe_statistics[3].item(), 1.0)
                     ),
@@ -1116,10 +1062,16 @@ def train_stage1(
                         probe_statistics[2].item()
                         / max(probe_statistics[3].item(), 1.0)
                     ),
+                    support_selection_count=int(probe_statistics[3].item()),
+                    # Histogram index is the support size. Aggregate across
+                    # experts, accumulated microbatches and distributed ranks.
+                    raw_k_histogram=support_histograms[0].tolist(),
+                    selected_k_histogram=support_histograms[1].tolist(),
                     cholesky_fallbacks=int(probe_statistics[4].item()),
                     task_gradient_norms=diagnostics.task_norms,
-                    dpp_gradient_norms=diagnostics.dpp_norms,
-                    repulsion_cap_factors=diagnostics.repulsion_cap_factors,
+                    rbf_gradient_norms=diagnostics.rbf_norms,
+                    weighted_rbf_gradient_norms=diagnostics.weighted_rbf_norms,
+                    rbf_task_gradient_ratios=diagnostics.rbf_task_ratios,
                     preclip_gradient_norms=preclip_norms,
                 )
             if (
@@ -1141,15 +1093,15 @@ def train_stage1(
                     distributed.world_size,
                 )
 
-            sft_buffers = [
+            task_buffers = [
                 zeros_like_parameters(parameters) for parameters in parameter_lists
             ]
-            dpp_buffers = None
             full_window_counts = None
             sft_token_count = dpp_sample_count = accumulated_microbatches = 0
             accumulated_sft_loss = accumulated_dpp_loss = 0.0
-            selected_k_sum = cap_hits = saturation_hits = 0.0
+            selected_k_sum = raw_k_sum = saturation_hits = 0.0
             support_selection_count = cholesky_fallbacks = 0
+            support_histograms.zero_()
         start_batch = 0
         barrier()
 
@@ -1173,6 +1125,7 @@ def train_stage1(
         manifest = {
             "schema_version": 1,
             "artifact": "stage1_checkpoint",
+            "method": STAGE1_METHOD,
             "global_step": global_step,
             "training_checkpoint": "checkpoint.pt",
             "training_checkpoint_sha256": file_sha256(output_dir / "checkpoint.pt"),

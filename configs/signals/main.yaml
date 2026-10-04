@@ -19,6 +19,6 @@ signals:
 runtime:
   lm_head_chunk_tokens: 64
 paths:
-  prepared: artifacts/prepared/s1k_1_1
+  prepared: artifacts/prepared/s1k_1_1_cot_only
   stage1: artifacts/stage1/main
   output: artifacts/supervision/main

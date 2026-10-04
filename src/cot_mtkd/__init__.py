@@ -1,3 +1,3 @@
-"""GAC-CoT-MTKD research implementation."""
+"""CoT-MTKD research implementation."""
 
 __version__ = "0.1.0"

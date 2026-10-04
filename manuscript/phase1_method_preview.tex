@@ -1,0 +1,230 @@
+% Standalone review copy. Paste the body of phase1_sections_3_2_3_3.tex
+% into the manuscript, replacing its current Sections 3.2 and 3.3.
+% This wrapper is for preview; it does not reproduce the ACL template.
+% Source: repository commit f59e73b2890867f3c80323f4d4ddf0d507b9a324.
+\documentclass[11pt,twocolumn]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{times}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage[authoryear,round]{natbib}
+\usepackage[hidelinks]{hyperref}
+\setlength{\columnsep}{0.25in}
+\newcommand{\Vocab}{\mathcal{V}}
+\newcommand{\Tset}{\mathcal{T}}
+\newcommand{\Lcal}{\mathcal{L}}
+\newcommand{\Bcal}{\mathcal{B}}
+\newcommand{\Ccal}{\mathcal{C}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator{\median}{median}
+\DeclareMathOperator{\clip}{clip}
+\begin{document}
+\setcounter{section}{3}
+\setcounter{subsection}{1}
+% Replacement for Sections 3.2 and 3.3 of the supplied ARR draft.
+% Uses only macros/packages already present in that draft.
+% Academic revision: main text focuses on the method and its rationale.
+
+\subsection{Adaptive non-target support}
+\label{sec:council}
+
+The council should capture complementary predictions among alternatives that
+its members consider likely. We therefore define a shared non-target support
+at each reasoning position, adapting its size to the predictions of individual
+experts. Taking the union of their candidate sets preserves alternatives
+favored by any member and provides a common space in which to compare their
+predictions.
+
+At position $t$, let $z^{\downarrow}_{m,t,j}$ and $v_{m,t,j}$ denote the
+$j$th-largest logit and its token identity among
+$\Vocab\setminus\{y_t\}$ for expert $m$. We search only the top
+$K=\min(512,|\Vocab|-1)$ non-target candidates. Both rank and logit axes
+are normalized within this window, so the criterion identifies a local knee
+in the plausible head region rather than a global vocabulary knee. We use
+a locally normalized bounded Kneedle-style criterion
+\citep{satopaa2011kneedle}:
+\begin{equation}
+\begin{gathered}
+ x_j=\frac{j-1}{K-1},\quad
+ u_{m,t,j}=\frac{z^{\downarrow}_{m,t,j}-z^{\downarrow}_{m,t,K}}
+ {z^{\downarrow}_{m,t,1}-z^{\downarrow}_{m,t,K}+\epsilon_{\mathrm{sel}}},\\
+ \widehat k_{m,t}=\argmax_{1\le j\le K}
+       \left[(1-x_j)-u_{m,t,j}\right],\\
+ k_{m,t}=\min\!\left(K,\max(\widehat k_{m,t},8)\right).
+\end{gathered}
+\label{eq:kneedle}
+\end{equation}
+Here $\epsilon_{\mathrm{sel}}>0$ ensures a well-defined logit normalization.
+The first maximizing rank is chosen when there is a tie. For $K=1$, we set
+$\widehat k_{m,t}=k_{m,t}=1$ directly. The search window is the only upper
+bound; the lower bound of eight avoids impoverished supports whenever enough
+candidates are available. The criterion identifies the largest deviation of
+the locally normalized logit curve from the descending diagonal.
+
+The council support is
+\begin{equation}
+ \Ccal_t=\bigcup_{m=1}^{M}
+              \{v_{m,t,j}:1\le j\le k_{m,t}\}.
+ \label{eq:stage1-support}
+\end{equation}
+All experts are evaluated on these common token identities, and the support
+is held fixed when differentiating the diversity objective. Excluding the
+observed token $y_t$ directs this objective toward alternative continuations
+of the reasoning trace.
+
+\subsection{Stage 1: Learning a diverse council}
+\label{sec:stage1}
+
+Stage~1 learns a council that combines fidelity to the observed traces with
+complementary predictions. We train $M$ independently initialized LoRA
+adapters on the same fixed trajectories. Let
+$\theta_m=\{A_m^l,B_m^l\}_{l\in\Lcal}$ denote the parameters of expert $m$.
+The training rule combines supervised learning, a determinantal objective in
+prediction space, and a kernel interaction in effective-weight space.
+
+\paragraph{Trace supervision.}
+Each expert learns from the full observed response through supervised
+fine-tuning. Let $\Tset_n^{\mathrm{resp}}$ denote its response positions and
+$p_{m,n,t}$ the predictive distribution conditioned on the problem and
+observed prefix. The likelihood objective is
+\begin{equation}
+ \Lcal_{\mathrm{SFT}}^{(m)}=
+ -\frac{1}{N_{\mathrm{resp}}}
+ \sum_{n\in\Bcal}\sum_{t\in\Tset_n^{\mathrm{resp}}}
+ \log p_{m,n,t}(y_{n,t}),
+ \label{eq:sft1}
+\end{equation}
+where $N_{\mathrm{resp}}=\sum_{n\in\Bcal}|\Tset_n^{\mathrm{resp}}|$.
+This term anchors each expert to the supplied reasoning and answer, while the
+council interactions encourage complementary behavior among alternatives.
+
+\paragraph{Diversity in prediction space.}
+We measure predictive diversity on the non-target support from
+\S\ref{sec:council}. For each reasoning position, define the normalized
+feature vector
+\begin{equation}
+ v_{m,t}(v)=\frac{p_{m,t}(v)}
+                  {\sqrt{\sum_{u\in\Ccal_t}p_{m,t}(u)^2}},
+ \qquad v\in\Ccal_t.
+ \label{eq:stage1-features}
+\end{equation}
+This representation depends on the relative probabilities of the alternatives,
+independently of their total mass. Let $\mathbf V_t$ stack these vectors as
+rows. For reasoning step $s$ of example $n$, with content positions
+$\Tset_{n,s}^{\mathrm r}$, define
+\begin{equation}
+ G_{n,s}=\frac{1}{|\Tset_{n,s}^{\mathrm r}|}
+           \sum_{t\in\Tset_{n,s}^{\mathrm r}}
+                   \mathbf V_t\mathbf V_t^{\top}.
+ \label{eq:stage1-gram}
+\end{equation}
+This is the Gram matrix of the experts' concatenated, normalized step
+representations. We encourage these representations to span distinct
+directions using a determinantal penalty \citep{kulesza2012dpp}:
+\begin{equation}
+ \begin{gathered}
+ \ell_{n,s}=-\frac{1}{M}\log\det(G_{n,s}+\epsilon_{n,s}\mathbf I),\\
+ \Lcal_{\mathrm{DPP}}=
+ \frac{1}{|\Bcal_{\mathrm r}|}
+ \sum_{n\in\Bcal_{\mathrm r}}\frac{1}{|S_n^{\mathrm r}|}
+ \sum_{s\in S_n^{\mathrm r}}\ell_{n,s}.
+ \end{gathered}
+ \label{eq:dpp}
+\end{equation}
+Here $\epsilon_{n,s}>0$ is a small diagonal regularizer,
+$S_n^{\mathrm r}$ contains the nonempty reasoning steps, and
+$\Bcal_{\mathrm r}$ contains the examples with such steps. The determinant
+acts on the step-averaged Gram matrix, encouraging complementary predictions
+across the reasoning step. Equal weighting across steps and examples limits
+the influence of differences in trace length. This objective applies only to
+reasoning content; SFT supervises the full response.
+
+\paragraph{Diversity in effective-weight space.}
+The LoRA factorization is nonunique: for any invertible $R$,
+$(B_m^lR)(R^{-1}A_m^l)=B_m^lA_m^l$. We therefore compare experts through
+their effective updates $\Delta W_m^l=(\alpha/r)B_m^lA_m^l$, using
+\begin{equation}
+ d_{mq}^{2}=\frac{1}{|\Lcal|}\sum_{l\in\Lcal}
+ \frac{\|\Delta W_m^l-\Delta W_q^l\|_F^2}
+      {d_{\mathrm{out}}^l d_{\mathrm{in}}^l}.
+ \label{eq:stage1-distance}
+\end{equation}
+Normalizing by the matrix size gives each adapted projection equal weight.
+The resulting distance is invariant to refactorizations that preserve the
+effective update.
+
+An RBF kernel $K_{mq}=\exp(-d_{mq}^{2}/h)$ expresses proximity between
+experts, where the positive bandwidth $h$ follows a smoothed median of their
+pairwise distances. Inspired by kernel-based particle methods
+\citep{liu2016svgd}, we define a similarity potential and a repulsive direction:
+\begin{equation}
+ \Phi=\frac{1}{\binom{M}{2}}\sum_{m<q}K_{mq},
+ \qquad r_m=-\nabla_{\theta_m}\Phi.
+ \label{eq:stage1-repulsion}
+\end{equation}
+With $h$ held fixed, $r_m$ is a local descent direction for pairwise similarity,
+providing a second diversity signal alongside the prediction-space objective.
+
+\paragraph{Coupled council update.}
+Let $g_m^{\mathrm{SFT}}=\nabla_{\theta_m}\Lcal_{\mathrm{SFT}}^{(m)}$ and
+$g_m^{\mathrm{DPP}}=\nabla_{\theta_m}\Lcal_{\mathrm{DPP}}$. The kernel
+coordinates gradient exchange across experts:
+\begin{equation}
+ \begin{gathered}
+ \omega_{qm}=\frac{K_{qm}}{\sum_{j=1}^{M}K_{jm}},\\
+ a_m=\sum_{q=1}^{M}\omega_{qm}
+       \bigl(g_q^{\mathrm{SFT}}+\lambda_{\mathrm{div}}g_q^{\mathrm{DPP}}\bigr).
+ \end{gathered}
+ \label{eq:stage1-mixing}
+\end{equation}
+The weights form a convex combination for each receiving expert, favoring
+updates from members with similar effective weights. Gradients are combined
+in corresponding LoRA factor coordinates. We limit the repulsive direction
+relative to this aggregate by setting
+\begin{equation}
+ \widetilde r_m=
+ \min\left\{1,\frac{\|a_m\|_2}{\|r_m\|_2+\delta}\right\}r_m,
+ \label{eq:stage1-repulsion-cap}
+\end{equation}
+where $\delta>0$ is a small stabilizer. Thus
+$\|\widetilde r_m\|_2\le\|a_m\|_2$.
+
+A scheduling coefficient $\gamma\in[0,1]$ introduces the council interactions
+gradually after an initial period of independent SFT. The resulting
+pseudo-gradient is
+\begin{equation}
+ \begin{aligned}
+ g_m={}&(1-\gamma)g_m^{\mathrm{SFT}}\\
+       &+\gamma\bigl(a_m-\lambda_{\mathrm{rep}}\widetilde r_m\bigr).
+ \end{aligned}
+ \label{eq:stage1-update}
+\end{equation}
+The coefficients $\lambda_{\mathrm{div}}$ and $\lambda_{\mathrm{rep}}$ control
+the strengths of predictive diversity and weight-space repulsion. Kernel
+weights and the repulsion rescaling are fixed when assembling this direction.
+Together, gradient exchange and repulsion balance shared trace supervision
+with complementary expert behavior.
+
+\begin{thebibliography}{3}
+\small
+\bibitem[Satop\"a\"a et~al.(2011)]{satopaa2011kneedle}
+Ville Satop\"a\"a, Jeannie Albrecht, David Irwin, and Barath Raghavan. 2011.
+\href{https://www.cs.williams.edu/~jeannie/papers/kneedle-simplex11.pdf}
+{Finding a ``Kneedle'' in a Haystack: Detecting Knee Points in System Behavior}.
+In \emph{2011 31st International Conference on Distributed Computing Systems Workshops}, pages 166--171.
+
+\bibitem[Kulesza and Taskar(2012)]{kulesza2012dpp}
+Alex Kulesza and Ben Taskar. 2012.
+\href{https://arxiv.org/abs/1207.6083}
+{Determinantal Point Processes for Machine Learning}.
+\emph{Foundations and Trends in Machine Learning}, 5(2--3):123--286.
+
+\bibitem[Liu and Wang(2016)]{liu2016svgd}
+Qiang Liu and Dilin Wang. 2016.
+\href{https://arxiv.org/abs/1608.04471}
+{Stein Variational Gradient Descent: A General Purpose Bayesian Inference Algorithm}.
+In \emph{Advances in Neural Information Processing Systems 29}.
+\end{thebibliography}
+\end{document}

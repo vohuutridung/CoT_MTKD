@@ -27,7 +27,6 @@ class PreparedRecord:
     step_ids: list[int]
     question: str
     thinking: str
-    attempt: str
     solution: str
     deepseek_grade: str | None
     original_length: int
@@ -35,6 +34,8 @@ class PreparedRecord:
     original_steps: int
     kept_steps: int
     truncated: bool
+    # Legacy suffix-boundary name: in CoT-only records this points to EOS.
+    # Gold-answer probes construct their own continuation from `solution`.
     answer_start: int
     reasoning_start: int
     tokenizer_fingerprint: str
@@ -44,6 +45,11 @@ class PreparedRecord:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "PreparedRecord":
+        if "attempt" in value:
+            raise ValueError(
+                "Prepared data with an attempt field is obsolete; rerun prepare "
+                "to build the filtered CoT-only corpus"
+            )
         normalized = dict(value)
         normalized["offset_mapping"] = [
             tuple(int(item) for item in pair) for pair in normalized["offset_mapping"]

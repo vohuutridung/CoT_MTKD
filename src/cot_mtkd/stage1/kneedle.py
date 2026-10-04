@@ -3,36 +3,47 @@ from __future__ import annotations
 import torch
 
 
-def capped_k_from_probe(
+@torch.no_grad()
+def local_k_from_probe(
     sorted_probe_logits: torch.Tensor,
-    non_target_min: torch.Tensor,
-    non_target_max: torch.Tensor,
-    vocab_size: int,
-    min_k: int = 5,
-    max_k: int = 128,
+    k_min: int = 8,
     epsilon: float = 1.0e-12,
-) -> torch.Tensor:
-    """Capped/probed Kneedle on descending non-target logits.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Local Kneedle over the top-512 non-target logits (or fewer candidates).
 
-    `sorted_probe_logits` has shape `[tokens, probe_k]`. Global non-target
-    min/max are used even though only the leading probe ranks are sorted.
+    Both axes are normalized inside the supplied descending search window:
+    x[j] = j / (K - 1), u[j] = (z[j] - z[-1]) / (z[0] - z[-1] + epsilon),
+    using zero-based j. Return raw knee ranks and final support sizes, with
+    k = min(K, max(raw_k, k_min)). Ties choose the first maximum. For K=1,
+    both sizes are 1; for K=0 they are 0. Selection is detached from autograd.
     """
     if sorted_probe_logits.ndim != 2:
-        raise ValueError("Probe logits must have shape [tokens, probe_k]")
+        raise ValueError("Probe logits must have shape [tokens, K]")
+    if k_min < 1 or epsilon <= 0:
+        raise ValueError("k_min and epsilon must be positive")
+    tokens, window = sorted_probe_logits.shape
+    if window > 512:
+        raise ValueError("Local Kneedle search window cannot exceed 512 candidates")
+    if window <= 1:
+        raw_k = torch.full(
+            (tokens,), window, device=sorted_probe_logits.device, dtype=torch.int64
+        )
+        return raw_k, raw_k.clone()
     ranks = torch.arange(
-        1,
-        sorted_probe_logits.shape[1] + 1,
+        window,
         device=sorted_probe_logits.device,
-        dtype=torch.float32,
+        dtype=torch.float64 if sorted_probe_logits.dtype == torch.float64 else torch.float32,
     )
-    x = ranks / float(max(vocab_size - 1, 1))
-    denominator = (non_target_max - non_target_min).unsqueeze(-1).clamp_min(epsilon)
-    y = (
-        sorted_probe_logits.float() - non_target_min.unsqueeze(-1).float()
-    ) / denominator
-    distance = (1.0 - x.unsqueeze(0)) - y
-    elbow = distance.argmax(dim=-1) + 1
-    return elbow.clamp(min=min_k, max=max_k).to(torch.int64)
+    x = ranks / float(window - 1)
+    # Preserve FP64 inputs for reference checks; promote FP16/BF16 to FP32.
+    logits = sorted_probe_logits.to(
+        torch.float64 if sorted_probe_logits.dtype == torch.float64 else torch.float32
+    )
+    tail = logits[:, -1:]
+    u = (logits - tail) / (logits[:, :1] - tail + epsilon)
+    distance = (1.0 - x.unsqueeze(0)) - u
+    raw_k = (distance.argmax(dim=-1) + 1).to(torch.int64)
+    return raw_k, raw_k.clamp(min=k_min).clamp(max=window)
 
 
 def build_union_support(
