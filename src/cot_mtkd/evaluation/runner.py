@@ -1,237 +1,199 @@
+"""P-ALIGN evaluation, identical in protocol to exp_s1k ``eval/run_eval.py``.
+
+For every seed: render ``"<instruction> <problem>"`` with the chat template
+(single user turn, default system prompt), sample k completions, grade them
+with :func:`grade_answer` and report Pass@1 as the mean over the k samples.
+"""
+
 from __future__ import annotations
 
 import json
 import logging
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
-import torch
-from tqdm.auto import tqdm
-
-from ..models.multi_adapter import (
-    create_student_model,
-    load_adapter_bundle,
-    load_adapter_state,
-    load_tokenizer,
-    require_same_model_source,
-)
-from ..utils.distributed import DistributedContext, barrier, shard_indices
-from ..utils.manifest import (
-    file_sha256,
-    files_fingerprint,
-    fingerprint,
-    read_json,
-    require_file_sha256,
-    runtime_metadata,
-    write_config_snapshot,
-    write_json,
-)
-from ..utils.seed import derived_seed
-from .grading import grade_math, normalize_answer
-from .metrics import macro_average, pass_metrics
+from ..utils.manifest import runtime_metadata, write_config_snapshot, write_json
+from .adapter import adapter_rank, resolve_adapter
+from .benchmarks import load_benchmark
+from .grading import grade_samples
+from .metrics import benchmark_metrics, macro_average, seed_summary
 
 LOGGER = logging.getLogger(__name__)
 
-
-def _question(record: dict[str, Any]) -> str:
-    for key in ("problem", "question", "prompt"):
-        if key in record:
-            return str(record[key])
-    raise KeyError(f"Could not find a question field in {sorted(record)}")
+PROTOCOL_KEYS = ("model", "adapter", "generation", "benchmarks", "limit")
 
 
-def _answer(record: dict[str, Any]) -> Any:
-    for key in ("answer", "solution", "final_answer"):
-        if key in record:
-            return record[key]
-    raise KeyError(f"Could not find an answer field in {sorted(record)}")
-
-
-def _load_benchmark(specification: dict[str, Any]):
-    from datasets import load_dataset
-
-    local_json = specification.get("local_json")
-    if local_json:
-        return load_dataset(
-            "json",
-            data_files=str(Path(local_json)),
-            split=specification.get("split", "train"),
-        )
-    return load_dataset(
-        specification["dataset"],
-        split=specification["split"],
-        revision=specification.get("revision"),
+def render_prompt(tokenizer: Any, instruction: str, problem: str) -> str:
+    content = f"{instruction} {problem}" if instruction else problem
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": content}],
+        tokenize=False,
+        add_generation_prompt=True,
     )
 
 
-def _chat_prompt(tokenizer: Any, prefix: str, problem: str) -> str:
-    content = f"{prefix}\n\n{problem}"
-    if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(
-            [{"role": "user", "content": content}],
-            tokenize=False,
-            add_generation_prompt=True,
+def _grade(arguments: tuple[list[str], str]) -> list[bool]:
+    return grade_samples(*arguments)
+
+
+def _check_model_source(config: dict[str, Any], manifest: dict[str, Any] | None) -> None:
+    if manifest is None:
+        LOGGER.warning("No Stage-2 manifest next to the adapter; model source not checked")
+        return
+    trained = manifest["config"]["model"]
+    for key in ("name_or_path", "revision"):
+        if trained.get(key) != config["model"].get(key):
+            raise RuntimeError(
+                f"Adapter was trained on model {key}={trained.get(key)!r}, "
+                f"but evaluation uses {config['model'].get(key)!r}"
+            )
+
+
+def _build_engine(config: dict[str, Any], adapter_dir: Path | None, tokenizer: Any):
+    name = config["engine"]["name"]
+    if name == "vllm":
+        from .engines import VLLMEngine
+
+        return VLLMEngine(
+            config["model"],
+            config["generation"],
+            config["engine"],
+            adapter_dir,
+            adapter_rank(adapter_dir),
         )
-    return content
+    if name == "hf":
+        from .engines import HFEngine
+
+        return HFEngine(config["model"], config["generation"], adapter_dir, tokenizer)
+    raise ValueError(f"Unknown engine {name!r}; use vllm or hf")
 
 
-def evaluate(config: dict[str, Any], distributed: DistributedContext) -> dict[str, Any]:
-    stage2_dir = Path(config["paths"]["stage2"])
+def _evaluate_seed(
+    config: dict[str, Any],
+    engine: Any,
+    tokenizer: Any,
+    benchmarks: dict[str, list[Any]],
+    seed: int,
+    seed_dir: Path,
+    executor: ProcessPoolExecutor,
+) -> dict[str, Any]:
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    instruction = str(config["generation"]["instruction"])
+    started = time.time()
+    results: dict[str, Any] = {}
+    for name, items in benchmarks.items():
+        prompts = [render_prompt(tokenizer, instruction, item.question) for item in items]
+        samples = engine.generate(prompts, seed)
+        texts = [[sample.text for sample in group] for group in samples]
+        correct = list(
+            executor.map(
+                _grade, [(group, item.answer) for group, item in zip(texts, items)], chunksize=4
+            )
+        )
+        records = [
+            {
+                "index": item.index,
+                "question": item.question,
+                "gold": item.answer,
+                "completions": [sample.text for sample in group],
+                "token_counts": [sample.num_tokens for sample in group],
+                "truncated": [sample.truncated for sample in group],
+                "correct": flags,
+            }
+            for item, group, flags in zip(items, samples, correct)
+        ]
+        with (seed_dir / f"{name}.jsonl").open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        results[name] = benchmark_metrics(records)
+        LOGGER.info(
+            "seed %d | %s: Pass@1 %.2f | Pass@%d %.2f | mean tokens %.0f | truncated %.1f%%",
+            seed,
+            name,
+            100 * results[name]["pass@1"],
+            results[name]["k"],
+            100 * results[name][f"pass@{results[name]['k']}"],
+            results[name]["mean_tokens"],
+            100 * results[name]["truncated_fraction"],
+        )
+    summary = {
+        "seed": seed,
+        "benchmarks": results,
+        **macro_average(results),
+        "runtime_sec": time.time() - started,
+    }
+    write_json(seed_dir / "result.json", summary)
+    LOGGER.info("seed %d | Avg Pass@1 %.2f", seed, 100 * summary["avg"])
+    return summary
+
+
+def evaluate(config: dict[str, Any]) -> dict[str, Any]:
+    from transformers import AutoTokenizer
+
+    project_root = Path(config["_project_root"])
     output_dir = Path(config["paths"]["output"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    public_config = {
-        key: value for key, value in config.items() if not key.startswith("_")
-    }
-    config_snapshot = output_dir / "config.yaml"
-    if distributed.is_main:
-        write_config_snapshot(config_snapshot, public_config)
-    barrier()
-    stage2_manifest = read_json(stage2_dir / "manifest.json")
-    require_file_sha256(
-        stage2_dir, stage2_manifest, "adapter_bundle", "adapter_bundle_sha256"
+    public_config = {key: value for key, value in config.items() if not key.startswith("_")}
+    # Seeds, engine and overwrite may change between invocations; the protocol may not.
+    write_config_snapshot(
+        output_dir / "protocol.yaml",
+        {key: public_config.get(key) for key in PROTOCOL_KEYS},
     )
-    require_file_sha256(
-        stage2_dir, stage2_manifest, "config_file", "config_file_sha256"
-    )
-    stage2_config = stage2_manifest["config"]
-    require_same_model_source(
-        config["model"], stage2_config["model"], "Evaluation/Stage 2"
-    )
-    tokenizer = load_tokenizer(config["model"])
-    model = create_student_model(
-        config["model"], stage2_config["lora"], distributed.device, int(config["seed"])
-    )
-    bundle = load_adapter_bundle(stage2_dir / stage2_manifest["adapter_bundle"])
-    load_adapter_state(model, "student", bundle["student"])
-    model.eval()
-    generation = config["generation"]
 
-    for benchmark in config["benchmarks"]:
-        name = str(benchmark["name"])
-        dataset = _load_benchmark(benchmark)
-        expected_records = benchmark.get("expected_records")
-        if expected_records is not None and len(dataset) != int(expected_records):
-            raise RuntimeError(
-                f"Benchmark {name} has {len(dataset)} rows; expected {int(expected_records)}"
+    adapter_dir, stage2_manifest = resolve_adapter(config["adapter"], project_root)
+    _check_model_source(config, stage2_manifest)
+    LOGGER.info("Evaluating adapter %s", adapter_dir or "<base model>")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config["model"]["name_or_path"], revision=config["model"].get("revision")
+    )
+    limit = config.get("limit")
+    benchmarks = {
+        str(spec["name"]): load_benchmark(spec, project_root, limit)
+        for spec in config["benchmarks"]
+    }
+    seeds = [int(seed) for seed in config["seeds"]]
+    overwrite = bool(config.get("overwrite", False))
+
+    results: dict[int, dict[str, Any]] = {}
+    engine = None
+    with ProcessPoolExecutor(max_workers=min(32, os.cpu_count() or 1)) as executor:
+        for seed in seeds:
+            seed_dir = output_dir / f"seed{seed}"
+            done = seed_dir / "result.json"
+            if done.exists() and not overwrite:
+                LOGGER.info("seed %d already evaluated; skipping (%s)", seed, done)
+                results[seed] = json.loads(done.read_text(encoding="utf-8"))
+                continue
+            if engine is None:
+                engine = _build_engine(config, adapter_dir, tokenizer)
+            results[seed] = _evaluate_seed(
+                config, engine, tokenizer, benchmarks, seed, seed_dir, executor
             )
-        shard_path = output_dir / (
-            f"{name}-rank{distributed.rank:05d}-of{distributed.world_size:05d}.jsonl"
+
+    summary = {
+        "schema_version": 2,
+        "artifact": "evaluation_run",
+        "adapter": str(adapter_dir) if adapter_dir else None,
+        "stage2_global_step": (stage2_manifest or {}).get("global_step"),
+        **seed_summary(results),
+        "config": public_config,
+        "runtime": runtime_metadata(str(project_root)),
+    }
+    write_json(output_dir / "summary.json", summary)
+    LOGGER.info(
+        "Avg Pass@1 over seeds %s: %.2f ± %.2f | Avg Pass@k %.2f",
+        seeds,
+        100 * summary["avg"]["mean"],
+        100 * summary["avg"]["std"],
+        100 * summary["avg_passk"]["mean"],
+    )
+    for name, value in summary["benchmarks"].items():
+        LOGGER.info(
+            "  %-8s Pass@1 %.2f ± %.2f", name, 100 * value["pass@1"]["mean"],
+            100 * value["pass@1"]["std"],
         )
-        temporary = shard_path.with_suffix(".jsonl.tmp")
-        with temporary.open("w", encoding="utf-8") as handle:
-            iterator = shard_indices(
-                len(dataset), distributed.rank, distributed.world_size
-            )
-            for index in tqdm(
-                iterator, desc=f"Evaluate {name} rank {distributed.rank}"
-            ):
-                raw = dict(dataset[index])
-                problem = _question(raw)
-                reference = _answer(raw)
-                prompt = _chat_prompt(
-                    tokenizer, str(generation["prompt_prefix"]), problem
-                )
-                encoded = tokenizer(
-                    prompt, return_tensors="pt", add_special_tokens=False
-                )
-                encoded = {
-                    key: value.to(distributed.device) for key, value in encoded.items()
-                }
-                seed = derived_seed(int(config["seed"]), "evaluation", name, index)
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed(seed)
-                with torch.inference_mode():
-                    outputs = model.generate(
-                        **encoded,
-                        do_sample=bool(generation["do_sample"]),
-                        temperature=float(generation["temperature"]),
-                        top_p=float(generation["top_p"]),
-                        repetition_penalty=float(generation["repetition_penalty"]),
-                        max_new_tokens=int(generation["max_new_tokens"]),
-                        num_return_sequences=int(generation["num_return_sequences"]),
-                        pad_token_id=tokenizer.pad_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                    )
-                prompt_length = encoded["input_ids"].shape[1]
-                responses = tokenizer.batch_decode(
-                    outputs[:, prompt_length:], skip_special_tokens=True
-                )
-                correct = [
-                    grade_math(
-                        response,
-                        reference,
-                        bool(config["grading"].get("prefer_math_verify", True)),
-                        float(config["grading"]["timeout_seconds"]),
-                    )
-                    for response in responses
-                ]
-                parsed_answers = [normalize_answer(response) for response in responses]
-                handle.write(
-                    json.dumps(
-                        {
-                            "benchmark": name,
-                            "index": index,
-                            "problem": problem,
-                            "reference": reference,
-                            "prompt": prompt,
-                            "generations": responses,
-                            "parsed_answers": parsed_answers,
-                            "parsed_reference": normalize_answer(reference),
-                            "correct": correct,
-                            "seed": seed,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-        temporary.replace(shard_path)
-    barrier()
-    if distributed.is_main:
-        benchmark_metrics: dict[str, dict[str, float | int]] = {}
-        for benchmark in config["benchmarks"]:
-            name = str(benchmark["name"])
-            records = []
-            paths = [
-                output_dir
-                / f"{name}-rank{rank:05d}-of{distributed.world_size:05d}.jsonl"
-                for rank in range(distributed.world_size)
-            ]
-            for path in paths:
-                with path.open("r", encoding="utf-8") as handle:
-                    records.extend(json.loads(line) for line in handle if line.strip())
-            records.sort(key=lambda value: int(value["index"]))
-            expected_records = benchmark.get("expected_records")
-            if expected_records is not None and len(records) != int(expected_records):
-                raise RuntimeError(
-                    f"Generated {len(records)} records for {name}; "
-                    f"expected {int(expected_records)}"
-                )
-            combined_path = output_dir / f"{name}.jsonl"
-            with combined_path.open("w", encoding="utf-8") as handle:
-                for record in records:
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            benchmark_metrics[name] = pass_metrics(records)
-        prediction_files = [
-            f"{benchmark['name']}.jsonl" for benchmark in config["benchmarks"]
-        ]
-        manifest = {
-            "schema_version": 1,
-            "artifact": "evaluation_run",
-            "benchmarks": benchmark_metrics,
-            "macro_average": macro_average(benchmark_metrics),
-            "prediction_files": prediction_files,
-            "prediction_files_fingerprint": files_fingerprint(
-                output_dir / name for name in prediction_files
-            ),
-            "stage2_manifest_fingerprint": fingerprint(stage2_manifest),
-            "config": public_config,
-            "config_fingerprint": fingerprint(public_config),
-            "config_file": config_snapshot.name,
-            "config_file_sha256": file_sha256(config_snapshot),
-            "runtime": runtime_metadata(config["_project_root"]),
-        }
-        write_json(output_dir / "manifest.json", manifest)
-        LOGGER.info("Evaluation macro average: %s", manifest["macro_average"])
-    barrier()
-    return read_json(output_dir / "manifest.json")
+    return summary

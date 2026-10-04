@@ -1,43 +1,55 @@
-schema_version: 1
-seed: 42
+# P-ALIGN protocol exactly as in exp_s1k eval/run_eval.py (vLLM, 3 seeds).
+# Override any key with --set, e.g. --set adapter.path=/data/student --set seeds=[42].
+schema_version: 2
 model:
   name_or_path: Qwen/Qwen2.5-7B-Instruct
   revision: a09a35458c702b33eeacc393d103063234e8bc28
   dtype: bfloat16
-  attn_implementation: flash_attention_2
-  use_cache: true
+  attn_implementation: sdpa          # HF engine only
+adapter:
+  # Stage-2 output dir, unpacked 65_pack_student.sh archive, PEFT adapter dir,
+  # Hugging Face Hub repo id, or "base" for the untuned model.
+  path: artifacts/stage2/output_space
+  revision: null                     # Hub only
+  subfolder: null                    # Hub only
+seeds: [42, 43, 44]
 generation:
-  prompt_prefix: "Please reason step by step, and put your final answer within \\boxed{}."
-  num_return_sequences: 3
-  do_sample: true
+  instruction: "Please reason step by step, and put your final answer within \\boxed{}."
+  num_samples: 3                     # k; Pass@1 = mean over k, Pass@3 = any correct
   temperature: 0.6
   top_p: 0.9
+  top_k: -1                          # disabled (Qwen generation_config's top_k=20 is not used)
   repetition_penalty: 1.05
   max_new_tokens: 4096
+engine:
+  name: vllm                         # vllm (reference) | hf (slow fallback)
+  gpu_memory_utilization: 0.90
+  max_model_len: null                # null = max_new_tokens + 2048
+  tensor_parallel_size: 1
+  max_num_seqs: 256
+  max_num_batched_tokens: 16384
+  seed: 42
 benchmarks:
-  - name: aime25
-    dataset: yentinglin/aime_2025
-    split: train
-    revision: 6f71d77b0b89b9dabe07ab466c51df33f514df7f
-    expected_records: 30
-  - name: aime24
-    dataset: HuggingFaceH4/aime_2024
-    split: train
-    revision: 2fe88a2f1091d5048c0f36abc874fb997b3dd99a
-    expected_records: 30
-  - name: amc12
-    dataset: AI-MO/aimo-validation-amc
-    split: train
-    revision: 69d78a4a2c840e82d69af6bc742bda09005f6316
-    expected_records: 83
   - name: math500
     dataset: HuggingFaceH4/MATH-500
     split: test
     revision: 6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be
     expected_records: 500
-grading:
-  timeout_seconds: 10
-  prefer_math_verify: true
+  - name: aime24
+    dataset: HuggingFaceH4/aime_2024
+    split: train
+    revision: 2fe88a2f1091d5048c0f36abc874fb997b3dd99a
+    expected_records: 30
+  - name: aime25
+    dataset: opencompass/AIME2025
+    subsets: [AIME2025-I, AIME2025-II]
+    split: test
+    revision: a6ad95f611d72cf628a80b58bd0432ef6638f958
+    expected_records: 30
+  - name: amc
+    local_json: data/eval/amc12_p_align.jsonl
+    expected_records: 83
+limit: null                          # problems per benchmark, for smoke tests only
+overwrite: false                     # true re-runs seeds that already have result.json
 paths:
-  stage2: artifacts/stage2/output_space
   output: artifacts/evaluation/p_align

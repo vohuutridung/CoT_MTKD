@@ -37,10 +37,9 @@ CUDA_VISIBLE_DEVICES=0 \
   ./project_commands.sh stage2-stress
 ./project_commands.sh stage2
 
-.venv/bin/python -m cot_mtkd.cli.evaluate \
-  --config configs/eval/p_align.yaml \
-  --set paths.stage2=artifacts/stage2/output_space_local \
-  --set paths.output=artifacts/evaluation/p_align_local
+EVAL_ADAPTER=artifacts/stage2/output_space_local \
+  EVAL_OUTPUT=artifacts/evaluation/p_align_local \
+  ./project_commands.sh evaluate
 ```
 
 Purpose of each command above:
@@ -65,8 +64,9 @@ Purpose of each command above:
 7. `stage2` trains the student for three epochs with output-space KD and writes
    checkpoints, the final student adapter and logs to `artifacts/stage2/output_space_local`.
 8. The final `evaluate` command optionally generates and grades the local
-   student on AIME 2025, AIME 2024, AMC and MATH-500. It writes benchmark outputs
-   to `artifacts/evaluation/p_align_local`; it is separate from training.
+   student on MATH-500, AIME 2024, AIME 2025 and AMC (see [Evaluation](#evaluation)).
+   It writes outputs to `artifacts/evaluation/p_align_local`; it is separate
+   from training and needs vLLM.
 
 ### Train Phase 2 using the existing Hugging Face experts
 
@@ -104,7 +104,8 @@ Purpose of each command above:
    contains `checkpoint.pt`, `manifest.json`, `metrics.jsonl` and the detailed
    `reasoning_steps.jsonl` and `performance.jsonl` logs.
 7. `evaluate` optionally benchmarks the exported student. Training is complete
-   when `stage2` finishes; evaluation is not needed to export the adapter.
+   when `stage2` finishes; evaluation is not needed to export the adapter and
+   can run on another machine (see [Evaluation](#evaluation)).
 
 The H200 stress checks are preflights; on another CUDA GPU, use the individual
 training commands and a memory check suited to that hardware. Neither route
@@ -131,7 +132,8 @@ are skipped when CUDA is unavailable:
 ## Multi-GPU
 
 Run preparation/import once, and use `NPROC_PER_NODE` for distributed medoid
-selection, training and evaluation. For example, using eight GPUs with the Hub
+selection and training. Evaluation runs in one vLLM process; see
+[Evaluation](#evaluation) for using several GPUs. For example, using eight GPUs with the Hub
 experts:
 
 ```bash
@@ -140,7 +142,7 @@ export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space.yaml
 ./project_commands.sh fetch-teachers
 NPROC_PER_NODE=8 ./project_commands.sh stage2-medoid
 NPROC_PER_NODE=8 ./project_commands.sh stage2
-NPROC_PER_NODE=8 ./project_commands.sh evaluate
+./project_commands.sh evaluate
 ```
 
 The stress commands require one visible H200 rather than a distributed launch.
@@ -413,8 +415,76 @@ The gradient-space variant remains available with
 gold-answer anchors and artifact paths remain distinct. Checkpoints bind the
 selected method, configuration and source fingerprints, so an output-space run
 cannot resume a gradient-space or legacy dual-source checkpoint. Evaluation
-defaults to `artifacts/stage2/output_space`; evaluating another variant requires
-setting the corresponding `paths.stage2` in an evaluation config.
+defaults to `artifacts/stage2/output_space`; evaluate another variant with
+`EVAL_ADAPTER=<its Stage-2 output dir>`.
+
+## Evaluation
+
+`evaluate` reproduces the exp_s1k P-ALIGN evaluation (`eval/run_eval.py`)
+exactly, so scores are directly comparable with the baselines measured there
+(e.g. gate2 36.5):
+
+| Setting | Value |
+|---|---|
+| Benchmarks | MATH-500 (500), AIME 2024 (30), AIME 2025 opencompass I+II (30), AMC12 from the P-ALIGN repo (83, vendored in `data/eval/amc12_p_align.jsonl`) |
+| Prompt | chat template, one user turn: `Please reason step by step, and put your final answer within \boxed{}. <problem>` |
+| Engine | vLLM, LoRA adapter, bf16, `max_model_len = 4096 + 2048`, prefix caching |
+| Sampling | k = 3 samples, T = 0.6, top-p = 0.9, top-k off, repetition penalty 1.05, 4096 new tokens, per-request seed |
+| Seeds | 42, 43, 44; report mean ± std over seeds |
+| Grading | `math_verify` with the gold wrapped in `\boxed{}`, then normalized match of the last boxed answer (or last number) |
+| Metrics | Pass@1 = mean accuracy over the k samples; Pass@3 = any sample correct; Avg = unweighted mean over the four benchmarks |
+
+Outputs in `paths.output` (default `artifacts/evaluation/p_align`):
+`seed<N>/<benchmark>.jsonl` (completions, token counts, truncation, per-sample
+correctness), `seed<N>/result.json` (same keys as exp_s1k: `benchmarks.*.pass@1`,
+`avg`, `avg_passk`) and `summary.json` (mean/std over seeds). A seed whose
+`result.json` exists is skipped, so an interrupted run resumes; `--set overwrite=true`
+re-runs it. `protocol.yaml` refuses to mix different protocols in one output directory.
+
+### Evaluate on another machine
+
+On the training machine, after `stage2` finishes:
+
+```bash
+STAGE2_DIR=artifacts/stage2/output_space ./project_commands.sh pack-student
+# -> artifacts/student_output_space.tar.gz (manifest.json, config.yaml, LoRA adapter)
+# or upload to a private Hub repo instead of copying the archive:
+HF_REPO=<user>/<repo> STAGE2_DIR=artifacts/stage2/output_space ./project_commands.sh pack-student
+```
+
+On the evaluation machine (only the base model, the benchmarks and vLLM are needed,
+not the training artifacts):
+
+```bash
+git clone --branch eval-p-align https://github.com/vohuutridung/CoT_MTKD.git
+cd CoT_MTKD
+./project_commands.sh setup-eval          # .venv with vLLM
+
+mkdir -p student && tar -xzf student_output_space.tar.gz -C student
+CUDA_VISIBLE_DEVICES=0 EVAL_ADAPTER=$PWD/student \
+  EVAL_OUTPUT=artifacts/evaluation/output_space ./project_commands.sh evaluate
+
+# from the Hub instead (pin the revision printed by pack-student):
+EVAL_ADAPTER=<user>/<repo> ./project_commands.sh evaluate --set adapter.revision=<commit>
+```
+
+`EVAL_ADAPTER` also accepts a Stage-2 output directory, a PEFT adapter directory
+(`final/adapters/student`) or `base` for the untuned model. Each seed takes
+roughly one vLLM run of 643 problems × 3 samples. To use several GPUs, give each
+GPU its own seed and output directory, then merge by running once more without
+`EVAL_SEEDS` on a directory that contains all `seed<N>/result.json`:
+
+```bash
+for s in 42 43 44; do
+  CUDA_VISIBLE_DEVICES=$((s-42)) EVAL_SEEDS="[$s]" EVAL_ADAPTER=$PWD/student \
+    EVAL_OUTPUT=artifacts/evaluation/output_space ./project_commands.sh evaluate &
+done; wait
+EVAL_ADAPTER=$PWD/student EVAL_OUTPUT=artifacts/evaluation/output_space ./project_commands.sh evaluate
+```
+
+`--set engine.name=hf` uses a slow single-GPU `transformers` fallback with the
+same sampling distribution (top-k disabled) when vLLM is unavailable; its random
+streams differ from vLLM, so report vLLM numbers.
 
 ## Resume training
 
@@ -435,7 +505,7 @@ DATA_CONFIG=configs/data/s1k_1_1.yaml ./project_commands.sh prepare
 STAGE1_CONFIG=configs/stage1/qwen25_7b_m3.yaml ./project_commands.sh stage1
 SIGNALS_CONFIG=configs/signals/main.yaml ./project_commands.sh supervision
 STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space.yaml ./project_commands.sh stage2
-EVAL_CONFIG=configs/eval/p_align.yaml ./project_commands.sh evaluate
+EVAL_CONFIG=configs/eval/p_align.yaml ./project_commands.sh evaluate --set limit=5 --set seeds=[42]
 HF_HUB_OFFLINE=1 ./project_commands.sh all
 ```
 
