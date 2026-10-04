@@ -12,6 +12,7 @@
 #                 e.g. STAGE2_RUNS="main geometric arithmetic single sft"
 #   EVAL_GPUS     GPUs for evaluation, seeds spread over them (default: first visible GPU)
 #   EVAL_SEEDS    default "42 43 44"
+#   EVAL_GPU_MEMORY_UTILIZATION  vLLM memory fraction (default 0.90 from the config)
 #   RUN_STRESS=1  run the H200 Phase-2 memory preflight before training
 #   SKIP_EVAL=1   train only
 #   PROC_PREFIX   process-title prefix shown in nvitop (default hieunq10)

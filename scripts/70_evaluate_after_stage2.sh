@@ -8,6 +8,8 @@
 #                 and run in parallel (default: first entry of CUDA_VISIBLE_DEVICES, else 0)
 #   EVAL_SEEDS    space-separated seeds (default "42 43 44")
 #   POLL_SECONDS  check interval while waiting (default 300)
+#   EVAL_GPU_MEMORY_UTILIZATION  vLLM memory fraction (config default 0.90;
+#                 use e.g. 0.45 on a GPU shared with other jobs)
 #   PROC_TITLE    process name shown in nvitop (default hieunq10_eval)
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 export PROC_TITLE="${PROC_TITLE:-hieunq10_eval}"
@@ -25,10 +27,14 @@ until [[ -f "$STAGE2_DIR/manifest.json" \
 done
 echo "$(date -u +%FT%TZ) Stage 2 finished; evaluating on GPUs ${gpus[*]}, seeds ${seeds[*]}"
 
+extra=()
+[[ -n "${EVAL_GPU_MEMORY_UTILIZATION:-}" ]] \
+  && extra+=(--set "engine.gpu_memory_utilization=$EVAL_GPU_MEMORY_UTILIZATION")
 evaluate() {  # evaluate <gpu> <yaml seed list>
   CUDA_VISIBLE_DEVICES="$1" "$EVAL_PYTHON_BIN" -m cot_mtkd.cli.evaluate \
     --config "${EVAL_CONFIG:-configs/eval/p_align.yaml}" \
-    --set "adapter.path=$STAGE2_DIR" --set "paths.output=$EVAL_OUTPUT" --set "seeds=$2"
+    --set "adapter.path=$STAGE2_DIR" --set "paths.output=$EVAL_OUTPUT" --set "seeds=$2" \
+    "${extra[@]}"
 }
 join() { local IFS=,; echo "[$*]"; }
 

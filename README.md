@@ -45,6 +45,7 @@ CUDA_VISIBLE_DEVICES=0 EVAL_GPUS=0,1,2 \
 | `STAGE2_RUNS` | `main` | Runs to train, by config suffix (see [controls](#phase-2-objective-and-controls)) |
 | `EVAL_GPUS` | first visible GPU | Evaluation GPUs; the seeds are spread over them |
 | `EVAL_SEEDS` | `42 43 44` | Evaluation seeds |
+| `EVAL_GPU_MEMORY_UTILIZATION` | `0.90` | vLLM memory fraction; lower it (e.g. `0.45`) on a shared GPU |
 | `NPROC_PER_NODE` | `1` | Training processes (GPUs) per run |
 | `RUN_STRESS` | `0` | `1` runs the H200 Phase-2 memory preflight first |
 | `SKIP_EVAL` | `0` | `1` trains only |
