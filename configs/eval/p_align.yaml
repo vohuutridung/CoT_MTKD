@@ -30,24 +30,23 @@ engine:
   max_num_batched_tokens: 16384
   seed: 42
 benchmarks:
+  # Vendored in data/eval (problem + answer), so no dataset download is needed.
+  # Exported from the exp_s1k sources below and checked identical to them.
   - name: math500
-    dataset: HuggingFaceH4/MATH-500
-    split: test
-    revision: 6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be
+    local_json: data/eval/math500.jsonl
+    source: HuggingFaceH4/MATH-500@6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be (test)
     expected_records: 500
   - name: aime24
-    dataset: HuggingFaceH4/aime_2024
-    split: train
-    revision: 2fe88a2f1091d5048c0f36abc874fb997b3dd99a
+    local_json: data/eval/aime24.jsonl
+    source: HuggingFaceH4/aime_2024@2fe88a2f1091d5048c0f36abc874fb997b3dd99a (train)
     expected_records: 30
   - name: aime25
-    dataset: opencompass/AIME2025
-    subsets: [AIME2025-I, AIME2025-II]
-    split: test
-    revision: a6ad95f611d72cf628a80b58bd0432ef6638f958
+    local_json: data/eval/aime25.jsonl
+    source: opencompass/AIME2025@a6ad95f611d72cf628a80b58bd0432ef6638f958 (AIME2025-I + AIME2025-II, test)
     expected_records: 30
   - name: amc
-    local_json: data/eval/amc12_p_align.jsonl
+    local_json: data/eval/amc.jsonl
+    source: P-ALIGN repo data/result/amc12-output.jsonl (prefix stripped, 142.0 -> 142)
     expected_records: 83
 limit: null                          # problems per benchmark, for smoke tests only
 overwrite: false                     # true re-runs seeds that already have result.json

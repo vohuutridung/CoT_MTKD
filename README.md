@@ -426,7 +426,7 @@ exactly, so scores are directly comparable with the baselines measured there
 
 | Setting | Value |
 |---|---|
-| Benchmarks | MATH-500 (500), AIME 2024 (30), AIME 2025 opencompass I+II (30), AMC12 from the P-ALIGN repo (83, vendored in `data/eval/amc12_p_align.jsonl`) |
+| Benchmarks | MATH-500 (500), AIME 2024 (30), AIME 2025 opencompass I+II (30), AMC12 from the P-ALIGN repo (83); all vendored in `data/eval/` from the exp_s1k sources (sources and revisions in `configs/eval/p_align.yaml`) |
 | Prompt | chat template, one user turn: `Please reason step by step, and put your final answer within \boxed{}. <problem>` |
 | Engine | vLLM, LoRA adapter, bf16, `max_model_len = 4096 + 2048`, prefix caching |
 | Sampling | k = 3 samples, T = 0.6, top-p = 0.9, top-k off, repetition penalty 1.05, 4096 new tokens, per-request seed |
@@ -476,8 +476,8 @@ STAGE2_DIR=artifacts/stage2/output_space ./project_commands.sh pack-student
 HF_REPO=<user>/<repo> STAGE2_DIR=artifacts/stage2/output_space ./project_commands.sh pack-student
 ```
 
-On the evaluation machine (only the base model, the benchmarks and vLLM are needed,
-not the training artifacts):
+On the evaluation machine (only the base model and vLLM are needed, not the
+training artifacts or the benchmark datasets):
 
 ```bash
 git clone --branch eval-p-align https://github.com/vohuutridung/CoT_MTKD.git

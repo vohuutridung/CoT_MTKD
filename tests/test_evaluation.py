@@ -41,15 +41,18 @@ class MetricsTest(unittest.TestCase):
 
 
 class BenchmarkTest(unittest.TestCase):
-    def test_vendored_amc_matches_p_align(self) -> None:
-        items = load_benchmark(
-            {"name": "amc", "local_json": "data/eval/amc12_p_align.jsonl",
-             "expected_records": 83},
-            project_root(),
-        )
-        self.assertEqual(len(items), 83)
-        self.assertEqual(items[0].answer, "142")
-        self.assertFalse(items[0].question.startswith("Please reason"))
+    def test_vendored_benchmarks(self) -> None:
+        sizes = {"math500": 500, "aime24": 30, "aime25": 30, "amc": 83}
+        for name, size in sizes.items():
+            items = load_benchmark(
+                {"name": name, "local_json": f"data/eval/{name}.jsonl",
+                 "expected_records": size},
+                project_root(),
+            )
+            self.assertEqual(len(items), size)
+            self.assertFalse(items[0].question.startswith("Please reason"))
+        amc = load_benchmark({"name": "amc", "local_json": "data/eval/amc.jsonl"}, project_root())
+        self.assertEqual(amc[0].answer, "142")
 
 
 class _Tokenizer:

@@ -1,9 +1,10 @@
 """Benchmark loading identical to the exp_s1k P-ALIGN evaluation (``eval/benchmarks.py``).
 
-AMC12 is the 83-problem set shipped with the P-ALIGN repository; its questions
-and answers are vendored in ``data/eval/amc12_p_align.jsonl`` (prompt prefix
-stripped, ``142.0`` written as ``142``) so evaluation needs no extra checkout.
-AIME 2025 is opencompass Part I followed by Part II.
+All four benchmarks are vendored in ``data/eval/<name>.jsonl`` so evaluation
+needs no dataset download: MATH-500, AIME 2024 and AIME 2025 (opencompass Part I
+followed by Part II) exported from their pinned Hub revisions, and AMC12 from the
+P-ALIGN repository (prompt prefix stripped, ``142.0`` written as ``142``). A
+benchmark without ``local_json`` is loaded from ``dataset``/``subsets``/``revision``.
 """
 
 from __future__ import annotations
