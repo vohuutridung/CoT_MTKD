@@ -21,10 +21,20 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 log() { echo "$(date -u +%FT%TZ) [stage2-eval] $*"; }
 
-[[ -x .venv/bin/python ]] || { log "creating training .venv"; ./scripts/00_setup.sh; }
-if [[ "${SKIP_EVAL:-0}" != 1 && ! -x .venv-eval/bin/python ]]; then
-  log "creating evaluation .venv-eval (vLLM)"
+# A venv counts as ready only if its packages import; an interrupted
+# pip install leaves bin/python behind, so its existence proves nothing.
+ready() { [[ -x "$1/bin/python" ]] && "$1/bin/python" -c "$2" >/dev/null 2>&1; }
+if ! ready .venv "import torch, transformers, peft, cot_mtkd"; then
+  log "setting up training .venv"
+  ./scripts/00_setup.sh
+  ready .venv "import torch, transformers, peft, cot_mtkd" || {
+    log "training .venv is broken after setup"; exit 1; }
+fi
+if [[ "${SKIP_EVAL:-0}" != 1 ]] && ! ready .venv-eval "import vllm, cot_mtkd"; then
+  log "setting up evaluation .venv-eval (vLLM)"
   ./scripts/05_setup_eval.sh
+  ready .venv-eval "import vllm, cot_mtkd" || {
+    log "evaluation .venv-eval is broken after setup"; exit 1; }
 fi
 source scripts/_common.sh
 
