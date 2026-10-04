@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -41,7 +42,11 @@ def _cholesky_logdet(
 
 
 def _batched_cholesky_logdet(
-    grams: torch.Tensor, initial_jitter: float, maximum_jitter: float
+    grams: torch.Tensor,
+    initial_jitter: float,
+    maximum_jitter: float,
+    *,
+    normalize: bool = False,
 ) -> tuple[torch.Tensor, float, int]:
     """Factor all step matrices together; retry only matrices that failed.
 
@@ -49,15 +54,28 @@ def _batched_cholesky_logdet(
     one device synchronization per reasoning step. Failed Cholesky factors
     never enter autograd: even a zero upstream gradient through a singular
     factor can produce non-finite gradients.
+
+    With normalize=True, subtract M * log1p(eps) from each logdet, using
+    that matrix's actual jitter, including retries (not the batch maximum).
     """
     grams = grams.float()
     identity = torch.eye(grams.shape[-1], device=grams.device, dtype=grams.dtype)
+
+    def baseline(eps: float) -> float:
+        return grams.shape[-1] * math.log1p(eps) if normalize else 0.0
+
+    def factor_logdet(factor: torch.Tensor, eps: float) -> torch.Tensor:
+        return (
+            2.0 * torch.log(torch.diagonal(factor, dim1=-2, dim2=-1)).sum(-1)
+            - baseline(eps)
+        )
+
     jitter = initial_jitter
     fallback_count = 0
     factor, info = torch.linalg.cholesky_ex(grams + jitter * identity)
     if not bool(info.ne(0).any()):
         return (
-            2.0 * torch.log(torch.diagonal(factor, dim1=-2, dim2=-1)).sum(-1),
+            factor_logdet(factor, jitter),
             jitter,
             fallback_count,
         )
@@ -71,7 +89,7 @@ def _batched_cholesky_logdet(
         values = values.index_copy(
             0,
             successful,
-            2.0 * torch.log(torch.diagonal(factor, dim1=-2, dim2=-1)).sum(-1),
+            factor_logdet(factor, jitter),
         )
     pending = torch.where(info.ne(0))[0]
     while True:
@@ -84,17 +102,21 @@ def _batched_cholesky_logdet(
                 raise FloatingPointError(
                     "DPP Gram matrix remains non-positive after maximum jitter"
                 )
-            return values.index_copy(0, pending, logabsdet), maximum_jitter, fallback_count
+            return (
+                values.index_copy(0, pending, logabsdet - baseline(maximum_jitter)),
+                maximum_jitter,
+                fallback_count,
+            )
         jitter = min(maximum_jitter, jitter * 10.0)
         retried = grams[pending] + jitter * identity
         factor, info = torch.linalg.cholesky_ex(retried)
         if not bool(info.ne(0).any()):
-            logdet = 2.0 * torch.log(torch.diagonal(factor, dim1=-2, dim2=-1)).sum(-1)
+            logdet = factor_logdet(factor, jitter)
             return values.index_copy(0, pending, logdet), jitter, fallback_count
         successful = torch.where(info.eq(0))[0]
         if successful.numel():
             factor = torch.linalg.cholesky(retried[successful])
-            logdet = 2.0 * torch.log(torch.diagonal(factor, dim1=-2, dim2=-1)).sum(-1)
+            logdet = factor_logdet(factor, jitter)
             values = values.index_copy(0, pending[successful], logdet)
         pending = pending[info.ne(0)]
 
@@ -107,7 +129,13 @@ def step_dpp_loss(
     maximum_jitter: float = 1.0e-2,
     reduction: str = "mean",
 ) -> tuple[torch.Tensor, DPPMetrics]:
-    """Negative log-volume, mean over steps per sample then over samples."""
+    """Normalized DPP log-volume, mean over steps per sample then samples.
+
+    Each step uses [M * log(1 + eps_D) - logdet(L_s + eps_D * I)] / M.
+    L_s is the mean token Gram matrix of L2-normalized support features;
+    eps_D is that step's actual jitter. The identity Gram has zero loss up
+    to rounding. The baseline is constant during differentiation.
+    """
     if features.ndim != 3:
         raise ValueError("features must have shape [experts, tokens, dimensions]")
     if sample_ids.numel() != features.shape[1] or step_ids.numel() != features.shape[1]:
@@ -146,7 +174,7 @@ def step_dpp_loss(
     else:
         grams = (grams / token_counts[:, None, None]).to(features.dtype)
     logdets, used_jitter, fallback_count = _batched_cholesky_logdet(
-        grams, jitter, maximum_jitter
+        grams, jitter, maximum_jitter, normalize=True
     )
     step_losses = -logdets / expert_count
     unique_samples, sample_groups, step_counts = torch.unique(

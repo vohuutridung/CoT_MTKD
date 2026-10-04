@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 import torch
@@ -47,7 +48,9 @@ def reference_step_loss(
         selected = features[:, mask, :]
         gram = torch.einsum("mtk,ntk->mn", selected, selected) / mask.sum()
         value, used_jitter, count = reference_logdet(gram, 1e-4, 1e-2)
-        per_sample.setdefault(int(pair[0]), []).append(-value / features.shape[0])
+        per_sample.setdefault(int(pair[0]), []).append(
+            math.log1p(used_jitter) - value / features.shape[0]
+        )
         largest_jitter = max(largest_jitter, used_jitter)
         fallbacks += count
     values = torch.stack([torch.stack(parts).mean() for parts in per_sample.values()])
@@ -66,6 +69,35 @@ class DPPTest(unittest.TestCase):
         identical_loss, _ = step_dpp_loss(identical, samples, steps)
         orthogonal_loss, _ = step_dpp_loss(orthogonal, samples, steps)
         self.assertGreater(float(identical_loss), float(orthogonal_loss))
+
+    def test_orthogonal_experts_have_zero_normalized_loss(self) -> None:
+        features = torch.eye(3).unsqueeze(1).repeat(1, 4, 1)
+        metadata = torch.zeros(4, dtype=torch.long)
+        for jitter in (1e-4, 1e-3, 1e-2):
+            with self.subTest(jitter=jitter):
+                loss, _ = step_dpp_loss(features, metadata, metadata, jitter=jitter)
+                self.assertAlmostEqual(
+                    float(loss), 0.0, delta=2 * torch.finfo(torch.float32).eps
+                )
+
+    def test_normalization_shifts_loss_without_changing_gradient(self) -> None:
+        torch.manual_seed(12)
+        features = torch.randn(3, 7, 11)
+        features /= features.norm(dim=-1, keepdim=True)
+        features.requires_grad_(True)
+        reference = features.detach().clone().requires_grad_(True)
+        metadata = torch.zeros(7, dtype=torch.long)
+        loss, _ = step_dpp_loss(features, metadata, metadata)
+        gram = torch.einsum("mtk,ntk->mn", reference, reference) / 7
+        old_logdet, _, _ = reference_logdet(gram, 1e-4, 1e-2)
+        old_loss = -old_logdet / 3
+        torch.testing.assert_close(loss, old_loss + math.log1p(1e-4), atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(
+            torch.autograd.grad(loss, features)[0],
+            torch.autograd.grad(old_loss, reference)[0],
+            atol=1e-6,
+            rtol=1e-5,
+        )
 
     def test_expert_permutation_invariant(self) -> None:
         torch.manual_seed(3)
@@ -173,6 +205,31 @@ class DPPTest(unittest.TestCase):
         with self.assertRaises(FloatingPointError):
             _batched_cholesky_logdet(matrices, 1e-4, 1e-2)
 
+    def test_normalization_uses_each_matrix_jitter_including_fallback(self) -> None:
+        matrices = torch.stack(
+            [
+                torch.eye(3),
+                torch.diag(torch.tensor([-5e-4, 1.0, 1.0])),
+                torch.diag(torch.tensor([-5e-3, 1.0, 1.0])),
+                torch.diag(torch.tensor([-2e-2, -2e-2, 1.0])),
+            ]
+        ).requires_grad_(True)
+        reference = matrices.detach().clone().requires_grad_(True)
+        actual, used_jitter, fallbacks = _batched_cholesky_logdet(
+            matrices, 1e-4, 1e-2, normalize=True
+        )
+        scalar_results = [reference_logdet(matrix, 1e-4, 1e-2) for matrix in reference]
+        expected = torch.stack(
+            [value - 3 * math.log1p(jitter) for value, jitter, _ in scalar_results]
+        )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(
+            torch.autograd.grad(actual.sum(), matrices)[0],
+            torch.autograd.grad(expected.sum(), reference)[0],
+        )
+        self.assertEqual(used_jitter, 1e-2)
+        self.assertEqual(fallbacks, 6)
+
     def assert_nearly_identical_parity(self, device: str) -> None:
         torch.manual_seed(71)
         samples = torch.tensor([17] * 51 + [2] * 37, device=device)
@@ -232,7 +289,7 @@ class DPPTest(unittest.TestCase):
             selected = expected_features[:, (steps == step).to(device), :]
             gram = torch.einsum("mtk,ntk->mn", selected, selected) / selected.shape[1]
             factor = torch.linalg.cholesky(gram + 1e-4 * identity)
-            losses.append(-2 * torch.log(torch.diagonal(factor)).sum() / 3)
+            losses.append(math.log1p(1e-4) - 2 * torch.log(torch.diagonal(factor)).sum() / 3)
         expected = torch.stack(losses).mean()
         actual_gradient = torch.autograd.grad(actual, logits)[0]
         expected_gradient = torch.autograd.grad(expected, reference_logits)[0]

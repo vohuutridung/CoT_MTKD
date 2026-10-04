@@ -173,6 +173,21 @@ Each expert retains its own top-`k` candidates, then DPP uses the detached union
 of these supports. With three experts, this union can contain up to 1,536 token
 identities. The step-level DPP objective uses this shared union support.
 
+For each reasoning step, DPP uses the mean token Gram matrix `L_s` of the
+experts' L2-normalized exponentiated-logit vectors on that union:
+
+```math
+L_{\mathrm{DPP},s}
+= \frac{1}{M}\left[M\log(1+\epsilon_D)
+  - \log\det(\mathbf L_s+\epsilon_D\mathbf I)\right].
+```
+
+This normalization gives zero loss for an identity Gram matrix, up to numerical
+rounding. It adds a constant to the earlier negative log-volume loss, so its
+gradient is unchanged at fixed jitter. Jitter starts at `1e-4` and retries up
+to `1e-2`; both terms use each step's actual jitter, not the batch maximum.
+Losses are averaged over steps within each example, then over examples.
+
 `artifacts/stage1/main/metrics.jsonl` records `mean_raw_k`, `mean_selected_k`,
 `raw_k_histogram`, `selected_k_histogram`, `support_selection_count`, and
 `probe_saturation_rate`. Histogram index is the raw/final support size; counts
