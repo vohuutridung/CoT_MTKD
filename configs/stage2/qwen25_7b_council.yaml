@@ -32,10 +32,10 @@ council:
   k_max: 256
   mask_epsilon: 1.0e-12
   # Dynamic temperature tau(JS): tau_min < 1 < tau_max.
-  tau_min: 0.5
-  tau_max: 2.0
+  tau_min: 0.8
+  tau_max: 1.5
   temperature_schedule: linear   # linear | sigmoid | step
-  js_max: null                   # linear: null = ln M
+  js_max: p95                    # linear: p95 = reasoning-token JS percentile; null = ln M
   sigmoid_gamma: 8.0             # sigmoid slope
   sigmoid_center: null           # sigmoid inflection: null = council-cache JS median
   step_theta_1: 0.1              # step thresholds (nats)

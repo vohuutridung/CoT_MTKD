@@ -4,12 +4,12 @@ paths:
   stage1: artifacts/stage1/main
   stage2_teachers: artifacts/stage1/duyentl04_abc
   supervision: artifacts/supervision/main
-  teacher_cache: artifacts/teacher_cache/output_space
-  stage2: artifacts/stage2/output_space
+  teacher_cache: artifacts/teacher_cache/council
+  stage2: artifacts/stage2/council
   evaluation: artifacts/evaluation/p_align
 configs:
   data: configs/data/s1k_1_1.yaml
   stage1: configs/stage1/qwen25_7b_m3.yaml
   signals: configs/signals/main.yaml
-  stage2: configs/stage2/qwen25_7b_output_space.yaml
+  stage2: configs/stage2/qwen25_7b_council.yaml
   evaluation: configs/eval/p_align.yaml

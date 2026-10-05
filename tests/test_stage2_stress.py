@@ -8,7 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
-from transformers import Qwen2Config, Qwen2ForCausalLM
+from test_council_phase2 import council_config
+from test_stage2_online import tiny_online_council
 
 from cot_mtkd.cli.stress_stage2_memory import (
     GIB,
@@ -23,30 +24,12 @@ from cot_mtkd.cli.stress_stage2_memory import (
     run_case,
 )
 from cot_mtkd.data.schema import PreparedRecord
-from cot_mtkd.data.serialize import pag_answer_prefix
-from cot_mtkd.models.multi_adapter import (
-    adapter_parameter_map,
-    create_multi_adapter_model,
-    extract_adapter_state,
-    load_adapter_state,
-    lora_config,
-    set_active_adapter,
-)
-from cot_mtkd.stage2.online import RecordGradientResult, compute_record_gradient, plan_record
+from cot_mtkd.models.multi_adapter import extract_adapter_state
+from cot_mtkd.stage2.council_cache import compile_record
+from cot_mtkd.stage2.online import RecordGradientResult
+from cot_mtkd.stage2.student import compute_record_gradient, plan_record
 from cot_mtkd.stage2.trainer import METHOD, _stable_config
 from cot_mtkd.utils.manifest import file_sha256, fingerprint, read_json
-
-
-class TinyTokenizer:
-    def __call__(self, text: str, **kwargs) -> dict:
-        prefix = pag_answer_prefix()
-        assert text.startswith(prefix)
-        gold = text[len(prefix) :]
-        return {
-            "input_ids": [20] + [21 + index % 8 for index in range(len(gold))],
-            "offset_mapping": [(0, len(prefix))]
-            + [(len(prefix) + index, len(prefix) + index + 1) for index in range(len(gold))],
-        }
 
 
 def stress_record() -> PreparedRecord:
@@ -76,23 +59,13 @@ def stress_record() -> PreparedRecord:
 
 
 def stress_config() -> dict:
-    return {
-        "seed": 42,
-        "model": {"gradient_checkpointing": True},
-        "lora": {"dropout": 0.0},
-        "geometry": {"temperature": 2.0, "epsilon_a": 1.0e-12, "epsilon_u": 1.0e-12},
-        "stage2": {
-            "epochs": 3,
-            "max_length": 32,
-            "learning_rate": 2.0e-5,
-            "micro_batch_size": 1,
-            "global_batch_size": 32,
-            "max_grad_norm": 1.0,
-        },
-        "runtime": {"lm_head_chunk_tokens": 4},
-        "optimizer": {"name": "adamw", "betas": [0.9, 0.999], "eps": 1.0e-8, "weight_decay": 0.1},
-        "scheduler": {"name": "cosine", "warmup_ratio": 0.1, "min_lr_ratio": 0.0},
-    }
+    config = council_config()
+    config["model"] = {"gradient_checkpointing": True}
+    config["lora"] = {"dropout": 0.0}
+    config["stage2"].update(epochs=1, max_length=32, global_batch_size=32)
+    config["runtime"] = {"lm_head_chunk_tokens": 4}
+    config["optimizer"]["weight_decay"] = 0.1
+    return config
 
 
 def result_with_signal(active: bool = True) -> RecordGradientResult:
@@ -100,61 +73,24 @@ def result_with_signal(active: bool = True) -> RecordGradientResult:
         gradients=[torch.tensor([0.5 if active else 0.0])],
         loss=0.1 if active else 0.0,
         steps=2,
-        active_steps=1 if active else 0,
+        active_steps=2 if active else 0,
         discarded_steps=0,
-        metrics={"weight_sum": 0.4 if active else 0.0},
-        timings={"teacher_forward": 0.25, "answer_anchor_gradients": 0.5},
+        metrics={"sft_loss": 0.1 if active else 0.0},
+        timings={"student_forward": 0.25, "adapter_gradient": 0.5},
     )
 
 
 class Stage2StressTest(unittest.TestCase):
-    def test_tiny_checkpointed_council_runs_real_online_method_and_optimizer(self) -> None:
+    def test_tiny_checkpointed_council_runs_real_phase2_step_and_optimizer(self) -> None:
         thread_count = torch.get_num_threads()
         torch.set_num_threads(1)
         self.addCleanup(torch.set_num_threads, thread_count)
-        torch.manual_seed(17)
-        base = Qwen2ForCausalLM(
-            Qwen2Config(
-                vocab_size=64,
-                hidden_size=8,
-                intermediate_size=16,
-                num_hidden_layers=1,
-                num_attention_heads=2,
-                num_key_value_heads=1,
-                max_position_embeddings=32,
-                attention_dropout=0.0,
-            )
-        )
-        base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        base.enable_input_require_grads()
+        model, names, parameters = tiny_online_council(True)
         config = stress_config()
-        config["lora"].update(
-            rank=2,
-            alpha=2,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-        )
-        with patch("cot_mtkd.models.multi_adapter.load_base_causal_lm", return_value=base):
-            model, names = create_multi_adapter_model(
-                {}, config["lora"], 3, torch.device("cpu"), 42
-            )
-        model.add_adapter("student", lora_config(config["lora"]))
-        generator = torch.Generator().manual_seed(703)
-        with torch.no_grad():
-            for name in names:
-                for key, parameter in adapter_parameter_map(model, name).items():
-                    if "lora_B" in key:
-                        parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.13)
-            load_adapter_state(model, "student", extract_adapter_state(model, names[0]))
-        set_active_adapter(model, "student")
-        parameters = list(adapter_parameter_map(model, "student").values())
+        record = stress_record()
+        cached, _, _ = compile_record(model, names, record, config, torch.device("cpu"))
+        config["_stress_targets"] = {record.sample_id: cached}
+        config["_stress_js_median"] = 0.1
         before_student = [parameter.detach().clone() for parameter in parameters]
         before_teachers = {name: extract_adapter_state(model, name) for name in names}
         optimizer, scheduler = _optimizer_and_scheduler(parameters, config, 10)
@@ -166,8 +102,8 @@ class Stage2StressTest(unittest.TestCase):
             ) as compute,
         ):
             details = _run_microbatch(
-                stress_record(),
-                TinyTokenizer(),
+                record,
+                None,
                 model,
                 names,
                 parameters,
@@ -177,8 +113,9 @@ class Stage2StressTest(unittest.TestCase):
                 torch.device("cpu"),
             )
         self.assertEqual(compute.call_count, 1)
+        self.assertIs(compute.call_args.kwargs["cached_target"], cached)
         self.assertEqual(details["steps"], 2)
-        self.assertGreater(details["active_steps"], 0)
+        self.assertEqual(details["active_steps"], 2)
         self.assertTrue(details["optimizer_update_applied"])
         self.assertEqual(len(optimizer.state), len(parameters))
         self.assertTrue(
@@ -189,61 +126,44 @@ class Stage2StressTest(unittest.TestCase):
             for key, value in extract_adapter_state(model, name).items():
                 torch.testing.assert_close(value, before_teachers[name][key], rtol=0.0, atol=0.0)
         for component in (
-            "teacher_forward",
-            "teacher_kd_gradients",
-            "answer_anchor_gradients",
-            "geometry",
-            "final_kd_gradient",
+            "student_forward",
+            "head_chunks_and_hidden_gradient",
+            "adapter_gradient",
+            "optimizer_update_seconds",
         ):
             self.assertIn(component, details["component_seconds"])
 
-    def test_synthetic_extends_only_final_step_to_gold_anchor_limit(self) -> None:
-        record, tokenizer = stress_record(), TinyTokenizer()
-        original = plan_record(record, tokenizer, 32)
-        synthetic, plan = make_synthetic_record(record, tokenizer, 32)
-        self.assertEqual(synthetic.solution, record.solution)
-        self.assertEqual(plan.solution, original.solution)
-        self.assertEqual(plan.num_steps, 2)
-        self.assertEqual(plan.discarded_steps, 0)
-        self.assertEqual(plan.max_anchor_length, 32)
-        self.assertEqual(plan.step_positions[0], original.step_positions[0])
-        extra = 32 - original.max_anchor_length
-        self.assertEqual(len(plan.step_positions[-1]), len(original.step_positions[-1]) + extra)
-        self.assertEqual(
-            synthetic.input_ids[synthetic.answer_start :], record.input_ids[record.answer_start :]
-        )
-        self.assertEqual(synthetic.region_ids[plan.prefix_ends[-1] - 1], 3)
-        self.assertTrue(
-            all(
-                synthetic.region_ids[position] == 2
-                for positions in plan.step_positions
-                for position in positions
-            )
-        )
-
-    def test_synthetic_removes_discarded_steps_before_extension(self) -> None:
-        record, tokenizer = stress_record(), TinyTokenizer()
-        before = plan_record(record, tokenizer, 15)
-        self.assertEqual(before.num_steps, 1)
-        self.assertEqual(before.discarded_steps, 1)
-        synthetic, plan = make_synthetic_record(record, tokenizer, 15)
-        self.assertEqual(plan.num_steps, 1)
-        self.assertEqual(plan.max_anchor_length, 15)
-        self.assertEqual(plan.discarded_steps, 0)
-        self.assertEqual(synthetic.solution, "gold")
-        self.assertNotIn(1, synthetic.step_ids)
-
-    def test_longest_selection_includes_whole_gold_solution_length(self) -> None:
+    def test_synthetic_extends_only_final_step_to_sequence_limit(self) -> None:
         record = stress_record()
-        longer_gold = replace(record, sample_id="longer-gold", solution="entire gold solution")
-        selected, plan, counts = longest_eligible_record([record, longer_gold], TinyTokenizer(), 64)
-        self.assertEqual(selected.sample_id, "longer-gold")
-        self.assertEqual(plan.max_anchor_length, 11 + 1 + len(longer_gold.solution))
+        original = plan_record(record, None, 32)
+        synthetic, plan = make_synthetic_record(record, None, 32)
+        self.assertEqual(synthetic.solution, record.solution)
+        self.assertEqual(plan.num_steps, 2)
+        self.assertEqual(len(plan.input_ids), 32)
+        self.assertEqual(plan.step_positions[0], original.step_positions[0])
+        extra = 32 - len(record.input_ids)
+        self.assertEqual(len(plan.step_positions[-1]), len(original.step_positions[-1]) + extra)
+        self.assertEqual(synthetic.input_ids[-4:], record.input_ids[-4:])
+        self.assertEqual(synthetic.region_ids[-4:], record.region_ids[-4:])
+        self.assertEqual(plan.answer_positions, [p + extra for p in original.answer_positions])
+        self.assertTrue(
+            all(synthetic.region_ids[p] == 2 for step in plan.step_positions for p in step)
+        )
+        with self.assertRaises(ValueError):
+            make_synthetic_record(record, None, 10)
+
+    def test_longest_selection_prefers_the_longest_full_sequence(self) -> None:
+        record = stress_record()
+        longer, _ = make_synthetic_record(replace(record, sample_id="longer"), None, 20)
+        selected, plan, counts = longest_eligible_record([record, longer], None, 64)
+        self.assertEqual(selected.sample_id, "longer-synthetic-sequence-20")
+        self.assertEqual(len(plan.input_ids), 20)
         self.assertEqual(counts["eligible_examples"], 2)
 
     def test_full_result_is_applied_by_real_adamw_update(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([1.0]))
         config = stress_config()
+        config["_stress_targets"] = {"tiny-phase2-stress": {"fake": True}}
         optimizer, scheduler = _optimizer_and_scheduler([parameter], config, 10)
         before = parameter.detach().clone()
         with (
@@ -255,7 +175,7 @@ class Stage2StressTest(unittest.TestCase):
         ):
             details = _run_microbatch(
                 stress_record(),
-                TinyTokenizer(),
+                None,
                 None,
                 ["a", "b", "c"],
                 [parameter],
@@ -265,8 +185,8 @@ class Stage2StressTest(unittest.TestCase):
                 torch.device("cpu"),
             )
         self.assertTrue(compute.call_args.kwargs["profile"])
+        self.assertEqual(compute.call_args.kwargs["cached_target"], {"fake": True})
         self.assertEqual(compute.call_args.args[2], [parameter])
-        self.assertEqual(compute.call_args.args[3].solution, "gold")
         self.assertTrue(details["optimizer_update_applied"])
         self.assertFalse(torch.equal(before, parameter))
         self.assertIn(parameter, optimizer.state)
@@ -276,6 +196,7 @@ class Stage2StressTest(unittest.TestCase):
     def test_zero_signal_does_not_apply_weight_decay_or_advance_scheduler(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([1.0]))
         config = stress_config()
+        config["_stress_targets"] = {"tiny-phase2-stress": {}}
         optimizer, scheduler = _optimizer_and_scheduler([parameter], config, 10)
         epoch_before = scheduler.last_epoch
         with patch(
@@ -284,7 +205,7 @@ class Stage2StressTest(unittest.TestCase):
         ):
             details = _run_microbatch(
                 stress_record(),
-                TinyTokenizer(),
+                None,
                 None,
                 ["a", "b", "c"],
                 [parameter],
@@ -300,11 +221,11 @@ class Stage2StressTest(unittest.TestCase):
 
     def test_warmup_component_times_are_separate_and_peak_includes_warmup(self) -> None:
         record = stress_record()
-        plan = plan_record(record, TinyTokenizer(), 32)
+        plan = plan_record(record, None, 32)
         details = {
             "steps": 2,
             "optimizer_update_applied": True,
-            "component_seconds": {"teacher_forward": 0.5},
+            "component_seconds": {"student_forward": 0.5},
         }
         with (
             patch("torch.cuda.synchronize"),
@@ -339,8 +260,10 @@ class Stage2StressTest(unittest.TestCase):
         self.assertEqual(report["warmup_elapsed_seconds"], [100])
         self.assertEqual(report["measured_elapsed_seconds"], [2, 4])
         self.assertEqual(report["mean_measured_elapsed_seconds"], 3)
-        self.assertEqual(report["mean_measured_component_seconds"]["teacher_forward"], 0.5)
+        self.assertEqual(report["mean_measured_component_seconds"]["student_forward"], 0.5)
         self.assertEqual(report["max_memory_reserved_bytes"], 45 * GIB)
+        self.assertEqual(report["sequence_length"], 14)
+        self.assertEqual(report["reasoning_tokens"], 5)
         self.assertTrue(report["memory_includes_warmup"])
         self.assertTrue(report["all_retained_steps_evaluated"])
         self.assertEqual(report["optimizer_updates"], 3)
@@ -364,7 +287,7 @@ class Stage2StressTest(unittest.TestCase):
             report = run_case(
                 "longest_real",
                 record,
-                plan_record(record, TinyTokenizer(), 32),
+                plan_record(record, None, 32),
                 None,
                 None,
                 [],
@@ -453,7 +376,7 @@ class Stage2StressTest(unittest.TestCase):
                     "council_cache",
                     [
                         ("index_file", "index_file_sha256", "index.json"),
-                        ("best_expert_file", "best_expert_file_sha256", "best.pt"),
+                        ("student_init_file", "student_init_file_sha256", "student_init.pt"),
                     ],
                 ),
             ):
@@ -505,7 +428,7 @@ class Stage2StressTest(unittest.TestCase):
                 patch("cot_mtkd.cli.stress_stage2_memory._validate_stage2_config") as validate,
                 patch("cot_mtkd.cli.stress_stage2_memory.runtime_metadata", return_value={}),
                 patch("torch.cuda.is_available", return_value=False),
-                patch("cot_mtkd.cli.stress_stage2_memory.create_online_model") as create,
+                patch("cot_mtkd.stage2.initialization.create_cached_student") as create,
                 self.assertRaises(SystemExit) as raised,
             ):
                 main()
@@ -515,6 +438,7 @@ class Stage2StressTest(unittest.TestCase):
         create.assert_not_called()
         self.assertEqual(report["status"], "requirement_not_met")
         self.assertEqual(report["recommendation"], "not_measured")
+        self.assertEqual(report["method"], METHOD)
         self.assertEqual(report["cases"], [])
         self.assertEqual(report["cases_completed"], 0)
         self.assertFalse(report["trained_artifact_written"])

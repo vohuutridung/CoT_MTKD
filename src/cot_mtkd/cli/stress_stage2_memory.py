@@ -17,16 +17,10 @@ from ..data.dataset import JsonlRecordDataset
 from ..data.prepare import tokenizer_fingerprint
 from ..data.schema import PreparedRecord, TokenRegion
 from ..models.multi_adapter import load_tokenizer, require_same_model_source
-from ..stage2.online import (
-    Phase2RecordPlan,
-    RecordGradientResult,
-    compute_record_gradient,
-    create_online_model,
-    plan_record,
-)
+from ..stage2.online import RecordGradientResult
+from ..stage2.student import StudentPlan, compute_record_gradient, plan_record
 from ..stage2.trainer import (
     METHOD,
-    OUTPUT_SPACE_METHOD,
     _stable_config,
     _validate_stage2_config,
     apply_accumulated_update,
@@ -46,106 +40,73 @@ GIB = 1024**3
 
 
 def make_synthetic_record(
-    record: PreparedRecord, tokenizer: Any, max_length: int, method: str = METHOD
-) -> tuple[PreparedRecord, Phase2RecordPlan]:
-    """Extend the last retained step to the method's full context limit.
+    record: PreparedRecord, tokenizer: Any, max_length: int
+) -> tuple[PreparedRecord, StudentPlan]:
+    """Extend the last reasoning step so the whole sequence reaches ``max_length``.
 
-    Output-space uses the reasoning sequence limit; task-geometry reserves its
-    complete gold-anchor suffix. The source answer is preserved in the record.
     The extended step is a memory stress only; its timing does not estimate
-    typical training cost. Remove discarded trailing steps before extending.
+    typical training cost. Answer/format blocks are preserved verbatim.
     """
-    planner = _record_planner(method)
-    plan = planner(record, tokenizer, max_length)
+    plan = plan_record(record, tokenizer, max_length)
     if plan.num_steps == 0:
-        raise ValueError("Cannot extend a sample with no eligible reasoning steps")
-    retained_end = len(plan.input_ids)
-    if retained_end > record.answer_start:
-        raise RuntimeError("Phase-2 reasoning input unexpectedly includes the answer block")
-    source = replace(
-        record,
-        input_ids=record.input_ids[:retained_end] + record.input_ids[record.answer_start :],
-        labels=record.labels[:retained_end] + record.labels[record.answer_start :],
-        attention_mask=(
-            record.attention_mask[:retained_end] + record.attention_mask[record.answer_start :]
-        ),
-        offset_mapping=(
-            record.offset_mapping[:retained_end] + record.offset_mapping[record.answer_start :]
-        ),
-        region_ids=record.region_ids[:retained_end] + record.region_ids[record.answer_start :],
-        step_ids=record.step_ids[:retained_end] + record.step_ids[record.answer_start :],
-        answer_start=retained_end,
-        kept_steps=plan.num_steps,
-        truncated=record.truncated or plan.discarded_steps > 0,
-    )
-    extra = max_length - max(len(plan.input_ids), plan.max_anchor_length)
+        raise ValueError("Cannot extend a sample with no reasoning steps")
+    extra = max_length - len(record.input_ids)
     if extra < 0:
         raise ValueError("Planned real sample exceeds the configured Phase-2 context limit")
     positions = plan.step_positions[-1]
-    if not positions:
-        raise RuntimeError("The final retained step has no KD content tokens")
     insertion = positions[-1] + 1
-    step_id = source.step_ids[positions[-1]]
-    repeated = [source.input_ids[positions[index % len(positions)]] for index in range(extra)]
+    step_id = record.step_ids[positions[-1]]
+    repeated = [record.input_ids[positions[index % len(positions)]] for index in range(extra)]
 
     def insert(values: list[Any], additions: list[Any]) -> list[Any]:
         return values[:insertion] + additions + values[insertion:]
 
     synthetic = replace(
-        source,
-        sample_id=f"{record.sample_id}-synthetic-{'reasoning' if method == OUTPUT_SPACE_METHOD else 'anchor'}-{max_length}",
-        input_ids=insert(source.input_ids, repeated),
-        labels=insert(source.labels, repeated),
-        attention_mask=insert(source.attention_mask, [1] * extra),
-        offset_mapping=insert(source.offset_mapping, [(0, 0)] * extra),
-        region_ids=insert(source.region_ids, [int(TokenRegion.REASONING)] * extra),
-        step_ids=insert(source.step_ids, [step_id] * extra),
-        answer_start=source.answer_start + extra,
-        original_length=len(source.input_ids) + extra,
-        kept_length=len(source.input_ids) + extra,
+        record,
+        sample_id=f"{record.sample_id}-synthetic-sequence-{max_length}",
+        input_ids=insert(record.input_ids, repeated),
+        labels=insert(record.labels, repeated),
+        attention_mask=insert(record.attention_mask, [1] * extra),
+        offset_mapping=insert(record.offset_mapping, [(0, 0)] * extra),
+        region_ids=insert(record.region_ids, [int(TokenRegion.REASONING)] * extra),
+        step_ids=insert(record.step_ids, [step_id] * extra),
+        answer_start=record.answer_start + extra
+        if record.answer_start >= insertion
+        else record.answer_start,
+        original_length=len(record.input_ids) + extra,
+        kept_length=len(record.input_ids) + extra,
     )
-    synthetic_plan = planner(synthetic, tokenizer, max_length)
-    if synthetic_plan.num_steps != plan.num_steps or synthetic_plan.discarded_steps != 0:
-        raise RuntimeError("Synthetic extension unexpectedly changed the retained reasoning steps")
-    if max(len(synthetic_plan.input_ids), synthetic_plan.max_anchor_length) != max_length:
+    synthetic_plan = plan_record(synthetic, tokenizer, max_length)
+    if synthetic_plan.num_steps != plan.num_steps:
+        raise RuntimeError("Synthetic extension unexpectedly changed the reasoning steps")
+    if len(synthetic_plan.input_ids) != max_length:
         raise RuntimeError("Synthetic extension did not reach the configured context limit")
     return synthetic, synthetic_plan
 
 
 def longest_eligible_record(
-    dataset: JsonlRecordDataset, tokenizer: Any, max_length: int, method: str = METHOD
-) -> tuple[PreparedRecord, Phase2RecordPlan, dict[str, int]]:
-    planner = _record_planner(method)
-    selected: tuple[PreparedRecord, Phase2RecordPlan] | None = None
+    dataset: JsonlRecordDataset, tokenizer: Any, max_length: int
+) -> tuple[PreparedRecord, StudentPlan, dict[str, int]]:
+    selected: tuple[PreparedRecord, StudentPlan] | None = None
     selected_size = (-1, -1)
     counts = {
         "examples_scanned": len(dataset),
         "examples_without_eligible_steps": 0,
-        "examples_with_discarded_steps": 0,
         "eligible_examples": 0,
     }
     for index in range(len(dataset)):
         record = dataset[index]
-        plan = planner(record, tokenizer, max_length)
-        counts["examples_with_discarded_steps"] += int(plan.discarded_steps > 0)
+        plan = plan_record(record, tokenizer, max_length)
         if plan.num_steps == 0:
             counts["examples_without_eligible_steps"] += 1
             continue
         counts["eligible_examples"] += 1
-        size = (max(len(plan.input_ids), plan.max_anchor_length), plan.num_steps)
+        size = (len(plan.input_ids), plan.num_steps)
         if size > selected_size:
             selected, selected_size = (record, plan), size
     if selected is None:
         raise ValueError("Prepared dataset has no Phase-2-ready reasoning samples")
     return selected[0], selected[1], counts
-
-
-def _record_planner(method: str):
-    if method == OUTPUT_SPACE_METHOD:
-        from ..stage2.output_space import plan_record as output_plan
-
-        return output_plan
-    return plan_record
 
 
 def _optimizer_and_scheduler(
@@ -186,11 +147,7 @@ def _run_microbatch(
     # Training holds its FP32 accumulation buffer during the complete forward.
     # Allocate it before the forward so the measured peak includes that state.
     buffer = zeros_like_parameters(parameters)
-    if config.get("method") == OUTPUT_SPACE_METHOD:
-        from ..stage2.output_space import compute_record_gradient as record_gradient
-    else:
-        record_gradient = compute_record_gradient
-    result = record_gradient(
+    result = compute_record_gradient(
         model,
         adapter_names,
         parameters,
@@ -199,11 +156,9 @@ def _run_microbatch(
         config,
         device,
         profile=True,
-        **(
-            {"cached_target": config["_stress_targets"][record.sample_id]}
-            if config.get("method") == OUTPUT_SPACE_METHOD
-            else {}
-        ),
+        cached_target=config["_stress_targets"][record.sample_id],
+        js_median=config.get("_stress_js_median"),
+        js_p95=config.get("_stress_js_p95"),
     )
     if not isinstance(result, RecordGradientResult):
         raise TypeError("The Phase-2 gradient path returned an unexpected result type")
@@ -216,7 +171,7 @@ def _run_microbatch(
             raise FloatingPointError("Phase-2 stress produced a non-finite gradient")
     if not math.isfinite(result.loss):
         raise FloatingPointError("Phase-2 stress produced a non-finite loss")
-    if not 0 <= result.active_steps <= result.steps:
+    if not 0 <= result.active_steps <= max(result.steps, 1):
         raise RuntimeError("Stress active-step count is invalid")
     timings = dict(result.timings)
     applied = result.active_steps > 0
@@ -224,7 +179,6 @@ def _run_microbatch(
         "loss": result.loss,
         "steps": result.steps,
         "active_steps": result.active_steps,
-        "discarded_steps": result.discarded_steps,
         "metrics": dict(result.metrics),
     }
     add_gradients_(buffer, result.gradients)
@@ -259,7 +213,7 @@ def _run_microbatch(
 def run_case(
     name: str,
     record: PreparedRecord,
-    plan: Phase2RecordPlan,
+    plan: StudentPlan,
     tokenizer: Any,
     model: torch.nn.Module,
     adapter_names: list[str],
@@ -275,7 +229,7 @@ def run_case(
     if warmup < 0 or repetitions <= 0:
         raise ValueError("Stress warmup must be nonnegative and repetitions must be positive")
     if plan.num_steps == 0:
-        raise ValueError("Stress case must contain eligible reasoning steps")
+        raise ValueError("Stress case must contain reasoning steps")
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
     warmup_times: list[float] = []
@@ -324,12 +278,8 @@ def run_case(
         "status": status,
         "error": error,
         "sample_id": record.sample_id,
-        "reasoning_sequence_length": len(plan.input_ids),
-        **(
-            {"max_teacher_forced_sequence_length": len(plan.input_ids)}
-            if config.get("method") == OUTPUT_SPACE_METHOD
-            else {"max_gold_anchor_sequence_length": plan.max_anchor_length}
-        ),
+        "sequence_length": len(plan.input_ids),
+        "reasoning_tokens": len(plan.reasoning_positions),
         "planned_steps": plan.num_steps,
         "all_retained_steps_evaluated": all(
             item["steps"] == plan.num_steps for item in iteration_details
@@ -464,7 +414,7 @@ def _record_provenance(
     )
     for file_key, hash_key in [
         ("index_file", "index_file_sha256"),
-        ("best_expert_file", "best_expert_file_sha256"),
+        ("student_init_file", "student_init_file_sha256"),
     ]:
         path = require_file_sha256(root, council, file_key, hash_key)
         file_checksums[f"council_cache.{file_key}"] = {
@@ -494,7 +444,7 @@ def main() -> None:
         description="Measure configured Phase-2 updates on one H200 with all LoRA parameters and steps"
     )
     parser.add_argument("--config", required=True)
-    parser.add_argument("--output", default="artifacts/stage2/output_space_stress_memory.json")
+    parser.add_argument("--output", default="artifacts/stage2/council_stress_memory.json")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--min-headroom-gib", type=float, default=12.0)
@@ -508,9 +458,7 @@ def main() -> None:
     if int(config["stage2"]["micro_batch_size"]) != 1:
         raise ValueError("Phase-2 stress requires stage2.micro_batch_size: 1")
     stable_config = _stable_config(config)
-    method = config.get("method", METHOD)
-    output_space = method == OUTPUT_SPACE_METHOD
-    section = "aggregation" if output_space else "geometry"
+    council_config = config["council"]
     report: dict[str, Any] = {
         "status": "not_measured",
         "recommendation": "not_measured",
@@ -524,11 +472,8 @@ def main() -> None:
         "warmup_iterations_per_case": arguments.warmup,
         "measured_iterations_per_case": arguments.repetitions,
         "required_headroom_gib": arguments.min_headroom_gib,
-        "method": method,
-        "execution": "cached_support_tail_student_only"
-        if output_space
-        else "legacy_online_task_geometry",
-        "gold_answer_source": None if output_space else "entire_solution_field",
+        "method": METHOD,
+        "execution": "cached_council_topk_student_only",
         "trained_artifact_written": False,
         "temporary_optimizer_updates_only": True,
         "timing_unit": "one_microbatch_with_temporary_optimizer_step",
@@ -541,23 +486,12 @@ def main() -> None:
             "global_batch_size": int(config["stage2"]["global_batch_size"]),
             "gradient_checkpointing": bool(config["model"].get("gradient_checkpointing", False)),
             "lora_dropout": float(config["lora"]["dropout"]),
-            **(
-                {
-                    "js_temperature": float(config["aggregation"]["js_temperature"]),
-                    "kd_temperature": float(config["aggregation"]["kd_temperature"]),
-                    "sft_weight": float(config["aggregation"]["sft_weight"]),
-                }
-                if output_space
-                else {"temperature": float(config[section]["temperature"])}
-            ),
-            **(
-                {}
-                if output_space
-                else {
-                    "epsilon_a": float(config["geometry"]["epsilon_a"]),
-                    "epsilon_u": float(config["geometry"]["epsilon_u"]),
-                }
-            ),
+            "k_max": council_config.get("k_max"),
+            "tau_min": float(council_config["tau_min"]),
+            "tau_max": float(council_config["tau_max"]),
+            "temperature_schedule": council_config.get("temperature_schedule", "linear"),
+            "alpha": float(council_config["alpha"]),
+            "beta": float(council_config["beta"]),
             "reasoning_step_cap": None,
             "lora_parameter_sampling": False,
         },
@@ -606,59 +540,56 @@ def main() -> None:
         if len(dataset) != int(manifests["prepared"]["records"]) or not len(dataset):
             raise RuntimeError("Prepared dataset record count is invalid")
         max_length = int(config["stage2"]["max_length"])
-        longest, longest_plan, counts = longest_eligible_record(
-            dataset, tokenizer, max_length, method=method
-        )
-        synthetic, synthetic_plan = make_synthetic_record(
-            longest, tokenizer, max_length, method=method
-        )
+        longest, longest_plan, counts = longest_eligible_record(dataset, tokenizer, max_length)
+        synthetic, synthetic_plan = make_synthetic_record(longest, tokenizer, max_length)
         report["dataset_scan"] = counts
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
-        load_start = time.perf_counter()
         distributed = DistributedContext(0, 0, 1, device)
-        if output_space:
-            from ..stage2.council_cache import compile_record, load_council_cache
-            from ..stage2.initialization import create_cached_student
-            from ..models.multi_adapter import (
-                create_multi_adapter_model,
-                load_adapter_bundle,
-                load_adapter_state,
-            )
+        from ..models.multi_adapter import (
+            create_multi_adapter_model,
+            load_adapter_bundle,
+            load_adapter_state,
+        )
+        from ..stage2.council_cache import compile_record, load_council_cache
+        from ..stage2.initialization import create_cached_student
 
-            cache = load_council_cache(config, manifests["prepared"], manifests["stage1"])
-            # Synthetic trajectories cannot reuse the real record's target.
-            # Precompute them separately, before any measured student iteration.
-            prep_started = time.perf_counter()
-            teachers, names = create_multi_adapter_model(
-                config["model"], config["lora"], 3, device, int(config["seed"])
-            )
-            bundle_path = Path(config["paths"]["stage1"]) / manifests["stage1"]["adapter_bundle"]
-            bundle = load_adapter_bundle(bundle_path)
-            for name in names:
-                load_adapter_state(teachers, name, bundle[name])
-            synthetic_target, _, _ = compile_record(teachers, names, synthetic, config, device)
-            del teachers, bundle
-            torch.cuda.empty_cache()
-            report["synthetic_preprocessing_seconds_excluded_from_training"] = (
-                time.perf_counter() - prep_started
-            )
-            config["_stress_targets"] = {
-                longest.sample_id: cache.get(longest.sample_id),
-                synthetic.sample_id: synthetic_target,
-            }
-            torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device)
-            load_start = time.perf_counter()
-            model, adapter_names, parameters = create_cached_student(config, distributed, cache)
-        else:
-            model, adapter_names, parameters = create_online_model(config, distributed)
+        cache = load_council_cache(config, manifests["prepared"], manifests["stage1"])
+        # Synthetic trajectories cannot reuse the real record's council signals.
+        # Run the council on them separately, before any measured student iteration.
+        prep_started = time.perf_counter()
+        names = list(manifests["stage1"]["adapter_names"])
+        teachers, created = create_multi_adapter_model(
+            config["model"], config["lora"], len(names), device, int(config["seed"])
+        )
+        if created != names:
+            raise RuntimeError("Council adapter names mismatch")
+        bundle_path = Path(config["paths"]["stage1"]) / manifests["stage1"]["adapter_bundle"]
+        bundle = load_adapter_bundle(bundle_path)
+        for name in names:
+            load_adapter_state(teachers, name, bundle[name])
+        synthetic_target, _, _ = compile_record(teachers, names, synthetic, config, device)
+        del teachers, bundle
+        torch.cuda.empty_cache()
+        report["synthetic_preprocessing_seconds_excluded_from_training"] = (
+            time.perf_counter() - prep_started
+        )
+        config["_stress_targets"] = {
+            longest.sample_id: cache.get(longest.sample_id),
+            synthetic.sample_id: synthetic_target,
+        }
+        config["_stress_js_median"] = cache.js_median
+        config["_stress_js_p95"] = cache.js_p95
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        load_start = time.perf_counter()
+        model, adapter_names, parameters = create_cached_student(config, distributed, cache)
         torch.cuda.synchronize(device)
         report["model_load_seconds"] = time.perf_counter() - load_start
         report["model_load_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
         report["model_load_peak_reserved_bytes"] = torch.cuda.max_memory_reserved(device)
         report["council_experts"] = adapter_names
-        report["teachers_loaded_during_student_measurement"] = not output_space
+        report["teachers_loaded_during_student_measurement"] = False
         report["student_lora_parameter_count"] = sum(parameter.numel() for parameter in parameters)
         if max_length > int(model.config.max_position_embeddings):
             raise ValueError("Configured Phase-2 context exceeds the model context limit")
@@ -671,11 +602,7 @@ def main() -> None:
         report["scheduler_training_steps"] = total_training_steps
         for name, record, plan in (
             ("longest_real", longest, longest_plan),
-            (
-                f"synthetic_{'reasoning' if output_space else 'anchor'}_{max_length}",
-                synthetic,
-                synthetic_plan,
-            ),
+            (f"synthetic_sequence_{max_length}", synthetic, synthetic_plan),
         ):
             result = run_case(
                 name,

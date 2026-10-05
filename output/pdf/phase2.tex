@@ -1,0 +1,542 @@
+\documentclass[12pt,a4paper]{article}
+
+% Packages
+% Tương thích cả pdfLaTeX (T5 cho tiếng Việt, ví dụ trên Overleaf) lẫn
+% XeLaTeX/LuaLaTeX (Unicode trực tiếp qua fontspec).
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[utf8]{inputenc}
+  \IfFileExists{t5enc.def}{\usepackage[T5]{fontenc}}{\usepackage[T1]{fontenc}}
+\else
+  \usepackage{fontspec}
+\fi
+\IfFileExists{vietnam.ldf}{\usepackage[vietnamese]{babel}}{}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{float}
+
+\algrenewcommand\algorithmicrequire{\textbf{Đầu vào}}
+\algrenewcommand\algorithmicfor{\textbf{lặp}}
+\algrenewcommand\algorithmicend{\textbf{hết}}
+\algrenewcommand\algorithmicif{\textbf{nếu}}
+\algrenewcommand\algorithmicthen{\textbf{thì}}
+\algrenewcommand\algorithmicelse{\textbf{ngược lại}}
+\algrenewcommand\algorithmicdo{}
+
+\hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=blue}
+
+\theoremstyle{plain}
+\newtheorem{proposition}{Mệnh đề}
+
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\KL}{KL}
+\DeclareMathOperator{\JS}{JS}
+\DeclareMathOperator{\Softmax}{Softmax}
+\newcommand{\Vk}{\mathcal V_k}
+\newcommand{\Cset}{\mathcal C}
+\newcommand{\ytar}{y^{*}}
+\newcommand{\sg}[1]{\mathrm{sg}\!\left[#1\right]}
+
+\title{\textbf{Council Top-$k$ Reasoning Distillation via Dynamic Temperature}}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+%==============================================================
+\section{Giới thiệu}
+\label{sec:intro}
+
+Đề xuất này tối ưu khả năng suy luận của một mô hình ngôn ngữ bằng một \emph{hội đồng} gồm $M$ LoRA expert, nhưng chỉ giữ lại \emph{một} adapter LoRA student ở thời điểm inference. Phương pháp không loại bỏ cứng các reasoning step mà giữ toàn bộ chuỗi reasoning làm tín hiệu huấn luyện.
+
+Quy trình gồm hai phase:
+\begin{itemize}
+\item \textbf{Phase 1 -- Diversity Training:} huấn luyện $M$ expert vừa chính xác vừa khác biệt, trên ba mặt: dữ liệu (step-level gradient dropout), không gian tham số (lực đẩy kernel trên khoảng cách chiếu giữa các không gian con) và phân phối đầu ra (DPP).
+\item \textbf{Phase 2 -- Medoid Cloning \& Distillation:} khởi tạo student bằng expert trung tâm nhất (Medoid), rồi tối ưu bằng $\mathcal L_{\mathrm{SFT}}+\alpha\,\mathcal D_{\KL}+\beta\,\mathcal L_{mass}$. Hội đồng cung cấp vùng Top-$k$, nhiệt độ động $\tau_{i,t}$ (từ độ bất đồng JSD) và khối lượng $\bar p(\Vk)$. KL tự thân (student so với chính nó ở nhiệt độ $\tau_{i,t}$) điều chỉnh \emph{hình dạng} phân phối trong $\Vk$, còn $\mathcal L_{mass}$ (KL nhị phân $\Vk$ so với phần còn lại) chưng cất \emph{khối lượng} của $\Vk$ từ hội đồng.
+\end{itemize}
+
+\paragraph{Nguyên lý xuyên suốt: một hội đồng, một vùng Top-$k$.}
+Phân phối đầu ra của mô hình có đuôi dài rất nhiều nhiễu. Cả hai phase vì vậy chỉ làm việc trên \emph{cùng một tập $\Vk$} do hội đồng xác định bằng \emph{cùng một thuật toán} (Mục~\ref{sec:topk}). Hai phase chỉ khác nhau ở chỗ dùng tập đó vào việc gì:
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}lXX@{}}
+\toprule
+ & Phase 1 & Phase 2 \\
+\midrule
+Tập token dùng & $\Cset=\Vk\setminus\{\ytar\}$ (các dự đoán sai nhưng hợp lý) & $\Vk$ (toàn vùng hội đồng quan tâm, gồm cả $\ytar$ nếu có) \\
+Dùng để làm gì & DPP đẩy các expert ra xa nhau & JSD $\to$ nhiệt độ $\tau_{i,t}$ $\to$ KL tự chưng cất của student trên $\Vk$, cộng $\mathcal L_{mass}$ cho khối lượng của $\Vk$ \\
+Ai lo token đúng $\ytar$ & SFT & SFT \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Nhờ vậy vùng mà DPP đã định hình ở Phase 1 chính là vùng mà JSD đo bất đồng và KL tác động ở Phase 2. Student cuối cùng là một adapter hạng $r$ duy nhất nên không có chi phí tham số phát sinh khi sinh văn bản.
+
+%==============================================================
+\section{Ký hiệu}
+\label{sec:notation}
+
+Tham số gốc $\theta_{base}$ được đóng băng. Ta gắn $M$ adapter LoRA $\Phi=\{\phi_1,\dots,\phi_M\}$; mỗi $\phi_m$ gồm các cặp $(A_m^{(\ell)},B_m^{(\ell)})$ trên từng mô-đun đích $\ell\in\mathcal M$, với $A_m^{(\ell)}\in\mathbb R^{r\times d_{in}}$, $B_m^{(\ell)}\in\mathbb R^{d_{out}\times r}$ và hệ số $s=\alpha/r$:
+\begin{equation}
+W^{(\ell)}_m = W^{(\ell)}_{base} + s\,B_m^{(\ell)}A_m^{(\ell)}.
+\end{equation}
+
+\paragraph{Chuỗi suy luận.}
+Teacher sinh ra chuỗi reasoning $R=(r_1,\dots,r_T)$, được tách theo ranh giới đoạn văn thành $S$ step liên tiếp, không chồng lấn $\{s_1,\dots,s_S\}$; step $s_i=(y_{i,1},\dots,y_{i,T_i})$ có $T_i$ token. Token ranh giới không thuộc step nào nên $\sum_iT_i\le T$. Trọng số được gán ở mức step, không ở mức token. Token định dạng (delimiter, answer marker, EOS, \ldots) và token đáp án không thuộc reasoning step: chúng tạo thành hai khối luôn-on, \emph{khối định dạng} và \emph{khối đáp án}, mỗi khối chuẩn hóa độ dài riêng. Nhờ đó mọi phương pháp được so sánh đều tính loss trên cùng một tập token đáp án.
+
+\paragraph{Xác suất và NLL.}
+Với đề bài $x$, gọi $z^{(m)}_{i,t}\in\mathbb R^{N}$ là logit của expert $m$ tại token $y_{i,t}$ ($N$ là kích thước từ vựng), và phân phối đầy đủ
+\begin{equation}
+\label{eq:phat}
+\hat p^{(m)}_{i,t}=\Softmax\!\big(z^{(m)}_{i,t}\big)\in\Delta^{N-1}.
+\end{equation}
+NLL chuẩn hóa độ dài của expert $m$ trên step $s_i$:
+\begin{equation}
+\label{eq:nll}
+\mathcal L_i^{(m)}=-\frac1{T_i}\sum_{t=1}^{T_i}\log \hat p^{(m)}_{i,t}(y_{i,t}).
+\end{equation}
+
+%==============================================================
+\section{Công cụ chung: Council Top-$k$}
+\label{sec:topk}
+
+Mục này định nghĩa các đối tượng dùng ở cả hai phase. Với một token $(i,t)$ và logit $\{z^{(m)}\}_{m=1}^M$ của $M$ expert, ta làm ba bước. Chỉ số $(i,t)$ được bỏ khi không gây nhầm lẫn.
+
+\paragraph{Bước 1 -- Đồng thuận trên toàn từ vựng.}
+\begin{equation}
+\label{eq:pbar}
+\bar p=\frac1M\sum_{m=1}^M\hat p^{(m)}.
+\end{equation}
+
+\paragraph{Bước 2 -- Kneedle chọn $\Vk$.}
+Sắp xếp $\bar p$ giảm dần thành $\bar p^\downarrow$, đặt $p_{max}=\bar p^\downarrow_1$, $p_{min}=\bar p^\downarrow_{N'}$ và chuẩn hóa
+\begin{equation}
+x_j=\frac{j}{N'},\qquad y_j=\frac{\bar p^\downarrow_j-p_{min}}{p_{max}-p_{min}},\qquad j=1,\dots,N'.
+\end{equation}
+Điểm khuỷu là điểm cách đường chéo $y=1-x$ xa nhất:
+\begin{equation}
+\label{eq:kneedle}
+k=\argmax_{j}\big((1-x_j)-y_j\big),\qquad \Vk=\text{$k$ token có $\bar p$ lớn nhất}.
+\end{equation}
+Mặc định $N'=N$. \emph{Tùy chọn hiệu năng:} chỉ lấy \texttt{topk} với $K_{max}$ cố định (64--256) và đặt $N'=K_{max}$, $p_{min}=\bar p^\downarrow_{K_{max}}$; khi đó phải dùng \emph{cùng} $K_{max}$ ở cả hai phase. Nếu $p_{max}=p_{min}$ (phân phối phẳng) thì lấy $k=N'$. Bước chọn $\Vk$ rời rạc, chạy dưới \texttt{no\_grad}, không đưa gradient.
+
+\paragraph{Bước 3 -- Phân phối hạn chế.}
+Với tập con $\mathcal S\subseteq\{1,\dots,N\}$ bất kỳ, phân phối của expert $m$ hạn chế trên $\mathcal S$ là
+\begin{equation}
+\label{eq:restrict}
+\pi^{(m)}_{\mathcal S}(v)=\frac{\hat p^{(m)}(v)}{\sum_{u\in\mathcal S}\hat p^{(m)}(u)}=\Softmax\!\big(z^{(m)}\big|_{\mathcal S}\big)(v),\qquad v\in\mathcal S,
+\end{equation}
+và trung bình $\bar\pi_{\mathcal S}=\frac1M\sum_m\pi^{(m)}_{\mathcal S}$. Softmax luôn lấy trên toàn từ vựng trước (hoặc tương đương, trên logit đã cắt về $\mathcal S$), không softmax hai lần.
+
+\paragraph{Cách hai phase gọi công cụ này.}
+\begin{itemize}
+\item \textbf{Phase 1:} $\Cset=\Vk\setminus\{\ytar\}$ ($\ytar$ bị loại \emph{sau} khi đã xác định khuỷu), vector DPP là $\pi^{(m)}_{\Cset}$ (Mục~\ref{sec:dpp}).
+\item \textbf{Phase 2:} $\mathcal S=\Vk$, không loại $\ytar$, dùng $\pi^{(m)}_{\Vk}$ cho JSD, và dùng $\Vk$ làm vùng tính KL của student (Mục~\ref{sec:signals}--\ref{sec:phase2loss}).
+\end{itemize}
+Điểm khác duy nhất giữa hai phase là có loại $\ytar$ hay không, và đó là chủ đích: DPP chỉ nên tác động lên các token sai, còn KL ở Phase 2 cần toàn vùng Top-$k$, kể cả $\ytar$. Khi $\ytar\notin\Vk$ (hội đồng bỏ sót đáp án đúng), KL ở Phase 2 không chạm vào logit của $\ytar$, và SFT tự đẩy $\ytar$ lên mà không bị KL cản.
+
+%==============================================================
+\section{Phase 1: Diversity Training}
+\label{sec:phase1}
+
+Phase 1 huấn luyện $M$ expert sao cho vừa chính xác vừa khác biệt. Tính khác biệt là điều kiện tiên quyết: nếu các expert hội tụ về cùng một nghiệm thì mọi tín hiệu đo ở Phase 2 ($\JS_{i,t}$) đều triệt tiêu. Ba cơ chế tác động lần lượt lên \emph{dữ liệu} (Mục~\ref{sec:gdrop}), \emph{không gian tham số} (Mục~\ref{sec:rep}) và \emph{phân phối đầu ra} (Mục~\ref{sec:dpp}); Mục~\ref{sec:phase1obj} gộp chúng vào một quy tắc cập nhật.
+
+%--------------------------------------------------------------
+\subsection{Step-level Gradient Dropout (tác động lên dữ liệu)}
+\label{sec:gdrop}
+
+Với mỗi sample $i$, reasoning step $s$ và expert $m$, biến giữ lại
+\begin{equation}
+\label{eq:graddropout}
+d_{i,s,m}\sim\mathrm{Bernoulli}(1-p_{drop})
+\end{equation}
+được lấy độc lập theo bộ ba $(i,s,m)$. Step bị loại ($d_{i,s,m}=0$) có trọng số $0$ và không xuất hiện ở tử số lẫn mẫu số của \eqref{eq:sftmean}; khối đáp án và khối định dạng luôn được giữ. Dropout chỉ đổi \emph{trọng số của loss}, không đổi forward pass; mỗi expert vì vậy chỉ thấy một tập con ngẫu nhiên của tín hiệu huấn luyện, và các tập con khác nhau giữa các expert. Dropout không áp vào DPP hay lực đẩy.
+
+%--------------------------------------------------------------
+\subsection{Lực đẩy kernel trên khoảng cách chiếu (tác động lên tham số)}
+\label{sec:rep}
+
+Ta coi $M$ expert như $M$ hạt tương tác theo tinh thần Stein Variational Gradient Descent (SVGD): ngoài gradient NLL của riêng mình, mỗi expert chịu thêm một lực đẩy tách nó khỏi các expert ``gần'' nó. Khoảng cách được đo trên các \emph{không gian con} mà LoRA khai thác: hai adapter là gần nhau nếu không gian hàng của $A$ (hoặc không gian cột của $B$) trùng lặp nhiều, bất kể độ lớn hay cơ sở nội tại.
+
+\paragraph{Không gian con và phép chiếu.}
+Đặt $X_m^{(\ell,A)}:=A_m^{(\ell)}\in\mathbb R^{r\times d_{in}}$ và $X_m^{(\ell,B)}:=(B_m^{(\ell)})^{\top}\in\mathbb R^{r\times d_{out}}$. Mỗi không gian con là không gian hàng của một ma trận $X_m\in\mathbb R^{r\times d}$ hạng đầy đủ. Ma trận Gram và phép chiếu trực giao lên không gian hàng:
+\begin{equation}
+\label{eq:gram}
+C_{pq}=X_pX_q^{\top}\in\mathbb R^{r\times r},\qquad P_p=X_p^{\top}C_{pp}^{-1}X_p .
+\end{equation}
+
+\paragraph{Khoảng cách chiếu.}
+Với $r$ góc chính $\theta_1,\dots,\theta_r\in[0,\pi/2]$ giữa hai không gian con,
+\begin{equation}
+\label{eq:projdist}
+d_{X}(p,q)^2=\sum_{j=1}^{r}\sin^2\theta_j=r-f_{pq},\qquad
+f_{pq}=\operatorname{tr}(P_pP_q)=\operatorname{tr}\!\big(C_{pp}^{-1}C_{pq}C_{qq}^{-1}C_{qp}\big).
+\end{equation}
+Ở đây $f_{pq}=\|Q_p^\top Q_q\|_F^2$ ($Q$ là cơ sở trực chuẩn bất kỳ) là phần ``năng lượng'' của không gian này nằm trong không gian kia: bằng $r$ khi trùng nhau và $0$ khi trực giao. Khoảng cách tổng hợp, trung bình trên các mô-đun đích:
+\begin{equation}
+\label{eq:grasstotal}
+d(\phi_p,\phi_q)^2=\frac1{|\mathcal M|}\sum_{\ell\in\mathcal M}\Big[d_{A}^{(\ell)}(p,q)^2+d_{B}^{(\ell)}(p,q)^2\Big].
+\end{equation}
+
+\begin{proposition}
+\label{prop:bound}
+Với mọi cặp $(p,q)$: (i) $0\le d(\phi_p,\phi_q)^2\le 2r$, và $d_X^2=0$ khi và chỉ khi hai không gian con trùng nhau; (ii) $d_X$ bất biến khi thay $X_m\mapsto G_mX_m$ với $G_m\in GL_r$ bất kỳ; (iii) $d_X^2\le\sum_j\theta_j^2\le\frac{\pi^2}{4}d_X^2$, tức tương đương khoảng cách geodesic sai khác hằng số; (iv) kernel $K=\exp(-d^2/h)\in[e^{-2r/h},1]$ và giảm đơn điệu theo $d^2$.
+\end{proposition}
+\begin{proof}
+(i) $\sin^2\theta_j\in[0,1]$. (ii) $P_p$ chỉ phụ thuộc không gian hàng của $X_p$. (iii) Với $\theta\in[0,\pi/2]$ có $\frac2\pi\theta\le\sin\theta\le\theta$. (iv) suy ra từ (i).
+\end{proof}
+
+\paragraph{Kernel.}
+\begin{equation}
+\label{eq:grasskernel}
+K(\phi_p,\phi_q)=\exp\!\Big(-\frac{d(\phi_p,\phi_q)^2}{h}\Big),\qquad h=\frac{\mathrm{med}^2}{\ln M},
+\end{equation}
+với $\mathrm{med}$ là trung vị của $\{d(\phi_p,\phi_q)\}_{p<q}$. Cả $h$ và $K$ được tính lại mỗi lần cập nhật lực và coi là hằng số (stop-gradient). Hai expert có không gian con trùng nhiều nhận $K\approx1$ và bị đẩy mạnh; hai expert đã gần trực giao nhận $K$ nhỏ nên lực tự suy yếu, không cần ngưỡng cứng.
+
+\paragraph{Lực đẩy.}
+\begin{equation}
+\label{eq:repforce}
+F_{rep}(\phi_m)=\frac1M\sum_{m'\ne m}K(\phi_m,\phi_{m'})\,\nabla_{\phi_m}d(\phi_m,\phi_{m'})^2 ,
+\end{equation}
+với $\phi_{m'}$ được coi là hằng số khi lấy gradient. Vì $\nabla_\phi K=-\frac Kh\nabla_\phi d^2$, đây là số hạng lực đẩy của SVGD với kernel \eqref{eq:grasskernel}, sai khác hằng số $1/h$ được hấp thụ vào $\lambda_{rep}$.
+
+\begin{proposition}[Gradient dạng đóng]
+\label{prop:closedform}
+Với $T_{pq}=C_{pq}C_{qq}^{-1}$,
+\begin{equation}
+\label{eq:gradf}
+\nabla_{X_p}f_{pq}=2\,C_{pp}^{-1}\,T_{pq}\,\big(X_q-C_{qp}C_{pp}^{-1}X_p\big)=2\,C_{pp}^{-1}X_pP_q\,(I-P_p).
+\end{equation}
+Do đó $\nabla_{X_p}d_X^2=-\nabla_{X_p}f_{pq}$, và lực lên $X_p$ tại mô-đun $\ell$ là
+\begin{equation}
+\label{eq:forceclosed}
+F^{(\ell)}_{X}(p)=-\frac{2}{M|\mathcal M|}\sum_{q\ne p}K_{pq}\;C_{pp}^{-1}\,T_{pq}\,\big(X_q-C_{qp}C_{pp}^{-1}X_p\big).
+\end{equation}
+Lực với $B$ nhận được bằng cách chuyển vị $F_X$ với $X=B^\top$.
+\end{proposition}
+\begin{proof}[Phác thảo]
+Vi phân $\delta P_p=\delta X^\top C^{-1}X+X^\top C^{-1}\delta X-X^\top C^{-1}(\delta X\,X^\top+X\,\delta X^\top)C^{-1}X$, thay vào $\delta f=\operatorname{tr}(\delta P_p\,P_q)$ với $P_q$ đối xứng và rút gọn.
+\end{proof}
+
+\paragraph{Lưu ý thực hành.}
+\begin{itemize}
+\item Thừa số $(I-P_p)$ khiến lực nằm trong phần bù trực giao của $\mathrm{row}(X_p)$: lực chỉ \emph{xoay} không gian con ra xa $\mathcal U_q$ (đến bậc nhất), không co giãn nó.
+\item Nếu $\mathcal U_p=\mathcal U_q$ thì lực bằng $0$ (điểm yên ngựa); các expert cần khởi tạo $A$ khác nhau (khác seed) hoặc thêm nhiễu nhỏ.
+\item Chuẩn lực $\sim1/\sigma_{\min}(X_p)$, không bị chặn khi $\Vert{}X_p\Vert{}\to0$. Vì lực không đi qua optimizer và không bị cắt, cần theo dõi $\Vert{}F_{rep}\Vert{}$ và dùng ridge.
+\item \textbf{Ổn định số.} Thay $C_{pp}$ bằng $\tilde C_{pp}=C_{pp}+(\varepsilon_{rel}\operatorname{tr}C_{pp}/r+\varepsilon_{abs})I$ (ví dụ $\varepsilon_{rel}=10^{-4}$, $\varepsilon_{abs}=10^{-8}$) trong mọi nghịch đảo; Gram và nghịch đảo tính ở fp32.
+\item \textbf{Cổng $B$.} Với khởi tạo chuẩn $B=0$, $\mathrm{col}(B)$ chưa xác định; phần $B$ của \eqref{eq:grasstotal} và của lực chỉ bật khi đồng thời $t\ge t_B$ và $\min_m\Vert{}B_m\Vert{}_F>\tau_B$ (mặc định $\tau_B=0$), trước đó chỉ dùng phần $A$.
+\item \textbf{Chi phí.} Mọi đại lượng chỉ phụ thuộc các Gram cỡ $r\times r$. Gộp các mô-đun cùng shape thành chiều batch $L$, tính $G=X_{all}X_{all}^\top$ bằng một GEMM rồi tách khối. Chi phí mỗi nhóm $O(L\,M^2r^2d)$ cho GEMM và $O(L\,M^2r^3)$ cho các tích $r\times r$; không QR/SVD, chạy dưới \texttt{no\_grad}. Lực có thể cập nhật mỗi $n_{rep}$ bước (mặc định $1$) và tái dùng ở các bước giữa.
+\end{itemize}
+
+%--------------------------------------------------------------
+\subsection{DPP trên vùng sai nhưng hợp lý (tác động lên phân phối đầu ra)}
+\label{sec:dpp}
+
+Trực giao trong không gian trọng số là điều kiện cần nhưng chưa đủ; ép phân kỳ trên toàn từ vựng chỉ sinh nhiễu ở vùng đuôi. Vì vậy DPP chỉ chạy trên $\Cset=\Vk\setminus\{\ytar\}$, với $\Vk$ từ công cụ chung (Mục~\ref{sec:topk}).
+
+\paragraph{Vector và loss.}
+Với mỗi expert, lấy $\pi^{(m)}_{\Cset}$ theo \eqref{eq:restrict} và chuẩn hóa $L_2$:
+\begin{equation}
+\tilde v^{(m)}=\frac{\pi^{(m)}_{\Cset}}{\|\pi^{(m)}_{\Cset}\|_2+\epsilon}.
+\end{equation}
+(Chuẩn hóa $L_2$ triệt tiêu hằng số chia của \eqref{eq:restrict}, nên $\tilde v^{(m)}$ trùng với việc cắt $\hat p^{(m)}$ lên $\Cset$.) Với $G_{p,q}=(\tilde v^{(p)})^\top\tilde v^{(q)}$:
+\begin{equation}
+l_{DPP,i,t}=-\log\det(G+\alpha I),\quad \alpha=10^{-5},\qquad
+\mathcal L_{DPP\_div}=\frac1S\sum_{i=1}^S\Big(\frac1{T_i}\sum_{t=1}^{T_i}l_{DPP,i,t}\Big),
+\label{eq:dppsteploss}
+\end{equation}
+chỉ tính các token có $|\Cset|>0$. Định thức $M\times M$ tốn $O(M^3)$, Gram tốn $O(M^2|\Cset|)$.
+
+\paragraph{Hiện thực: probe và VJP.}
+DPP cần logit của \emph{tất cả} $M$ expert trên cùng một token, trong khi SFT của mỗi expert là độc lập. Để không giữ $M$ computation graph cùng lúc, DPP được tính trên một lượt \emph{probe} \texttt{no-grad} (không dùng mask dropout), thu được cotangent $c^{(m)}=\partial\mathcal L_{DPP\_div}/\partial\log\hat p^{(m)}_{\Cset}$; sau đó mỗi expert đưa cotangent này về tham số LoRA bằng VJP trong lượt forward có graph của chính nó (qua softmax đầy đủ). Vì dropout chỉ đổi trọng số loss nên hai lượt cho logit giống hệt nhau. Có hai chế độ tương đương về toán học: \textbf{probe} (mặc định, tiết kiệm bộ nhớ, forward gấp đôi) và \textbf{joint} (một forward, giữ $M$ graph, có thể cần gradient checkpointing). Hai tùy chọn giảm chi phí, mặc định tắt vì đổi nhẹ tập token DPP nhìn thấy: chỉ tính DPP trên tỉ lệ $\pi_{dpp}$ vị trí token, hoặc mỗi $n_{dpp}$ bước.
+
+%--------------------------------------------------------------
+\subsection{Hàm mục tiêu và quy tắc cập nhật}
+\label{sec:phase1obj}
+
+NLL của expert $m$ trên step $s$ của sample $i$ là $\ell^{(m)}_{i,s}$ (cùng dạng \eqref{eq:nll}). Trên một bước optimizer (gộp batch và gradient accumulation), cộng các số hạng rồi chia cho tổng số segment đóng góp của chính expert đó:
+\begin{equation}
+\label{eq:sftmean}
+\mathcal L_{\mathrm{SFT}}^{(m)}=
+\frac{\sum_{i,s}d_{i,s,m}\,\ell_{i,s}^{(m)}+\sum_i\mathcal L_{\mathrm{ans},i}^{(m)}+\sum_i\mathcal L_{\mathrm{fixed},i}^{(m)}}
+{\sum_{i,s}d_{i,s,m}+\sum_i\mathbf 1_{\mathrm{ans},i}+\sum_i\mathbf 1_{\mathrm{fixed},i}}.
+\end{equation}
+Mỗi step được giữ đóng góp đúng một đơn vị NLL chuẩn hóa độ dài nên scale loss tương đương giữa các mẫu. Hàm mục tiêu dữ liệu chỉ gồm hai thành phần:
+\begin{equation}
+\label{eq:phase1}
+\mathcal L_{Phase1}^{(m)}=\mathcal L_{\mathrm{SFT}}^{(m)}+\lambda_{div}\,\mathcal L_{DPP\_div}.
+\end{equation}
+Lực đẩy tác động trực tiếp lên hướng cập nhật chứ không phải một số hạng của loss. Gradient dữ liệu $g_m=\nabla_{\phi_m}\mathcal L_{Phase1}^{(m)}$ được cắt chuẩn $\ell_2$ toàn cục (\texttt{max\_grad\_norm}) rồi đưa vào AdamW (lịch cosine warmup); lực đẩy không đi qua optimizer và không bị cắt:
+\begin{equation}
+\label{eq:phase1update}
+\phi_m^{t+1}=\mathrm{AdamW}\!\big(\phi_m^{t},g_m\big)+\eta_t\,\lambda_{rep}\,F_{rep}\!\big(\phi_m^{t}\big),
+\end{equation}
+với $\eta_t$ là learning rate hiện tại và $F_{rep}$ tính từ tham số \emph{trước} bước cập nhật dữ liệu (một snapshot chung cho cả $M$ expert, để lực đối xứng giữa các cặp). Ba cơ chế ứng với ba số hạng: dropout lên dữ liệu, lực đẩy lên tham số, gradient DPP lên phân phối đầu ra.
+
+%--------------------------------------------------------------
+\subsection{Thuật toán một bước huấn luyện}
+\label{sec:p1algo}
+
+Một bước optimizer $t$ gom $G$ microbatch. Mỗi expert giữ một trạng thái AdamW riêng. Khi $n_{dpp}=1$, mỗi expert forward đúng hai lần trên mỗi microbatch (probe và replay).
+
+\begin{algorithm}[H]
+\caption{Một bước optimizer của Phase 1 (chế độ probe)}
+\label{alg:phase1step}
+\begin{algorithmic}[1]
+\Require $\phi_1^t,\dots,\phi_M^t$; cửa sổ $G$ microbatch; learning rate $\eta_t$
+\State Đặt các bộ cộng dồn gradient $G^{(m)}_{\mathrm{SFT}},G^{(m)}_{\mathrm{DPP}}\leftarrow0$ và các mẫu số $N^{(m)}_{\mathrm{SFT}},N_{\mathrm{DPP}}\leftarrow0$
+\For{microbatch $\mathcal B_b$, $b=1,\dots,G$}
+    \If{$n_{dpp}>1$ và $t\bmod n_{dpp}\neq0$}
+        \State Bỏ probe, đặt $c^{(m)}\leftarrow0$
+    \Else
+        \State \textbf{Probe} (\texttt{no-grad}, không dropout): forward cả $M$ expert, lấy logit $z^{(m)}$
+        \State Tính $\bar p$, $\Vk$ (Mục~\ref{sec:topk}), $\Cset=\Vk\setminus\{\ytar\}$, $\tilde v^{(m)}$ (Mục~\ref{sec:dpp})
+        \State Tính $\mathcal L_{DPP\_div}$ theo \eqref{eq:dppsteploss}; $c^{(m)}\leftarrow\partial\mathcal L_{DPP\_div}/\partial\log\hat p^{(m)}_{\Cset}$, rồi tách khỏi graph
+    \EndIf
+    \For{expert $m=1,\dots,M$}
+        \State \textbf{Replay}: forward có graph; lấy $d_{i,s,m}$ theo \eqref{eq:graddropout}
+        \State Cộng gradient của tử số \eqref{eq:sftmean} vào $G^{(m)}_{\mathrm{SFT}}$; tăng $N^{(m)}_{\mathrm{SFT}}$ theo số step giữ lại cộng khối đáp án và khối định dạng
+        \State Cộng VJP của $\langle c^{(m)},\log\hat p^{(m)}_{\Cset}\rangle$ vào $G^{(m)}_{\mathrm{DPP}}$
+    \EndFor
+    \State $N_{\mathrm{DPP}}\mathrel{+}=$ số sample trong $\mathcal B_b$ có ít nhất một token $|\Cset|>0$
+\EndFor
+\State All-reduce mọi tổng gradient và mọi mẫu số giữa các rank
+\State $g_m\leftarrow G^{(m)}_{\mathrm{SFT}}/\max(N^{(m)}_{\mathrm{SFT}},1)+\lambda_{div}\,G^{(m)}_{\mathrm{DPP}}/\max(N_{\mathrm{DPP}},1)$; cắt $g_m$ theo \texttt{max\_grad\_norm}
+\If{chưa có bộ đệm lực, hoặc $t\bmod n_{rep}=0$}
+    \State Chụp $(A_m^{(\ell)},B_m^{(\ell)})$ của cả $M$ expert, trước mọi \texttt{AdamW.step}
+    \State Gom mô-đun cùng shape; Gram và nghịch đảo ở fp32 dưới \texttt{no\_grad}; ridge $\tilde C_{pp}$; tính $f_{pq}$, $d^2$, $h$, $K$
+    \If{$t<t_B$ hoặc $\min_m\|B_m\|_F\le\tau_B$}
+        \State Chỉ phía $A$ vào \eqref{eq:grasstotal} và vào lực
+    \Else
+        \State Cộng phía $B$: tính lực trên $X=B^\top$ rồi chuyển vị về dạng của $B$
+    \EndIf
+    \State Ghi $F_{rep}$ theo \eqref{eq:forceclosed} vào bộ đệm
+\EndIf
+\For{expert $m=1,\dots,M$}
+    \State $\phi_m\leftarrow\mathrm{AdamW}(\phi_m^t,g_m)$;\quad $\phi_m\leftarrow\phi_m+\eta_t\lambda_{rep}F_{rep}$
+\EndFor
+\State Tiến lịch cosine warmup
+\end{algorithmic}
+\end{algorithm}
+
+Ba điểm cần đọc cùng \eqref{eq:phase1update}. (1) Các mẫu số chỉ được chia sau khi cộng hết cửa sổ $G$ và all-reduce, nên $g_m$ là gradient của trung bình toàn cục, không phải trung bình của các gradient microbatch. (2) $F_{rep}$ lấy từ một snapshot chung chụp trước khi expert nào bước AdamW; khi $n_{rep}>1$ đó là lần làm tươi gần nhất, còn hệ số nhân vẫn là $\eta_t$ hiện tại. (3) Lực cộng sau \texttt{AdamW.step}, không vào trạng thái optimizer và không bị cắt chuẩn; weight decay nằm trong AdamW.
+
+%==============================================================
+\section{Phase 2: Medoid Cloning và Tự chưng cất theo nhiệt độ động}
+\label{sec:phase2}
+
+Sau Phase 1, hội đồng $\Phi$ (đóng băng) đã đa dạng. Phase 2 gồm bốn việc theo thứ tự: (1) chọn expert trung tâm làm điểm khởi đầu cho student $\tilde\theta$; (2) chạy một lượt hội đồng để lấy vùng $\Vk$, khối lượng $q$ của nó và độ bất đồng JSD; (3) biến JSD thành nhiệt độ động $\tau_{i,t}$; (4) tối ưu student bằng $\mathcal L_{\mathrm{SFT}}+\alpha\,\mathcal D_{\KL}+\beta\,\mathcal L_{mass}$: KL so sánh student với chính nó ở nhiệt độ động, còn $\mathcal L_{mass}$ so khối lượng của $\Vk$ với hội đồng.
+
+%--------------------------------------------------------------
+\subsection{Khởi tạo student bằng Medoid Cloning}
+\label{sec:medoid}
+
+Thay vì trung bình hóa các task-vector rồi nén hạng $r$ (có thể mất thông tin hoặc phá cấu trúc không gian đã hội tụ), ta chọn nguyên một adapter của hội đồng. Từ khoảng cách chiếu \eqref{eq:grasstotal} tại cuối Phase 1:
+\begin{equation}
+\label{eq:medoid}
+D_m=\sum_{q\ne m}d(\phi_m,\phi_q)^2,\qquad m^*=\argmin_{m}D_m,\qquad \tilde\theta\leftarrow\phi_{m^*}.
+\end{equation}
+Student bắt đầu từ một điểm ổn định trong không gian tham số, đại diện tốt nhất cho tri thức chung của hội đồng, không cần SVD.
+
+%--------------------------------------------------------------
+\subsection{Tín hiệu từ hội đồng: vùng $\Vk$ và JSD}
+\label{sec:signals}
+
+Với mỗi chuỗi reasoning huấn luyện, forward $M$ expert đóng băng (\texttt{no\_grad}, không dropout) và thu logit $z^{(m)}_{i,t}$. Kết quả có thể cache nếu dữ liệu không đổi giữa các epoch. Từ đó:
+
+\paragraph{(a) Vùng Top-$k$ -- đúng thuật toán Phase 1.}
+Gọi công cụ chung ở Mục~\ref{sec:topk}: tính $\bar p_{i,t}$ theo \eqref{eq:pbar}, Kneedle \eqref{eq:kneedle} cho $\Vk$ (cùng $N'$/$K_{max}$ với Phase 1, \emph{không} loại $\ytar$). Token có $k_{i,t}=1$ không mang tín hiệu chưng cất (khi đó $Q=P=1$) nên bị bỏ khỏi KL.
+
+\paragraph{(b) Bất đồng trên $\Vk$ (JSD).}
+Với $\pi^{(m)}_{i,t}:=\pi^{(m)}_{\Vk}$ theo \eqref{eq:restrict} và $\bar\pi_{i,t}=\frac1M\sum_m\pi^{(m)}_{i,t}$:
+\begin{equation}
+\label{eq:jsd}
+\JS_{i,t}=\mathcal H(\bar\pi_{i,t})-\frac1M\sum_{m=1}^M\mathcal H\big(\pi^{(m)}_{i,t}\big)\in[0,\ln M],
+\end{equation}
+với $\mathcal H$ là Shannon entropy. $\JS_{i,t}$ thấp nghĩa là hội đồng đồng thuận, cao nghĩa là bất đồng.
+
+\paragraph{(c) Khối lượng của $\Vk$.}
+\begin{equation}
+\label{eq:qmass}
+q_{i,t}=\bar p_{i,t}(\Vk)=\sum_{v\in\Vk}\bar p_{i,t}(v)\in(0,1],
+\end{equation}
+tính từ $\bar p$ toàn từ vựng \eqref{eq:pbar}, ở $\tau=1$ (không áp nhiệt độ), và coi là hằng số. Phần $1-q_{i,t}$ là khối lượng đuôi mà hội đồng gán.
+
+%--------------------------------------------------------------
+\subsection{Nhiệt độ động}
+\label{sec:temp}
+
+Nguyên lý: nếu hội đồng đồng thuận ($\JS$ thấp), student cần học chính xác (sharpen, $\tau<1$); nếu bất đồng ($\JS$ cao), student cần không gian để đa dạng hóa (flatten, $\tau>1$). Ta chọn $\tau_{min}<1<\tau_{max}$ và ánh xạ $\JS_{i,t}\mapsto\tau_{i,t}$ theo một trong ba cách:
+
+\begin{itemize}
+\item \textbf{Tuyến tính (mặc định):} $\displaystyle\tau_{i,t}=\tau_{min}+(\tau_{max}-\tau_{min})\min\!\Big(1,\frac{\JS_{i,t}}{\JS_{max}}\Big)$, với $\JS_{max}$ là hằng số tĩnh (ví dụ $\ln M$ hoặc phân vị 95\% của $\JS$).
+\item \textbf{Sigmoid:} $\displaystyle\tau_{i,t}=\tau_{min}+\frac{\tau_{max}-\tau_{min}}{1+\exp(-\gamma(\JS_{i,t}-\beta_J))}$, với $\beta_J$ là điểm uốn (ví dụ trung vị $\JS$) và $\gamma$ là độ dốc.
+\item \textbf{Bậc thang:} $\tau_{min}$ nếu $\JS\le\theta_1$; $1$ nếu $\theta_1<\JS<\theta_2$; $\tau_{max}$ nếu $\JS\ge\theta_2$.
+\end{itemize}
+
+\paragraph{Nhiệt độ chỉ là hệ số điều khiển vĩ mô.}
+Hội đồng không cung cấp phân phối đích: nó chỉ quyết định \emph{vùng} ($\Vk$) và \emph{nhiệt độ cơ sở} ($\tau_{i,t}$). Phân phối đích được dựng từ chính student, kết hợp với độ phân tán vi mô tại Mục~\ref{sec:phase2loss}.
+
+%--------------------------------------------------------------
+\subsection{Hàm mục tiêu Phase 2}
+\label{sec:phase2loss}
+
+\paragraph{SFT.}
+NLL của student $\mathcal L_i^{(\tilde\theta)}$ (dạng \eqref{eq:nll}) trên các step reasoning $\mathcal R$, cộng hai khối luôn-on; mỗi step và mỗi khối đóng góp một đơn vị như nhau:
+\begin{equation}
+\label{eq:sft_plain}
+\mathcal L_{\mathrm{SFT}}=\frac{\sum_{i\in\mathcal R}\mathcal L_i^{(\tilde\theta)}+\mathcal L_{\mathrm{ans}}^{(\tilde\theta)}+\mathcal L_{\mathrm{fixed}}^{(\tilde\theta)}}{|\mathcal R|+2}.
+\end{equation}
+SFT tính trên toàn từ vựng và là nơi duy nhất quyết định xác suất của $\ytar$.
+
+\paragraph{Token-wise Masked Self-tempered KL trên $\Vk$.}
+Việc áp dụng chung một nhiệt độ $\tau_{i,t}$ cho toàn bộ $\Vk$ sẽ gây ra hiệu ứng phụ: khi $\tau_{i,t} > 1$, chia logit âm cho $\tau$ vô tình bơm khối lượng xác suất vào các token rác. Để khắc phục, ta điều chế $\tau_{i,t}$ bằng một mask đo độ bất đồng vi mô tại từng token $v \in \Vk$.
+
+Tính phương sai xác suất của hội đồng tại token $v$:
+\begin{equation}
+\label{eq:variance}
+\sigma^2_{i,t}(v) = \frac{1}{M}\sum_{m=1}^M \left(\pi^{(m)}_{i,t}(v) - \bar\pi_{i,t}(v)\right)^2.
+\end{equation}
+Chuẩn hóa thành mask tỉ lệ $M_{i,t}(v) \in [0,1]$:
+\begin{equation}
+\label{eq:mask}
+M_{i,t}(v) = \frac{\sigma^2_{i,t}(v)}{\max_{u \in \Vk} \sigma^2_{i,t}(u) + \epsilon}.
+\end{equation}
+
+Nhiệt độ hiệu dụng $\tau_{eff}^{(v)}$ được thiết kế đảo chiều mask tùy theo trạng thái JSD vĩ mô:
+\begin{equation}
+\label{eq:tau_eff}
+\tau_{eff}^{(v)} =
+\begin{cases}
+1 + M_{i,t}(v) \cdot (\tau_{i,t} - 1), & \text{nếu } \tau_{i,t} \ge 1 \text{ (bất đồng, flatten)} \\
+1 + (1 - M_{i,t}(v)) \cdot (\tau_{i,t} - 1), & \text{nếu } \tau_{i,t} < 1 \text{ (đồng thuận, sharpen)}
+\end{cases}
+\end{equation}
+
+Gọi $z^{stu}_{i,t}$ là logit của student. Phân phối hiện tại và phân phối đích trên $\Vk$:
+\begin{equation}
+\label{eq:self_target}
+P^{(v)}_{stu,i,t}=\Softmax\!\big(z^{stu}_{i,t}\big|_{\Vk}\big)(v),\qquad
+Q^{(v)}_{i,t}=\sg{\Softmax\!\big(z^{stu}_{i,t}\big|_{\Vk}/\tau_{eff}^{(v)}\big)(v)},\qquad v\in\Vk.
+\end{equation}
+Gọi $\mathcal T$ là tập token reasoning có $k_{i,t}\ge2$:
+\begin{equation}
+\label{eq:kl_loss}
+\mathcal D_{\KL}=\frac1{|\mathcal T|}\sum_{(i,t)\in\mathcal T}\ \sum_{v\in\Vk}Q^{(v)}_{i,t}\log\frac{Q^{(v)}_{i,t}}{P^{(v)}_{stu,i,t}}.
+\end{equation}
+Vì $Q$ bị tách khỏi graph nên gradient theo logit của student trên $\Vk$ là $(P_{stu}-Q)/|\mathcal T|$. KL không đụng tới phần đuôi ngoài $\Vk$ và bất biến theo khối lượng tổng của $\Vk$.
+
+\paragraph{Phân tích cơ chế Masked Self-Tempering.}
+Sự phân tách mask theo hai nhánh JSD giải quyết triệt để nghịch lý phân bổ xác suất:
+\begin{itemize}
+\item \textbf{Khi hội đồng bất đồng ($\tau\_{i,t} > 1$):} Mask $M(v) \approx 1$ tại các token có tranh cãi (kích hoạt $\tau_{eff} > 1$, làm phẳng phân phối), và $M(v) \approx 0$ tại token rác (giữ $\tau_{eff} \approx 1$). Nhờ vậy, logit âm sâu của token rác không bị chia nhỏ, qua đó đóng băng xác suất dư thừa và nhường toàn bộ không gian cho các token tranh cãi thực sự.
+\item \textbf{Khi hội đồng đồng thuận ($\tau\_{i,t} < 1$):} Đảo mask $1 - M(v)$ giúp token đồng thuận ($M(v) \approx 0$) nhận trọn vẹn nhiệt độ $\tau_{eff} \approx \tau < 1$. Việc chia logit dương của token đúng cho số nhỏ hơn 1 phóng to giá trị (làm đỉnh nhọn thêm), đồng thời việc chia logit âm của token rác cho số nhỏ hơn 1 tiếp tục đào sâu hố âm, dứt khoát triệt tiêu các tàn dư xác suất.
+\end{itemize}
+
+\paragraph{Lưu ý.}
+Vì đích bám theo chính student nên đây là một dạng điều chuẩn entropy có hướng, điều khiển bởi hội đồng, chứ không phải chưng cất từ một nguồn ngoài. Cần theo dõi entropy của $P_{stu}$ trên $\Vk$ và chọn $\alpha$, $\tau_{min}$ vừa phải để SFT cân bằng.
+
+\paragraph{Mass loss: khối lượng của $\Vk$ so với phần còn lại.}
+Khối lượng của student trên $\Vk$, tính ổn định bằng logsumexp (\texttt{lse}) trên toàn từ vựng:
+\begin{equation}
+\label{eq:mstu}
+m_{i,t}=P_{stu}(\Vk)=\exp\!\Big(\mathrm{lse}\big(z^{stu}_{i,t}\big|_{\Vk}\big)-\mathrm{lse}\big(z^{stu}_{i,t}\big)\Big),\qquad m_{i,t}\leftarrow\mathrm{clip}(m_{i,t},\epsilon_m,1-\epsilon_m).
+\end{equation}
+Với $q_{i,t}$ từ \eqref{eq:qmass}, KL nhị phân giữa phân phối $(\Vk,\ \text{phần còn lại})$ của hội đồng và của student là
+\begin{equation}
+\label{eq:mass}
+\mathcal L_{mass}=\frac1{|\mathcal T'|}\sum_{(i,t)\in\mathcal T'}\Big[q_{i,t}\log\frac{q_{i,t}}{m_{i,t}}+(1-q_{i,t})\log\frac{1-q_{i,t}}{1-m_{i,t}}\Big],
+\end{equation}
+trong đó $\mathcal T'$ là tập token reasoning có $\ytar\in\Vk$ (kể cả token có $k=1$, khi đó loss hiệu chỉnh độ tự tin của top-1).
+\begin{itemize}
+\item \textbf{Phân vai ba loss.} KL toàn từ vựng giữa hai phân phối tách theo chain rule thành KL nhị phân $(\Vk,\ \text{đuôi})$, KL có điều kiện trong $\Vk$ và KL có điều kiện trong đuôi. $\mathcal L_{mass}$ lo phần thứ nhất (đích từ hội đồng), $\mathcal D_{\KL}$ lo phần thứ hai (đích tự thân theo $\tau$), phần đuôi bị bỏ có chủ đích.
+\item \textbf{Vì sao mask $\ytar\in\Vk$.} Khi $\ytar\notin\Vk$, SFT đẩy $\ytar$ (ngoài $\Vk$) lên làm $m$ giảm, trong khi $\mathcal L_{mass}$ kéo $m$ về $q$: hai loss xung đột đúng ở token hội đồng bỏ sót đáp án. Biến thể thay thế là dùng $\Vk\cup\{\ytar\}$ cho cả $q$ và $m$ (xem ablation).
+\item \textbf{Không áp nhiệt độ lên $q$.} Khối lượng nhị phân là đại lượng ở $\tau=1$; áp $\tau$ sẽ trộn lẫn với việc flatten trong $\Vk$ mà $\mathcal D_{\KL}$ đã lo.
+\item \textbf{Chi phí.} $O(N)$ mỗi token, nhưng logit toàn từ vựng đã có sẵn từ SFT.
+\item \textbf{Trọng số.} $\beta$ nên nhỏ (ví dụ $0.1\alpha$--$0.5\alpha$) vì đây là bộ điều chuẩn khối lượng, không phải mục tiêu chính.
+\end{itemize}
+
+\paragraph{Tổng hợp.}
+\begin{equation}
+\label{eq:phase2_total_loss}
+\mathcal L_{Phase2}=\mathcal L_{\mathrm{SFT}}+\alpha\,\mathcal D_{\KL}+\beta\,\mathcal L_{mass},\qquad \alpha=1.0,\ \beta\in[0.1\alpha,\,0.5\alpha]\ \text{(ví dụ)}.
+\end{equation}
+Chỉ tham số LoRA của student được cập nhật; $\theta_{base}$ và $\Phi$ đóng băng.
+
+\paragraph{Tóm tắt một epoch Phase 2.}
+\begin{enumerate}
+\item Khởi tạo $\tilde\theta\leftarrow\phi_{m^*}$ theo \eqref{eq:medoid}.
+\item Chạy lượt hội đồng (hoặc đọc cache) để có $\Vk$, $q_{i,t}$ và $\JS_{i,t}$.
+\item Tính $\tau_{i,t}$ từ $\JS_{i,t}$ (Mục~\ref{sec:temp}).
+\item Forward student, lấy $z^{stu}$ trên $\Vk$, dựng $P_{stu}$ và $Q$ theo \eqref{eq:self_target}, tính $m_{i,t}$ theo \eqref{eq:mstu}, rồi $\mathcal L_{Phase2}$ \eqref{eq:phase2_total_loss}; cập nhật $\tilde\theta$.
+\end{enumerate}
+
+%--------------------------------------------------------------
+\subsection{Suy luận}
+\label{sec:inference}
+
+Student $\tilde\theta$ là một adapter LoRA hạng $r$ duy nhất, gộp tĩnh vào base:
+\begin{equation}
+\label{eq:weffstudent}
+W_{\mathrm{eff}}^{(\ell)}=W_{\mathrm{base}}^{(\ell)}+s\,\tilde B^{(\ell)}\tilde A^{(\ell)},\qquad\ell\in\mathcal M.
+\end{equation}
+Số tham số lúc sinh văn bản bằng base model cộng một LoRA hạng $r$; không giữ multi-adapter.
+
+%==============================================================
+\section{Siêu tham số, chẩn đoán và ablation}
+\label{sec:hyper}
+
+\paragraph{Siêu tham số chính.}
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Chung & $M$, $r$, $K_{max}$ (nếu bật; dùng chung hai phase) \\
+Phase 1 & $p_{drop}$, $\lambda_{div}$, $\lambda_{rep}$, $\varepsilon_{rel}$, $t_B$, $\tau_B$, $n_{rep}$, $n_{dpp}$, $\pi_{dpp}$ \\
+Phase 2 & $\tau_{min}$, $\tau_{max}$, $\JS_{max}$, $\alpha$, $\beta$, $\epsilon_m$ \\
+\bottomrule
+\end{tabularx}
+\end{center}
+Thang của $d^2$ tối đa là $2r$ nên $\lambda_{rep}$ cần chỉnh lại so với bản geodesic.
+
+\paragraph{Đại lượng cần ghi log.}
+\begin{itemize}
+\item Phase 1: $\bar d^2$ và $\bar f_{pq}$ trung bình theo cặp; $\min/\max$ của $K$; $\Vert{}F_{rep}\Vert{}$ và tỉ số $\Vert{}\eta\lambda_{rep}F_{rep}\Vert{}/\Vert{}\Delta\phi\Vert{}_{AdamW}$; NLL từng expert; độ đa dạng DPP.
+\item Top-$k$ (cả hai phase): $k$ trung bình; khối lượng đuôi $1-\sum_{v\in\Vk}\bar p^{(v)}$; tỉ lệ token có $\ytar\notin\Vk$.
+\item Phase 2: phân bố $\JS_{i,t}$ và $\tau_{i,t}$; tỉ lệ token có $k=1$; $\mathcal D_{\KL}$ tách theo vùng $\JS$ thấp/cao; entropy của $P_{stu}$ trên $\Vk$ theo thời gian; $m_{i,t}$ so với $q_{i,t}$ (độ lệch $\vert{}m-q\vert{}$ trung bình) và tỉ lệ token bị loại khỏi $\mathcal T'$ vì $\ytar\notin\Vk$.
+\end{itemize}
+
+\paragraph{Ablation.}
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Cấu hình & Mục đích \\
+\midrule
+\multicolumn{2}{@{}l}{\emph{Phase 1}} \\
+Không dropout, không lực, không DPP & Baseline: $M$ expert độc lập \\
+Chỉ dropout / chỉ lực / chỉ DPP & Đóng góp của từng cơ chế \\
+Lực geodesic (autodiff) vs. lực chiếu (dạng đóng) & Metric mới có đổi kết quả không; so thời gian mỗi bước \\
+$n_{rep}\in\{1,4,8\}$; phần $B$ bật từ đầu vs. từ $t_B$ & Độ nhạy với tần suất lực và cổng $B$ \\
+Probe vs. joint & Kiểm tra tương đương, so bộ nhớ/thời gian \\
+\midrule
+\multicolumn{2}{@{}l}{\emph{Phase 2}} \\
+Kneedle trên $Z_{avg}$ (cũ) vs. trên $\bar p$ (mới, thống nhất Phase 1) & Thống nhất hai phase có thực sự cải thiện không \\
+$Q=\sg{\Softmax(z^{stu}/\tau)}$ (tự thân) vs. $Q\propto\bar\pi^{1/\tau}$ (từ hội đồng) & Đích là chính student hay đồng thuận hội đồng \\
+$\Vk$ vs. $\Vk\cup\{\ytar\}$ vs. $\Cset$ cho KL & Có cần thêm/bớt $\ytar$ không (so với tỉ lệ $\ytar\notin\Vk$ ở log) \\
+Không $\mathcal L_{mass}$ vs. $\mathcal L_{mass}$ (mask $\ytar\in\Vk$) vs. $\mathcal L_{mass}$ với $\Vk\cup\{\ytar\}$ & Khối lượng $\Vk$ có trôi không; xung đột với SFT; $|m-q|$ và $\beta$ \\
+Ba dạng nhiệt độ; $\tau\equiv1$ & Giá trị của nhiệt độ động ($\tau\equiv1\Rightarrow\mathcal D_{\KL}=0$, chỉ còn SFT) \\
+Medoid vs. expert ngẫu nhiên vs. merge SVD & Giá trị của Medoid Cloning \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\end{document}

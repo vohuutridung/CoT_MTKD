@@ -38,5 +38,5 @@ grading:
   timeout_seconds: 10
   prefer_math_verify: true
 paths:
-  stage2: artifacts/stage2/output_space
+  stage2: artifacts/stage2/council
   output: artifacts/evaluation/p_align

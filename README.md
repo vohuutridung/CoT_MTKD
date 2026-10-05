@@ -31,26 +31,26 @@ After setup, run the complete sequence below. Continue past each stress check
 only if it succeeds. Phase 2 defaults are **1 epoch, global batch 8, microbatch 1**.
 
 ```bash
-export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space_local.yaml
+export STAGE2_CONFIG=configs/stage2/qwen25_7b_council_local.yaml
 
 ./project_commands.sh prepare
 ./project_commands.sh stage1-stress
 ./project_commands.sh stage1
 
 ./project_commands.sh stage2-cache
-STAGE2_STRESS_OUTPUT=artifacts/stage2/output_space_local_stress_memory.json \
+STAGE2_STRESS_OUTPUT=artifacts/stage2/council_local_stress_memory.json \
   ./project_commands.sh stage2-stress
 ./project_commands.sh stage2
 
 .venv/bin/python -m cot_mtkd.cli.evaluate \
   --config configs/eval/p_align.yaml \
-  --set paths.stage2=artifacts/stage2/output_space_local \
+  --set paths.stage2=artifacts/stage2/council_local \
   --set paths.output=artifacts/evaluation/p_align_local
 ```
 
 Meaning of each command:
 
-1. `export STAGE2_CONFIG=...output_space_local.yaml` makes Phase 2 use the experts
+1. `export STAGE2_CONFIG=...council_local.yaml` makes Phase 2 use the experts
    trained locally by Phase 1, with separate cache and student output directories.
 2. `prepare` downloads and tokenizes the training corpus, saving it in
    `artifacts/prepared/s1k_1_1_cot_only/` for both phases.
@@ -59,12 +59,15 @@ Meaning of each command:
    report: `artifacts/stage1/stress_memory.json`.
 4. `stage1` trains the three experts and saves their adapters, checkpoint and
    manifest in `artifacts/stage1/main/`.
-5. `stage2-cache` precomputes teacher targets and selects the best expert for
-   student initialization; cache: `artifacts/teacher_cache/output_space_local/`.
+5. `stage2-cache` runs the frozen council once per sample (Council Top-k `V_k`,
+   its mass `q`, the JSD disagreement and the per-token variance mask) and selects
+   the medoid expert for student initialization (Medoid Cloning);
+   cache: `artifacts/teacher_cache/council_local/`.
 6. `stage2-stress` checks the cached student training path on real and synthetic
-   samples. The output override saves `artifacts/stage2/output_space_local_stress_memory.json`.
-7. `stage2` trains the student for one epoch and saves its adapter, checkpoint
-   and logs in `artifacts/stage2/output_space_local/`.
+   samples. The output override saves `artifacts/stage2/council_local_stress_memory.json`.
+7. `stage2` trains the student for one epoch with
+   `L_SFT + alpha * D_KL + beta * L_mass` (dynamic-temperature self-distillation on
+   `V_k`) and saves its adapter, checkpoint and logs in `artifacts/stage2/council_local/`.
 8. The `evaluate` command benchmarks that local student on AIME 2025, AIME 2024,
    AMC and MATH-500, saving results in `artifacts/evaluation/p_align_local/`.
    Evaluation is optional after training finishes.
@@ -149,7 +152,7 @@ After the same setup, use this sequence if you want the existing `duyentl04/abc`
 experts. It skips Phase-1 training. Continue past the stress check only if it succeeds.
 
 ```bash
-export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space.yaml
+export STAGE2_CONFIG=configs/stage2/qwen25_7b_council.yaml
 
 ./project_commands.sh prepare
 ./project_commands.sh fetch-teachers
@@ -161,18 +164,48 @@ export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space.yaml
 
 Meaning of each command:
 
-1. `export STAGE2_CONFIG=...output_space.yaml` selects the pinned Hugging Face council.
+1. `export STAGE2_CONFIG=...council.yaml` selects the pinned Hugging Face council.
 2. `prepare` builds the same tokenized corpus in `artifacts/prepared/s1k_1_1_cot_only/`.
 3. `fetch-teachers` downloads, verifies and imports the three experts into
    `artifacts/stage1/duyentl04_abc/`.
-4. `stage2-cache` precomputes teacher targets and selects the initialization expert;
-   cache: `artifacts/teacher_cache/output_space/`.
+4. `stage2-cache` runs the council pass (`V_k`, `q`, JSD, variance mask) and selects
+   the medoid expert as the student initialization; cache: `artifacts/teacher_cache/council/`.
 5. `stage2-stress` checks student training VRAM and update completion;
-   report: `artifacts/stage2/output_space_stress_memory.json`.
+   report: `artifacts/stage2/council_stress_memory.json`.
 6. `stage2` trains for one epoch, saving the student and logs in
-   `artifacts/stage2/output_space/`.
+   `artifacts/stage2/council/`.
 7. `evaluate` optionally benchmarks that student, saving results in
    `artifacts/evaluation/p_align/`.
 
 For either route, the student output directory contains `final/adapters/student/`,
 `checkpoint.pt`, `metrics.jsonl`, `performance.jsonl` and `reasoning_steps.jsonl`.
+
+### Phase 2 method (`council_topk_dynamic_temperature_self_distillation`)
+
+Phase 2 follows `output/pdf/phase2.tex` §5 and the shared Council Top-k tool (§3):
+
+1. **Medoid Cloning** (`medoid:`): pairwise projection distances between the experts'
+   LoRA row spaces (`A` and `Bᵀ`, ridge `ε_rel·tr(C)/r + ε_abs` in fp32, `B` side only
+   when `min_m ‖B_m‖_F > τ_B`); the student starts as the expert minimizing
+   `D_m = Σ_{q≠m} d(φ_m, φ_q)²`. Saved as `student_init.pt` next to the cache.
+2. **Council signals** (`stage2-cache`): per reasoning token, `p̄ = mean_m softmax(z^(m))`
+   over the full vocabulary, Kneedle on sorted `p̄` (`council.k_max: null` → `N' = N`;
+   an integer bounds the window) gives `V_k`; `q = p̄(V_k)`; `JS` and the variance mask
+   `M(v)` come from the restricted expert distributions on `V_k`. Only `V_k`, `M(v)`,
+   `k`, `q`, `JS` and `y* ∈ V_k` are persisted (ragged safetensors + sha256).
+3. **Dynamic temperature** (`council.tau_min < 1 < council.tau_max`, `temperature_schedule`
+   `linear` (default; `js_max: p95` uses the cached reasoning-token JS percentile,
+   `null` uses `ln M`) / `sigmoid` / `step`) and
+   `τ_eff(v)` from `M(v)`; these are applied at training time, so changing them
+   never invalidates the cache.
+4. **Objective**: `L_SFT` (one unit per reasoning step plus the answer block and the
+   fixed format block, full vocabulary) `+ alpha · D_KL` (token-wise masked
+   self-tempered KL on `V_k`, tokens with `k ≥ 2`, target `sg[Softmax(z|V_k / τ_eff)]`)
+   `+ beta · L_mass` (binary KL between `q` and the student's clipped `V_k` mass,
+   tokens with `y* ∈ V_k`). Defaults: `alpha: 1.0`, `beta: 0.25`, `epsilon_m: 1e-6`,
+   one epoch.
+
+`metrics.jsonl` logs the §6 diagnostics per update (JS/τ/k means, `k=1` fraction,
+`y* ∉ V_k` fraction, student entropy on `V_k`, mean `|m − q|`, council tail mass,
+KL split into sharpening (`τ<1`) and flattening (`τ≥1`) tokens);
+`reasoning_steps.jsonl` logs them per reasoning step.

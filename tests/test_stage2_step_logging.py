@@ -70,12 +70,11 @@ class Stage2StepLoggingTest(unittest.TestCase):
                 "token_end": 9,
                 "js_mean": 0.2 * math.log(3),
                 "js_units": "nats",
-                "js_normalized": 0.2,
-                "rho": 0.2,
-                "step_kd_loss": 0.7,
-                "js_temperature": 1.0,
-                "kd_temperature": 2.0,
-                "teacher_count": 3,
+                "tau_mean": 0.8,
+                "k_mean": 4.5,
+                "step_kl_loss": 0.7,
+                "step_sft_loss": 1.1,
+                "step_mass_loss": 0.05,
             },
             {
                 "step_index": 1,
@@ -85,12 +84,11 @@ class Stage2StepLoggingTest(unittest.TestCase):
                 "token_end": 14,
                 "js_mean": 0.4 * math.log(3),
                 "js_units": "nats",
-                "js_normalized": 0.4,
-                "rho": 0.4,
-                "step_kd_loss": 0.9,
-                "js_temperature": 1.0,
-                "kd_temperature": 2.0,
-                "teacher_count": 3,
+                "tau_mean": 1.3,
+                "k_mean": 6.0,
+                "step_kl_loss": 0.9,
+                "step_sft_loss": 1.4,
+                "step_mass_loss": 0.08,
             },
         ]
         result = SimpleNamespace(
@@ -98,7 +96,7 @@ class Stage2StepLoggingTest(unittest.TestCase):
             steps=2,
             discarded_steps=1,
             step_metrics=step_values,
-            metrics={"kd_loss": 0.8, "sft_loss": 0.0},
+            metrics={"kl_loss": 0.8, "sft_loss": 1.25, "mass_loss": 0.065},
         )
         metadata = {
             "run_fingerprint": self.run,
@@ -117,7 +115,8 @@ class Stage2StepLoggingTest(unittest.TestCase):
             self.assertIsInstance(row["time"], (int, float))
             self.assertTrue(math.isfinite(row["time"]))
             self.assertEqual(row["sample_id"], "sample-đặc-biệt")
-            self.assertEqual(row["sample_kd_loss"], 0.8)
+            self.assertEqual(row["sample_kl_loss"], 0.8)
+            self.assertEqual(row["sample_mass_loss"], 0.065)
             self.assertEqual(row["retained_steps"], 2)
             self.assertEqual(row["discarded_steps"], 1)
             for key, value in {**metadata, **expected_step}.items():
@@ -128,7 +127,8 @@ class Stage2StepLoggingTest(unittest.TestCase):
                     "event",
                     "time",
                     "sample_id",
-                    "sample_kd_loss",
+                    "sample_kl_loss",
+                    "sample_mass_loss",
                     "sample_sft_loss",
                     "sample_total_loss",
                     "retained_steps",

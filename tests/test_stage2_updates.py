@@ -20,7 +20,6 @@ from cot_mtkd.models.multi_adapter import adapter_parameter_map, extract_adapter
 from cot_mtkd.stage2.council_cache import build_council_cache
 from cot_mtkd.stage2.trainer import (
     METHOD,
-    OUTPUT_SPACE_METHOD,
     _load_checkpoint,
     _save_checkpoint,
     apply_accumulated_update,
@@ -268,13 +267,8 @@ class Stage2UpdateTest(unittest.TestCase):
         self.assert_state_equal(extract_adapter_state(model, "student"), before)
         self.assertEqual(optimizer.state, {})
 
-    def test_complete_council_training_export_and_completed_resume_on_tiny_Qwen(self):
-        self.check_council_training_export_and_resume(METHOD)
-
-    def test_output_space_council_training_export_and_completed_resume_on_tiny_Qwen(self):
-        self.check_council_training_export_and_resume(OUTPUT_SPACE_METHOD)
-
-    def check_council_training_export_and_resume(self, method):
+    def test_council_training_export_and_completed_resume_on_tiny_Qwen(self):
+        method = METHOD
         tokenizer = CharacterTokenizer()
         context = DistributedContext(0, 0, 1, torch.device("cpu"))
         initial_model, names, _ = tiny_online_council(checkpointing=True)
@@ -359,11 +353,17 @@ class Stage2UpdateTest(unittest.TestCase):
                 "seed": 42,
                 "model": model_config,
                 "lora": LORA,
-                "geometry": {
-                    "temperature": 2.0,
-                    "epsilon_a": 1.0e-12,
-                    "epsilon_u": 1.0e-12,
-                    "teacher_execution": "online_full_vocab",
+                "medoid": {"epsilon_rel": 1.0e-4, "epsilon_abs": 1.0e-8, "tau_b": 0.0},
+                "council": {
+                    "k_max": None,
+                    "mask_epsilon": 1.0e-12,
+                    "tau_min": 0.5,
+                    "tau_max": 2.0,
+                    "temperature_schedule": "linear",
+                    "js_max": None,
+                    "alpha": 1.0,
+                    "beta": 0.25,
+                    "epsilon_m": 1.0e-6,
                 },
                 "stage2": {
                     "epochs": 1,
@@ -393,16 +393,6 @@ class Stage2UpdateTest(unittest.TestCase):
                 },
                 "_project_root": str(root),
             }
-            config["aggregation"] = {
-                "js_temperature": 1.0,
-                "kd_temperature": 2.0,
-                "sft_weight": 0.25,
-                "search_k": 512,
-                "k_min": 8,
-                "teacher_execution": "precomputed_support_tail",
-            }
-            if method == OUTPUT_SPACE_METHOD:
-                del config["geometry"]
             with (
                 patch(
                     "cot_mtkd.models.multi_adapter.load_base_causal_lm",
@@ -418,107 +408,134 @@ class Stage2UpdateTest(unittest.TestCase):
                 ):
                     hit = build_council_cache(config, context)
                 self.assertEqual(hit, council_manifest)
-                if method == OUTPUT_SPACE_METHOD:
-                    with (
-                        patch(
-                            "cot_mtkd.stage2.council_cache.compile_record",
-                            side_effect=AssertionError("Training must not preprocess teachers"),
-                        ),
-                        patch(
-                            "cot_mtkd.stage2.online.create_multi_adapter_model",
-                            side_effect=AssertionError("Training must load only student"),
-                        ),
-                    ):
-                        manifest = train_stage2(config, context)
-                else:
+                self.assertEqual(council_manifest["cache_version"], 2)
+                self.assertEqual(
+                    council_manifest["initialization"], "medoid_cloning_projection_distance"
+                )
+                self.assertEqual(
+                    council_manifest["selected_expert_index"],
+                    int(torch.argmin(torch.tensor(council_manifest["medoid"]["sums"]))),
+                )
+                self.assertEqual(council_manifest["tokens"], 10)
+                self.assertEqual(council_manifest["steps"], 4)
+                with (
+                    patch(
+                        "cot_mtkd.stage2.council_cache.compile_record",
+                        side_effect=AssertionError("Training must not rerun the council"),
+                    ),
+                    patch(
+                        "cot_mtkd.stage2.online.create_multi_adapter_model",
+                        side_effect=AssertionError("Training must load only student"),
+                    ),
+                ):
                     manifest = train_stage2(config, context)
                 self.assertEqual(manifest["method"], method)
                 self.assertEqual(manifest["data_step"], 1)
                 self.assertEqual(manifest["global_step"], 1)
                 self.assertEqual(manifest["loss_scalars"]["examples"], 2)
                 self.assertEqual(manifest["loss_scalars"]["reasoning_steps"], 4)
+                self.assertEqual(manifest["loss_scalars"]["active_steps"], 4)
+                self.assertEqual(manifest["loss_scalars"]["reasoning_tokens"], 10)
+                self.assertEqual(manifest["config"]["stage2"]["epochs"], 1)
+                for key in (
+                    "sft_loss",
+                    "kl_loss",
+                    "mass_loss",
+                    "js_mean",
+                    "tau_mean",
+                    "k_mean",
+                    "k1_fraction",
+                    "gold_missing_fraction",
+                    "council_tail_mass_mean",
+                    "student_entropy_on_support_mean",
+                    "abs_mass_gap_mean",
+                    "kl_sharpen_mean",
+                    "kl_flatten_mean",
+                ):
+                    self.assertIn(key, manifest["loss_scalars"])
+                self.assertAlmostEqual(
+                    manifest["loss_scalars"]["total_loss"],
+                    manifest["loss_scalars"]["sft_loss"]
+                    + manifest["loss_scalars"]["kl_loss"]
+                    + 0.25 * manifest["loss_scalars"]["mass_loss"],
+                    places=6,
+                )
                 self.assertEqual(
                     manifest["initial_expert_adapter"], council_manifest["selected_expert"]
                 )
+                self.assertEqual(manifest["medoid"], council_manifest["medoid"])
                 bundle = torch.load(output / manifest["adapter_bundle"], weights_only=True)
                 self.assertEqual(set(bundle), {"student"})
                 checkpoint = torch.load(output / "checkpoint.pt", weights_only=False)
                 self.assertEqual(checkpoint["method"], method)
-                if method == OUTPUT_SPACE_METHOD:
-                    self.assertEqual(manifest["loss_scalars"]["active_steps"], 4)
-                    self.assertIn("disagreement_mean", manifest["loss_scalars"])
-                    self.assertNotIn("anchor_ce_mean", manifest["loss_scalars"])
-                    step_log = output / "reasoning_steps.jsonl"
-                    rows = [json.loads(line) for line in step_log.read_text().splitlines()]
-                    self.assertEqual(len(rows), 4)
-                    self.assertEqual(
-                        {row["sample_id"] for row in rows}, {record.sample_id for record in records}
-                    )
-                    self.assertEqual({row["step_id"] for row in rows}, {0, 1})
-                    for row in rows:
-                        self.assertEqual(row["run_fingerprint"], manifest["run_fingerprint"])
-                        self.assertEqual(row["data_step_before"], 0)
-                        self.assertEqual(row["global_step_before"], 0)
-                        self.assertEqual(row["rho"], row["js_normalized"])
-                        self.assertAlmostEqual(row["js_mean"], row["rho"] * math.log(3))
-                    for record in records:
-                        sample_rows = [row for row in rows if row["sample_id"] == record.sample_id]
-                        self.assertEqual(len(sample_rows), 2)
-                        self.assertAlmostEqual(
-                            sum(row["step_kd_loss"] for row in sample_rows) / 2,
-                            sample_rows[0]["sample_kd_loss"],
-                        )
-                    self.assertEqual(
-                        manifest["reasoning_step_logs"],
-                        [
-                            {
-                                "rank": 0,
-                                "file": "reasoning_steps.jsonl",
-                                "sha256": file_sha256(step_log),
-                            }
-                        ],
-                    )
-                    performance_log = output / "performance.jsonl"
-                    perf_rows = [
-                        json.loads(line) for line in performance_log.read_text().splitlines()
-                    ]
-                    self.assertEqual(perf_rows[0]["event"], "stage2_performance_session")
-                    self.assertEqual(
-                        perf_rows[0]["config_fingerprint"], manifest["config_fingerprint"]
-                    )
-                    samples = [
-                        row for row in perf_rows if row["event"] == "stage2_sample_performance"
-                    ]
-                    updates = [
-                        row for row in perf_rows if row["event"] == "stage2_update_performance"
-                    ]
-                    self.assertEqual(len(samples), 2)
-                    self.assertEqual(len(updates), 1)
-                    self.assertEqual(
-                        {row["sample_id"] for row in samples}, {r.sample_id for r in records}
-                    )
-                    for row in samples:
-                        self.assertEqual(row["prefix_tokens"], 10)
-                        self.assertEqual(row["reasoning_tokens"], 5)
-                        self.assertEqual(row["cached_steps"], 2)
-                        self.assertEqual(row["recomputed_steps"], 0)
-                        self.assertEqual(row["head_chunks"], 3)
-                        self.assertEqual(row["teacher_head_chunk_sweeps"], 0)
-                        self.assertIsNone(row["peak_allocated_gib"])
-                        self.assertGreaterEqual(row["record_gradient_wall_seconds"], 0)
-                    self.assertEqual(updates[0]["local_examples"], 2)
-                    self.assertEqual(updates[0]["local_prefix_tokens"], 20)
-                    self.assertEqual(updates[0]["eta_remaining_wall_seconds_estimate"], 0)
-                    self.assertEqual(
-                        manifest["performance_logs"],
-                        [
-                            {
-                                "rank": 0,
-                                "file": "performance.jsonl",
-                                "sha256": file_sha256(performance_log),
-                            }
-                        ],
-                    )
+                initial_student = torch.load(
+                    council / council_manifest["fingerprint"] / "student_init.pt",
+                    weights_only=True,
+                )
+                moved = any(
+                    not torch.equal(bundle["student"][key], initial_student[key])
+                    for key in initial_student
+                )
+                self.assertTrue(moved)
+                step_log = output / "reasoning_steps.jsonl"
+                rows = [json.loads(line) for line in step_log.read_text().splitlines()]
+                self.assertEqual(len(rows), 4)
+                self.assertEqual(
+                    {row["sample_id"] for row in rows}, {record.sample_id for record in records}
+                )
+                self.assertEqual({row["step_id"] for row in rows}, {0, 1})
+                for row in rows:
+                    self.assertEqual(row["run_fingerprint"], manifest["run_fingerprint"])
+                    self.assertEqual(row["data_step_before"], 0)
+                    self.assertEqual(row["global_step_before"], 0)
+                    self.assertGreaterEqual(row["js_mean"], 0.0)
+                    self.assertLessEqual(row["js_mean"], math.log(3) + 1e-9)
+                    self.assertGreaterEqual(row["tau_mean"], 0.5)
+                    self.assertLessEqual(row["tau_mean"], 2.0)
+                    self.assertGreaterEqual(row["k_mean"], 1.0)
+                    for key in ("step_sft_loss", "step_kl_loss", "step_mass_loss"):
+                        self.assertTrue(math.isfinite(row[key]))
+                self.assertEqual(
+                    manifest["reasoning_step_logs"],
+                    [
+                        {
+                            "rank": 0,
+                            "file": "reasoning_steps.jsonl",
+                            "sha256": file_sha256(step_log),
+                        }
+                    ],
+                )
+                performance_log = output / "performance.jsonl"
+                perf_rows = [json.loads(line) for line in performance_log.read_text().splitlines()]
+                self.assertEqual(perf_rows[0]["event"], "stage2_performance_session")
+                self.assertEqual(perf_rows[0]["config_fingerprint"], manifest["config_fingerprint"])
+                samples = [row for row in perf_rows if row["event"] == "stage2_sample_performance"]
+                updates = [row for row in perf_rows if row["event"] == "stage2_update_performance"]
+                self.assertEqual(len(samples), 2)
+                self.assertEqual(len(updates), 1)
+                self.assertEqual(
+                    {row["sample_id"] for row in samples}, {r.sample_id for r in records}
+                )
+                for row in samples:
+                    self.assertEqual(row["sequence_tokens"], 13)
+                    self.assertEqual(row["reasoning_tokens"], 5)
+                    self.assertEqual(row["supervised_tokens"], 11)
+                    self.assertEqual(row["head_chunks"], 6)
+                    self.assertIsNone(row["peak_allocated_gib"])
+                    self.assertGreaterEqual(row["record_gradient_wall_seconds"], 0)
+                self.assertEqual(updates[0]["local_examples"], 2)
+                self.assertEqual(updates[0]["local_sequence_tokens"], 26)
+                self.assertEqual(updates[0]["eta_remaining_wall_seconds_estimate"], 0)
+                self.assertEqual(
+                    manifest["performance_logs"],
+                    [
+                        {
+                            "rank": 0,
+                            "file": "performance.jsonl",
+                            "sha256": file_sha256(performance_log),
+                        }
+                    ],
+                )
                 self.assert_state_equal(bundle["student"], checkpoint["student_state"])
                 self.assertTrue(
                     (output / "final" / "adapters" / "student" / "adapter_config.json").is_file()
@@ -530,26 +547,20 @@ class Stage2UpdateTest(unittest.TestCase):
                 metrics_hash = file_sha256(output / "metrics.jsonl")
                 resume_config = copy.deepcopy(config)
                 resume_config["stage2"]["resume_from"] = str(output / "checkpoint.pt")
-                gradient_path = (
-                    "cot_mtkd.stage2.output_space.compute_record_gradient"
-                    if method == OUTPUT_SPACE_METHOD
-                    else "cot_mtkd.stage2.trainer.compute_record_gradient"
-                )
                 with patch(
-                    gradient_path,
+                    "cot_mtkd.stage2.student.compute_record_gradient",
                     side_effect=AssertionError("A completed resume must not retrain examples"),
                 ):
                     resumed_manifest = train_stage2(resume_config, context)
                 self.assertEqual(resumed_manifest, manifest)
                 self.assertEqual(file_sha256(output / "checkpoint.pt"), checkpoint_hash)
                 self.assertEqual(file_sha256(output / "metrics.jsonl"), metrics_hash)
-                if method == OUTPUT_SPACE_METHOD:
-                    self.assertEqual(
-                        file_sha256(step_log), manifest["reasoning_step_logs"][0]["sha256"]
-                    )
-                    self.assertEqual(
-                        file_sha256(performance_log), manifest["performance_logs"][0]["sha256"]
-                    )
+                self.assertEqual(
+                    file_sha256(step_log), manifest["reasoning_step_logs"][0]["sha256"]
+                )
+                self.assertEqual(
+                    file_sha256(performance_log), manifest["performance_logs"][0]["sha256"]
+                )
 
 
 if __name__ == "__main__":

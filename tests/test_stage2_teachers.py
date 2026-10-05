@@ -201,11 +201,15 @@ class HubTeachersTest(unittest.TestCase):
             config.update(
                 {
                     "method": METHOD,
-                    "geometry": {
-                        "temperature": 2.0,
-                        "epsilon_a": 1e-12,
-                        "epsilon_u": 1e-12,
-                        "teacher_execution": "online_full_vocab",
+                    "medoid": {"epsilon_rel": 1.0e-4, "epsilon_abs": 1.0e-8, "tau_b": 0.0},
+                    "council": {
+                        "k_max": None,
+                        "tau_min": 0.5,
+                        "tau_max": 2.0,
+                        "temperature_schedule": "linear",
+                        "alpha": 1.0,
+                        "beta": 0.25,
+                        "epsilon_m": 1.0e-6,
                     },
                     "stage2": {
                         "epochs": 1,
@@ -229,14 +233,6 @@ class HubTeachersTest(unittest.TestCase):
                     "_project_root": str(root),
                 }
             )
-            config["aggregation"] = {
-                "js_temperature": 1.0,
-                "kd_temperature": 2.0,
-                "sft_weight": 0.25,
-                "search_k": 512,
-                "k_min": 8,
-                "teacher_execution": "precomputed_support_tail",
-            }
             config["paths"].update(
                 {
                     "prepared": str(prepared),

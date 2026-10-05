@@ -42,7 +42,6 @@ from ..utils.training import (
     global_clip_grad_list_,
     zeros_like_parameters,
 )
-from .online import compute_record_gradient, create_online_model
 from .performance import TrainingPerformanceLogger, performance_log_filename
 from .step_logging import (
     create_reasoning_logger,
@@ -52,8 +51,33 @@ from .step_logging import (
 )
 
 LOGGER = logging.getLogger(__name__)
-METHOD = "task_anchored_gradient_geometry_mtkd"
-OUTPUT_SPACE_METHOD = "disagreement_adaptive_distribution_aggregation_mtkd"
+METHOD = "council_topk_dynamic_temperature_self_distillation"
+
+# Per-update accumulators, reduced across ranks once per effective batch.
+SUM_KEYS = (
+    "examples",
+    "reasoning_steps",
+    "active_steps",
+    "total_loss",
+    "sft_loss",
+    "kl_loss",
+    "mass_loss",
+    "reasoning_tokens",
+    "kl_tokens",
+    "mass_tokens",
+    "k1_tokens",
+    "gold_missing_tokens",
+    "js_sum",
+    "tau_sum",
+    "k_sum",
+    "tail_mass_sum",
+    "entropy_sum",
+    "abs_mass_gap_sum",
+    "kl_sharpen_sum",
+    "kl_sharpen_tokens",
+    "kl_flatten_sum",
+    "kl_flatten_tokens",
+)
 
 
 def _stable_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -65,12 +89,8 @@ def _stable_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_stage2_config(config: dict[str, Any]) -> None:
-    method = config.get("method")
-    if method not in (METHOD, OUTPUT_SPACE_METHOD):
-        raise ValueError(
-            "Use an output-space or task-geometry Stage-2 config; "
-            "legacy dual-source caches are unsupported"
-        )
+    if config.get("method") != METHOD:
+        raise ValueError(f"Phase 2 implements method: {METHOD}")
     if str(config["optimizer"].get("name", "")).lower() != "adamw":
         raise ValueError("Phase 2 implements optimizer.name: adamw")
     if str(config["scheduler"].get("name", "")).lower() != "cosine":
@@ -91,27 +111,13 @@ def _validate_stage2_config(config: dict[str, Any]) -> None:
         value = float(config["stage2"][key])
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"stage2.{key} must be finite and positive")
-    section = "aggregation" if method == OUTPUT_SPACE_METHOD else "geometry"
-    selector = config[section]
-    selector_keys = (
-        ("js_temperature", "kd_temperature")
-        if method == OUTPUT_SPACE_METHOD
-        else ("temperature", "epsilon_a", "epsilon_u")
-    )
-    for key in selector_keys:
-        value = float(selector[key])
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError(f"{section}.{key} must be finite and positive")
-    if method != OUTPUT_SPACE_METHOD and selector.get("teacher_execution") != "online_full_vocab":
-        raise ValueError("Phase 2 requires online_full_vocab teacher execution")
     if int(config["runtime"]["lm_head_chunk_tokens"]) <= 0:
         raise ValueError("runtime.lm_head_chunk_tokens must be positive")
-    if method == OUTPUT_SPACE_METHOD:
-        from .council_cache import validate_council_config
+    from .council_cache import validate_council_config
 
-        validate_council_config(config)
+    validate_council_config(config)
     if "hard_loss_weight" in config["stage2"] or "kd_loss_weight" in config["stage2"]:
-        raise ValueError("Old hard/KD source weights are not part of the new Phase-2 objective")
+        raise ValueError("Old hard/KD source weights are not part of the Phase-2 objective")
     if not isinstance(config.get("logging", {}).get("reasoning_steps", True), bool):
         raise TypeError("logging.reasoning_steps must be a boolean")
     if not isinstance(config.get("logging", {}).get("performance", True), bool):
@@ -245,13 +251,47 @@ def apply_accumulated_update(
     return True, norm
 
 
+def summarize_window(counts: dict[str, float], council: dict[str, Any], updated: bool) -> dict:
+    """Window means: losses per example, council diagnostics per relevant token."""
+
+    def ratio(numerator: str, denominator: str) -> float:
+        return counts[numerator] / counts[denominator] if counts[denominator] > 0 else 0.0
+
+    examples = max(counts["examples"], 1.0)
+    return {
+        "total_loss": counts["total_loss"] / examples,
+        "sft_loss": counts["sft_loss"] / examples,
+        "kl_loss": counts["kl_loss"] / examples,
+        "mass_loss": counts["mass_loss"] / examples,
+        "alpha": float(council["alpha"]),
+        "beta": float(council["beta"]),
+        "examples": int(counts["examples"]),
+        "reasoning_steps": int(counts["reasoning_steps"]),
+        "active_steps": int(counts["active_steps"]),
+        "reasoning_tokens": int(counts["reasoning_tokens"]),
+        "kl_tokens": int(counts["kl_tokens"]),
+        "mass_tokens": int(counts["mass_tokens"]),
+        "k1_fraction": ratio("k1_tokens", "reasoning_tokens"),
+        "gold_missing_fraction": ratio("gold_missing_tokens", "reasoning_tokens"),
+        "js_mean": ratio("js_sum", "reasoning_tokens"),
+        "tau_mean": ratio("tau_sum", "reasoning_tokens"),
+        "k_mean": ratio("k_sum", "reasoning_tokens"),
+        "council_tail_mass_mean": ratio("tail_mass_sum", "reasoning_tokens"),
+        "student_entropy_on_support_mean": ratio("entropy_sum", "kl_tokens"),
+        "abs_mass_gap_mean": ratio("abs_mass_gap_sum", "mass_tokens"),
+        "kl_sharpen_mean": ratio("kl_sharpen_sum", "kl_sharpen_tokens"),
+        "kl_flatten_mean": ratio("kl_flatten_sum", "kl_flatten_tokens"),
+        "kl_sharpen_tokens": int(counts["kl_sharpen_tokens"]),
+        "kl_flatten_tokens": int(counts["kl_flatten_tokens"]),
+        "skipped_update": not updated,
+    }
+
+
 def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dict[str, Any]:
     _validate_stage2_config(config)
     method = config["method"]
-    if method == OUTPUT_SPACE_METHOD:
-        from .output_space import compute_record_gradient as record_gradient
-    else:
-        record_gradient = compute_record_gradient
+    from .student import compute_record_gradient
+
     paths = config["paths"]
     prepared_dir, stage1_dir = Path(paths["prepared"]), Path(paths["stage1"])
     output_dir = Path(paths["output"])
@@ -265,11 +305,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
     council = cache.manifest
     data_path = require_file_sha256(prepared_dir, prepared, "data_file", "data_file_sha256")
     for root, manifest, pairs in (
-        (
-            prepared_dir,
-            prepared,
-            [("config_file", "config_file_sha256")],
-        ),
+        (prepared_dir, prepared, [("config_file", "config_file_sha256")]),
         (
             stage1_dir,
             stage1,
@@ -323,12 +359,9 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
     if distributed.is_main:
         write_config_snapshot(output_dir / "config.yaml", public_config)
     barrier()
-    if method == OUTPUT_SPACE_METHOD:
-        from .initialization import create_cached_student
+    from .initialization import create_cached_student
 
-        model, adapter_names, parameters = create_cached_student(config, distributed, cache)
-    else:
-        model, adapter_names, parameters = create_online_model(config, distributed)
+    model, adapter_names, parameters = create_cached_student(config, distributed, cache)
     opt = config["optimizer"]
     optimizer = torch.optim.AdamW(
         parameters,
@@ -354,13 +387,14 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
         if start_epoch >= epochs:
             barrier()
             return read_json(output_dir / "manifest.json")
-    if resume and distributed.is_main and method == OUTPUT_SPACE_METHOD:
+    if resume and distributed.is_main:
         trim_jsonl_to_checkpoint(
             output_dir / "metrics.jsonl", run_hash, data_step, before_update=False
         )
     logger = JsonlLogger(
         output_dir / "metrics.jsonl", enabled=distributed.is_main, truncate=not bool(resume)
     )
+    council_config = config["council"]
     logger.log(
         "stage2_council_cache",
         run_fingerprint=run_hash,
@@ -371,18 +405,26 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
         samples=council["records"],
         tokens=council["tokens"],
         steps=council["steps"],
-        expert_sft_scores=council["expert_sft_scores"],
+        adapter_names=council["adapter_names"],
+        medoid_sums=council["medoid"]["sums"],
         selected_expert=council["selected_expert"],
-        tie_breaking=council["tie_breaking"],
-        numerical_anomalies=council["numerical_anomalies"],
+        expert_sft_scores=council["expert_sft_scores"],
+        k_mean=council["diagnostics"]["k"]["mean"],
+        k1_fraction=council["diagnostics"]["k1_fraction"],
+        js_median=council["diagnostics"]["js"]["median"],
+        js_p95=council["diagnostics"]["js"]["p95"],
+        gold_missing_fraction=council["diagnostics"]["gold_missing_fraction"],
+        temperature_schedule=council_config.get("temperature_schedule", "linear"),
+        tau_min=float(council_config["tau_min"]),
+        tau_max=float(council_config["tau_max"]),
     )
     step_logger = None
-    if method == OUTPUT_SPACE_METHOD and config.get("logging", {}).get("reasoning_steps", True):
+    if config.get("logging", {}).get("reasoning_steps", True):
         step_logger = create_reasoning_logger(
             output_dir, distributed.rank, distributed.world_size, run_hash, data_step, bool(resume)
         )
     performance = None
-    if method == OUTPUT_SPACE_METHOD and config.get("logging", {}).get("performance", True):
+    if config.get("logging", {}).get("performance", True):
         performance = TrainingPerformanceLogger(
             output_dir,
             distributed.device,
@@ -394,10 +436,12 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             data_step,
             bool(resume),
         )
+    js_median = cache.js_median
+    js_p95 = cache.js_p95
+    if council_config.get("js_max") == "p95":
+        LOGGER.info("Linear temperature uses reasoning-token JS p95 as JS_max: %.6f", js_p95)
     buffer = zeros_like_parameters(parameters)
-    # Example/step counts and losses; reduction follows fixed K then example mean.
-    # The remaining slots hold method statistics and KD/SFT/tail diagnostics.
-    totals = torch.zeros(18, device=distributed.device, dtype=torch.float64)
+    totals = torch.zeros(len(SUM_KEYS), device=distributed.device, dtype=torch.float64)
     accumulated = 0
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
@@ -406,7 +450,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                 continue
             for sample_index, record in enumerate(records):
                 started = performance.begin_sample() if performance is not None else None
-                result = record_gradient(
+                result = compute_record_gradient(
                     model,
                     adapter_names,
                     parameters,
@@ -414,11 +458,9 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     tokenizer,
                     config,
                     distributed.device,
-                    **(
-                        {"cached_target": cache.get(record.sample_id)}
-                        if method == OUTPUT_SPACE_METHOD
-                        else {}
-                    ),
+                    cached_target=cache.get(record.sample_id),
+                    js_median=js_median,
+                    js_p95=js_p95,
                 )
                 record_seconds = time.perf_counter() - started if started is not None else None
                 if step_logger is not None:
@@ -435,35 +477,14 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                         global_step_before=global_step,
                     )
                 add_gradients_(buffer, result.gradients)
-                totals += totals.new_tensor(
-                    [
-                        1,
-                        result.steps,
-                        result.active_steps,
-                        result.discarded_steps,
-                        result.loss,
-                        result.metrics.get(
-                            "disagreement_sum"
-                            if method == OUTPUT_SPACE_METHOD
-                            else "agreement_sum",
-                            0.0,
-                        ),
-                        result.metrics.get(
-                            "rho_sum" if method == OUTPUT_SPACE_METHOD else "weight_sum", 0.0
-                        ),
-                        result.metrics.get("consensus_sum", 0.0),
-                        result.metrics.get("anchor_loss_sum", 0.0),
-                        result.metrics.get("kd_loss", result.loss),
-                        result.metrics.get("sft_loss", 0.0),
-                        result.metrics.get("weighted_sft_loss", 0.0),
-                        result.metrics.get("student_tail_mass", 0.0),
-                        result.metrics.get("target_tail_mass", 0.0),
-                        result.metrics.get("target_entropy", 0.0),
-                        result.metrics.get("tail_probability_clamps", 0),
-                        result.metrics.get("tail_roundoff_corrections", 0),
-                        result.metrics.get("tail_complement_fallbacks", 0),
-                    ]
-                )
+                sample_values = {
+                    "examples": 1,
+                    "reasoning_steps": result.steps,
+                    "active_steps": result.active_steps,
+                    "total_loss": result.loss,
+                    **{key: result.metrics.get(key, 0.0) for key in SUM_KEYS[4:]},
+                }
+                totals += totals.new_tensor([float(sample_values[key]) for key in SUM_KEYS])
                 if performance is not None:
                     performance.log_sample(
                         record.sample_id,
@@ -483,14 +504,14 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                 continue
             all_reduce_grad_lists([buffer])
             all_reduce_tensor(totals)
-            counts = totals.cpu().tolist()
+            counts = dict(zip(SUM_KEYS, totals.cpu().tolist(), strict=True))
             updated, norm = apply_accumulated_update(
                 parameters,
                 buffer,
                 optimizer,
                 scheduler,
-                int(counts[0]),
-                int(counts[2]),
+                int(counts["examples"]),
+                int(counts["active_steps"]),
                 float(config["stage2"]["max_grad_norm"]),
             )
             data_step += 1
@@ -502,41 +523,10 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     global_step,
                     total_steps,
                     epoch=epoch,
-                    global_examples=int(counts[0]),
+                    global_examples=int(counts["examples"]),
                     skipped_update=not updated,
                 )
-            last_metrics = {
-                "kd_loss": counts[9] / counts[0],
-                "total_loss": counts[4] / counts[0],
-                "examples": int(counts[0]),
-                "reasoning_steps": int(counts[1]),
-                "active_steps": int(counts[2]),
-                "discarded_steps": int(counts[3]),
-                "skipped_update": not updated,
-            }
-            if method == OUTPUT_SPACE_METHOD:
-                last_metrics.update(
-                    sft_loss=counts[10] / counts[0],
-                    weighted_sft_loss=counts[11] / counts[0],
-                    student_tail_mass=counts[12] / counts[0],
-                    target_tail_mass=counts[13] / counts[0],
-                    target_entropy=counts[14] / counts[0],
-                    tail_probability_clamps=int(counts[15]),
-                    tail_roundoff_corrections=int(counts[16]),
-                    tail_complement_fallbacks=int(counts[17]),
-                    js_temperature=float(config["aggregation"]["js_temperature"]),
-                    kd_temperature=float(config["aggregation"]["kd_temperature"]),
-                    disagreement_mean=counts[5] / max(counts[1], 1),
-                    rho_mean=counts[6] / max(counts[1], 1),
-                    js_mean=counts[5] * math.log(len(adapter_names)) / max(counts[1], 1),
-                )
-            else:
-                last_metrics.update(
-                    agreement_mean=counts[5] / max(counts[1], 1),
-                    utility_weight_mean=counts[6] / max(counts[1], 1),
-                    consensus_weight_mean=counts[7] / max(counts[1], 1),
-                    anchor_ce_mean=counts[8] / max(counts[1], 1),
-                )
+            last_metrics = summarize_window(counts, council_config, updated)
             if data_step % int(config["stage2"]["log_every_steps"]) == 0:
                 logger.log(
                     "stage2_step",
@@ -550,18 +540,19 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     **last_metrics,
                 )
                 LOGGER.info(
-                    "Phase 2 batch=%d update=%d loss=%.6f active=%d/%d lr=%.3e%s%s%s",
+                    "Phase 2 batch=%d update=%d loss=%.6f sft=%.4f kl=%.5f mass=%.5f "
+                    "JS=%.4f tau=%.3f k=%.1f k1=%.3f lr=%.3e%s%s",
                     data_step,
                     global_step,
                     last_metrics["total_loss"],
-                    int(counts[2]),
-                    int(counts[1]),
+                    last_metrics["sft_loss"],
+                    last_metrics["kl_loss"],
+                    last_metrics["mass_loss"],
+                    last_metrics["js_mean"],
+                    last_metrics["tau_mean"],
+                    last_metrics["k_mean"],
+                    last_metrics["k1_fraction"],
                     optimizer.param_groups[0]["lr"],
-                    (
-                        f" JS={last_metrics['js_mean']:.6g} nats rho={last_metrics['rho_mean']:.6g}"
-                        if method == OUTPUT_SPACE_METHOD
-                        else ""
-                    ),
                     " (skip)" if not updated else "",
                     (
                         f" wall={performance_summary['update_window_wall_seconds']:.1f}s"
@@ -617,7 +608,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             method=method,
         )
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "artifact": "stage2_checkpoint",
             "method": method,
             "global_step": global_step,
@@ -626,6 +617,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             "training_checkpoint_sha256": file_sha256(checkpoint),
             "student_adapter": "student",
             "initial_expert_adapter": council["selected_expert"],
+            "medoid": council["medoid"],
             "expert_sft_scores": council["expert_sft_scores"],
             "adapter_bundle": str(bundle.relative_to(output_dir)),
             "adapter_bundle_sha256": file_sha256(bundle),

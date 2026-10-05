@@ -1,3 +1,14 @@
+"""Council pass for Phase 2: ``V_k``, ``M(v)``, ``q`` and ``JS`` per reasoning token.
+
+The ``M`` frozen experts are run once per record (``no_grad``). For every
+retained reasoning token the consensus ``p_bar`` is formed over the full
+vocabulary, Kneedle selects ``V_k`` (Section 3 tool, optional ``K_max``), and
+the restricted expert distributions give the Jensen-Shannon disagreement and
+the per-category variance mask. Everything is persisted ragged per sample with
+content hashes; the student initialization is the council medoid (Medoid
+Cloning), saved next to the cache.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -7,12 +18,13 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 from tqdm.auto import tqdm
 
 from ..data.dataset import JsonlRecordDataset
 from ..data.prepare import tokenizer_fingerprint
-from ..models.chunked_head import decoder_and_lm_head, forward_hidden, full_vocab_probe
+from ..models.chunked_head import decoder_and_lm_head, forward_hidden
 from ..models.multi_adapter import (
     create_multi_adapter_model,
     load_adapter_bundle,
@@ -22,40 +34,43 @@ from ..models.multi_adapter import (
 )
 from ..utils.distributed import all_reduce_tensor, barrier, shard_indices
 from ..utils.manifest import file_sha256, fingerprint, read_json, require_file_sha256, write_json
-from .online import _select_adapter
-from .output_space import plan_record
-from .output_space_losses import (
-    local_js_log_distribution,
-    normalized_js_disagreement,
-    power_mean_log_target,
-    reduced_log_distribution,
-    support_from_probes,
+from .council import (
+    council_signals,
+    kneedle_support,
+    restricted_log_softmax,
+    support_mass,
+    validate_temperature_config,
 )
+from .medoid import MedoidResult, select_medoid, validate_medoid_config
+from .online import _select_adapter
+from .student import plan_record
 from .teachers import ensure_stage2_teachers, require_teacher_dataset
 
 LOGGER = logging.getLogger(__name__)
-CACHE_VERSION = 1
-SUPPORT_SEMANTICS = "phase1-local-nontarget-kneedle-union-plus-gold-ascending-unique-v1"
-MASK_SEMANTICS = "complete-retained-REASONING-content-only-token-step-sample-v1"
+CACHE_VERSION = 2
+SUPPORT_SEMANTICS = "kneedle-on-sorted-consensus-pbar-full-vocab-or-kmax-no-gold-exclusion-v1"
+MASK_SEMANTICS = "complete-REASONING-content-tokens-per-step-v1"
+STORAGE = "int32-ragged-support-float32-variance-mask-int32-k-float64-js-q-bool-gold-v1"
 
 
 def validate_council_config(config: dict[str, Any]) -> None:
-    a = config["aggregation"]
-    for key in ("js_temperature", "kd_temperature"):
-        if not math.isfinite(float(a[key])) or float(a[key]) <= 0:
-            raise ValueError(f"aggregation.{key} must be finite and positive")
-    if not math.isfinite(float(a["sft_weight"])) or float(a["sft_weight"]) < 0:
-        raise ValueError("aggregation.sft_weight must be finite and nonnegative")
-    if a["search_k"] != 512 or a["k_min"] != 8:
-        raise ValueError("Phase 2 reuses Phase-1 local Kneedle: search_k=512, k_min=8, no k_max")
-    if a.get("teacher_execution") != "precomputed_support_tail":
-        raise ValueError("Use precomputed_support_tail teacher execution")
-    if any(key in a for key in ("temperature", "medoid_temperature", "k_max")):
-        raise ValueError("Obsolete aggregation configuration")
-    if any(
-        k in config["runtime"] for k in ("teacher_hidden_storage", "teacher_probability_cache_gib")
-    ):
-        raise ValueError("Obsolete online teacher runtime configuration")
+    council = config["council"]
+    k_max = council.get("k_max")
+    if k_max is not None and (isinstance(k_max, bool) or int(k_max) != k_max or int(k_max) < 2):
+        raise ValueError("council.k_max must be null (N' = N) or an integer >= 2")
+    validate_temperature_config(council)
+    for key in ("alpha", "beta"):
+        value = float(council[key])
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"council.{key} must be finite and nonnegative")
+    if not (0.0 < float(council["epsilon_m"]) < 0.5):
+        raise ValueError("council.epsilon_m must lie in (0, 0.5)")
+    mask_epsilon = float(council.get("mask_epsilon", 1.0e-12))
+    if not math.isfinite(mask_epsilon) or mask_epsilon <= 0.0:
+        raise ValueError("council.mask_epsilon must be finite and positive")
+    validate_medoid_config(config["medoid"])
+    if any(key in config for key in ("aggregation", "geometry")):
+        raise ValueError("Obsolete Phase-2 configuration sections: aggregation/geometry")
     if int(config["runtime"]["lm_head_chunk_tokens"]) < 1:
         raise ValueError("lm_head_chunk_tokens must be positive")
     if config["runtime"].get("preprocessing_hidden_storage", "cpu") not in ("cpu", "device"):
@@ -63,18 +78,23 @@ def validate_council_config(config: dict[str, Any]) -> None:
 
 
 def cache_identity(config: dict[str, Any], prepared: dict, teachers: dict) -> dict:
-    """Epoch, optimizer, batch size, sft_weight and resume never affect static q."""
+    """Only quantities that change ``V_k``/``M(v)``/``q``/``JS`` enter the key.
+
+    Temperatures, loss coefficients, optimizer and batch settings are applied
+    at training time and never invalidate the council pass.
+    """
     source = Path(__file__).resolve().parents[1]
     code_files = [
-        "stage1/kneedle.py",
         "models/chunked_head.py",
         "models/multi_adapter.py",
+        "stage2/council.py",
         "stage2/council_cache.py",
-        "stage2/output_space_losses.py",
-        "stage2/output_space.py",
+        "stage2/medoid.py",
+        "stage2/student.py",
         "data/token_spans.py",
         "data/schema.py",
     ]
+    council = config["council"]
     return {
         "cache_version": CACHE_VERSION,
         "code_sha256": {name: file_sha256(source / name) for name in code_files},
@@ -84,28 +104,23 @@ def cache_identity(config: dict[str, Any], prepared: dict, teachers: dict) -> di
         "teacher_bundle_sha256": teachers["adapter_bundle_sha256"],
         "teacher_checkpoint_checksums": teachers.get("hub_file_sha256", {}),
         "backbone": {
-            k: config["model"].get(k)
-            for k in ("name_or_path", "dtype", "attn_implementation")
+            k: config["model"].get(k) for k in ("name_or_path", "dtype", "attn_implementation")
         },
         "tokenizer_fingerprint": prepared["tokenizer_fingerprint"],
-        "search_k": int(config["aggregation"]["search_k"]),
-        "k_min": int(config["aggregation"]["k_min"]),
-        "js_temperature": float(config["aggregation"]["js_temperature"]),
-        "kd_temperature": float(config["aggregation"]["kd_temperature"]),
+        "k_max": None if council.get("k_max") is None else int(council["k_max"]),
+        "mask_epsilon": float(council.get("mask_epsilon", 1.0e-12)),
+        "medoid": {
+            "epsilon_rel": float(config["medoid"]["epsilon_rel"]),
+            "epsilon_abs": float(config["medoid"]["epsilon_abs"]),
+            "tau_b": float(config["medoid"].get("tau_b", 0.0)),
+        },
         "max_length": int(config["stage2"]["max_length"]),
         "lm_head_chunk_tokens": int(config["runtime"]["lm_head_chunk_tokens"]),
         "support_semantics": SUPPORT_SEMANTICS,
         "mask_semantics": MASK_SEMANTICS,
-        "storage": "int32-ragged-support-float32-log-target-float64-js-rho-v1",
+        "storage": STORAGE,
         "torch_version": str(torch.__version__),
     }
-
-
-def select_best_expert(scores: torch.Tensor) -> int:
-    if scores.ndim != 1 or not len(scores) or not bool(torch.isfinite(scores).all()):
-        raise ValueError("Expert SFT scores must be a nonempty finite vector")
-    # torch.argmin selects the first equal minimum: manifest adapter order.
-    return int(scores.argmin())
 
 
 def distribution_summary(values: torch.Tensor) -> dict:
@@ -120,8 +135,8 @@ def distribution_summary(values: torch.Tensor) -> dict:
         "median": float(torch.quantile(values, 0.5)),
         "p90": float(torch.quantile(values, 0.90)),
         "p95": float(torch.quantile(values, 0.95)),
-        "max": float(values.max()),
-        "min": float(values.min()),
+        "max": high,
+        "min": low,
         "histogram": torch.histc(values, bins=20, min=histogram_low, max=histogram_high)
         .long()
         .tolist(),
@@ -133,130 +148,97 @@ def distribution_summary(values: torch.Tensor) -> dict:
 def compile_record(
     model, names, record, config, device
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict]:
-    """One decoder forward/expert/sample; SFT scoring shares the q pass.
+    """One decoder forward per expert, then two bounded head sweeps per chunk.
 
-    The first bounded head sweep reuses full_vocab_probe (gold exclusion) and
-    Phase-1 Kneedle. A second head sweep computes logZ and reduced categories.
-    Reduced teacher values survive only within one step until its rho is known.
-    No full teacher probability vector is constructed or persisted.
+    Sweep 1 accumulates ``p_bar`` (full vocabulary, temperature 1) and runs
+    Kneedle; sweep 2 gathers each expert on ``V_k`` for ``JS``, ``sigma^2`` and
+    ``M(v)``. Expert NLLs are collected as diagnostics only.
     """
-    if len(names) != 3:
-        raise ValueError("Phase 2 requires exactly three frozen experts")
+    if len(names) < 2:
+        raise ValueError("Phase 2 requires at least two frozen experts")
     plan = plan_record(record, None, int(config["stage2"]["max_length"]))
-    positions = [p for step in plan.step_positions for p in step]
+    positions = plan.reasoning_positions
     step_offsets = [0]
     for step in plan.step_positions:
         step_offsets.append(step_offsets[-1] + len(step))
+    count = len(positions)
     tensors = {
         "token_positions": torch.tensor(positions, dtype=torch.int32),
         "step_offsets": torch.tensor(step_offsets, dtype=torch.int64),
-        "support_offsets": torch.zeros(len(positions) + 1, dtype=torch.int64),
+        "support_offsets": torch.zeros(count + 1, dtype=torch.int64),
         "support_ids": torch.empty(0, dtype=torch.int32),
-        "support_log_target": torch.empty(0, dtype=torch.float32),
-        "tail_log_target": torch.empty(len(positions), dtype=torch.float32),
-        "step_js": torch.empty(plan.num_steps, dtype=torch.float64),
-        "step_rho": torch.empty(plan.num_steps, dtype=torch.float64),
-        "raw_k": torch.empty((3, len(positions)), dtype=torch.int16),
-        "selected_k": torch.empty((3, len(positions)), dtype=torch.int16),
-        "union_sizes": torch.empty(len(positions), dtype=torch.int16),
-        "gold_present_before_add": torch.empty(len(positions), dtype=torch.bool),
+        "support_mask": torch.empty(0, dtype=torch.float32),
+        "k": torch.empty(count, dtype=torch.int32),
+        "js": torch.empty(count, dtype=torch.float64),
+        "q": torch.empty(count, dtype=torch.float64),
+        "gold_in_support": torch.empty(count, dtype=torch.bool),
     }
-    scores = torch.zeros(3, dtype=torch.float64)
-    stats: dict[str, Any] = {"discarded_steps": plan.discarded_steps, "teacher_forward_count": 0}
-    if not positions:
+    scores = torch.zeros(len(names), dtype=torch.float64)
+    stats: dict[str, Any] = {"teacher_forward_count": 0}
+    if not count:
         return tensors, scores, stats
     ids = torch.tensor([plan.input_ids], device=device, dtype=torch.long)
     indices = torch.tensor(positions, device=device) - 1
+    store_on_cpu = config["runtime"].get("preprocessing_hidden_storage", "cpu") == "cpu"
     hidden = []
     for name in names:
         _select_adapter(model, name, training=False)
         output = forward_hidden(model, ids, torch.ones_like(ids), use_cache=False)
         selected = output.last_hidden_state[0].index_select(0, indices).detach()
-        hidden.append(
-            selected.cpu()
-            if config["runtime"].get("preprocessing_hidden_storage", "cpu") == "cpu"
-            else selected
-        )
+        hidden.append(selected.cpu() if store_on_cpu else selected)
         del selected, output
     stats["teacher_forward_count"] = len(names)
     _, head = decoder_and_lm_head(model)
     parameter = next(head.parameters())
     chunk = int(config["runtime"]["lm_head_chunk_tokens"])
-    a = config["aggregation"]
-    all_ids, all_logq = [], []
-    cursor = 0
-    for step_index, step in enumerate(plan.step_positions):
-        targets = torch.tensor([record.input_ids[p] for p in step], device=parameter.device)
-        probes = [
-            full_vocab_probe(
-                h[cursor : cursor + len(step)],
-                head,
-                targets,
-                int(a["search_k"]),
-                chunk,
-                output_device=parameter.device,
+    council = config["council"]
+    k_max = council.get("k_max")
+    mask_epsilon = float(council.get("mask_epsilon", 1.0e-12))
+    targets = torch.tensor([record.input_ids[p] for p in positions], device=parameter.device)
+    step_lengths = torch.tensor(
+        [len(step) for step in plan.step_positions for _ in step], device=parameter.device
+    ).double()
+    all_ids, all_masks = [], []
+    for start in range(0, count, chunk):
+        end = min(count, start + chunk)
+        mean_probabilities = None
+        for expert, h in enumerate(hidden):
+            logits = head(h[start:end].to(parameter.device, parameter.dtype)).float()
+            probabilities = F.softmax(logits, dim=-1)
+            mean_probabilities = (
+                probabilities if mean_probabilities is None else mean_probabilities + probabilities
             )
-            for h in hidden
-        ]
-        support, mask, metadata = support_from_probes(
-            torch.stack([p[0] for p in probes]),
-            torch.stack([p[1] for p in probes]),
-            targets,
-            int(a["k_min"]),
-        )
-        del probes
-        step_reduced = []
-        js_sum = 0.0
-        for start in range(0, len(step), chunk):
-            end = min(len(step), start + chunk)
-            local_ids, local_mask = support[start:end], mask[start:end]
-            reduced, js_values = [], []
-            for expert, h in enumerate(hidden):
-                logits = head(
-                    h[cursor + start : cursor + end].to(parameter.device, parameter.dtype)
-                ).float()
-                js_values.append(
-                    local_js_log_distribution(
-                        logits, local_ids, local_mask, float(a["js_temperature"])
-                    )
-                )
-                reduced.append(
-                    reduced_log_distribution(
-                        logits, local_ids, local_mask, float(a["kd_temperature"]), stats
-                    ).double()
-                )
-                nll = torch.logsumexp(logits, -1) - logits.gather(
-                    -1, targets[start:end, None]
-                ).squeeze(-1)
-                scores[expert] += nll.double().sum().cpu() / (len(step) * plan.num_steps)
-                del logits
-            js_sum += float(normalized_js_disagreement(torch.stack(js_values)).sum()) * math.log(3)
-            step_reduced.append(torch.stack(reduced).cpu())
-        js = js_sum / len(step)
-        rho = min(1.0, max(0.0, js / math.log(3)))
-        tensors["step_js"][step_index], tensors["step_rho"][step_index] = js, rho
-        # Ragged persistence: concatenate only valid support categories; tail
-        # remains one FP32 log probability per supervised token.
-        for chunk_index, start in enumerate(range(0, len(step), chunk)):
-            end = min(len(step), start + chunk)
-            q = power_mean_log_target(step_reduced[chunk_index], rho)
-            valid = mask[start:end].cpu()
-            all_ids.append(support[start:end].cpu()[valid].int())
-            all_logq.append(q[:, :-1][valid].float())
-            tensors["tail_log_target"][cursor + start : cursor + end] = q[:, -1].float()
-        tensors["raw_k"][:, cursor : cursor + len(step)] = metadata["raw_k"].cpu().short()
-        tensors["selected_k"][:, cursor : cursor + len(step)] = metadata["selected_k"].cpu().short()
-        tensors["union_sizes"][cursor : cursor + len(step)] = metadata["union_sizes"].cpu().short()
-        tensors["gold_present_before_add"][cursor : cursor + len(step)] = metadata[
-            "gold_present_before_add"
-        ].cpu()
-        sizes = mask.sum(-1).cpu()
-        tensors["support_offsets"][cursor + 1 : cursor + len(step) + 1] = tensors[
-            "support_offsets"
-        ][cursor] + sizes.cumsum(0)
-        cursor += len(step)
+            nll = torch.logsumexp(logits, -1) - logits.gather(-1, targets[start:end, None]).squeeze(
+                -1
+            )
+            scores[expert] += float(
+                (nll.double() / (step_lengths[start:end] * plan.num_steps)).sum()
+            )
+            del logits, probabilities
+        mean_probabilities = mean_probabilities / len(hidden)
+        support_ids, support_mask, k = kneedle_support(mean_probabilities, k_max)
+        q = support_mass(mean_probabilities, support_ids, support_mask)
+        del mean_probabilities
+        expert_log_pi = []
+        for h in hidden:
+            logits = head(h[start:end].to(parameter.device, parameter.dtype)).float()
+            expert_log_pi.append(restricted_log_softmax(logits, support_ids, support_mask))
+            del logits
+        signals = council_signals(torch.stack(expert_log_pi), support_mask, mask_epsilon)
+        del expert_log_pi
+        gold_in = ((support_ids == targets[start:end, None]) & support_mask).any(-1)
+        tensors["k"][start:end] = k.cpu().int()
+        tensors["js"][start:end] = signals.js.cpu()
+        tensors["q"][start:end] = q.cpu()
+        tensors["gold_in_support"][start:end] = gold_in.cpu()
+        valid = support_mask.cpu()
+        all_ids.append(support_ids.cpu()[valid].int())
+        all_masks.append(signals.variance_mask.cpu()[valid].float())
+        tensors["support_offsets"][start + 1 : end + 1] = tensors["support_offsets"][
+            start
+        ] + k.cpu().long().cumsum(0)
     tensors["support_ids"] = torch.cat(all_ids)
-    tensors["support_log_target"] = torch.cat(all_logq)
+    tensors["support_mask"] = torch.cat(all_masks)
     return tensors, scores, stats
 
 
@@ -281,19 +263,27 @@ class CouncilCache:
         )
         if len(self.index) != self.manifest["records"]:
             raise RuntimeError("Council cache record count mismatch")
-        if "best_expert_file" in self.manifest:
-            require_file_sha256(
-                self.directory, self.manifest, "best_expert_file", "best_expert_file_sha256"
-            )
-            best = select_best_expert(
-                torch.tensor(self.manifest["expert_sft_scores"], dtype=torch.float64)
-            )
-            if (
-                self.manifest["selected_expert_index"] != best
-                or self.manifest["selected_expert"] != self.manifest["adapter_names"][best]
-            ):
-                raise RuntimeError("Council cache initialization selection mismatch")
+        require_file_sha256(
+            self.directory, self.manifest, "student_init_file", "student_init_file_sha256"
+        )
+        medoid = self.manifest["medoid"]
+        sums = torch.tensor(medoid["sums"], dtype=torch.float64)
+        best = int(torch.argmin(sums))
+        if (
+            medoid["medoid_index"] != best
+            or self.manifest["selected_expert_index"] != best
+            or self.manifest["selected_expert"] != self.manifest["adapter_names"][best]
+        ):
+            raise RuntimeError("Council cache medoid selection mismatch")
         self.verified: set[str] = set()
+
+    @property
+    def js_median(self) -> float:
+        return float(self.manifest["diagnostics"]["js"]["median"])
+
+    @property
+    def js_p95(self) -> float:
+        return float(self.manifest["diagnostics"]["js"]["p95"])
 
     def get(self, sample_id: str) -> dict[str, torch.Tensor]:
         entry = self.index[sample_id]
@@ -328,6 +318,14 @@ def load_council_cache(config: dict, prepared: dict, teachers: dict) -> CouncilC
     return cache
 
 
+def _medoid_from_bundle(bundle_path: Path, names: list[str], config: dict) -> MedoidResult:
+    bundle = load_adapter_bundle(bundle_path)
+    missing = [name for name in names if name not in bundle]
+    if missing:
+        raise RuntimeError(f"Adapter bundle is missing experts {missing}")
+    return select_medoid({name: bundle[name] for name in names}, config["medoid"])
+
+
 def build_council_cache(config: dict[str, Any], distributed) -> dict:
     validate_council_config(config)
     started = time.perf_counter()
@@ -345,7 +343,7 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
     )
     for key in ("rank", "alpha", "target_modules"):
         if config["lora"][key] != teachers["config"]["lora"][key]:
-            raise ValueError(f"Best-expert cloning requires matching LoRA {key}")
+            raise ValueError(f"Medoid cloning requires matching LoRA {key}")
     identity = cache_identity(config, prepared, teachers)
     cache_key = fingerprint(identity)
     root = Path(config["paths"]["teacher_cache_dir"]) / cache_key
@@ -354,7 +352,7 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
         cache.verify_all()
         LOGGER.info("Council cache hit fingerprint=%s; no teacher model loaded", cache_key)
         return cache.manifest
-    LOGGER.info("Council cache miss fingerprint=%s; preprocessing three frozen experts", cache_key)
+    LOGGER.info("Council cache miss fingerprint=%s; running the frozen council", cache_key)
     root.mkdir(parents=True, exist_ok=True)
     tokenizer = load_tokenizer(config["model"])
     token_fingerprint = tokenizer_fingerprint(tokenizer)
@@ -364,8 +362,8 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
     ):
         raise RuntimeError("Council tokenizer mismatch with prepared data/teachers")
     names = list(teachers["adapter_names"])
-    if len(names) != 3 or len(set(names)) != 3:
-        raise ValueError("Phase 2 requires three distinct experts")
+    if len(names) < 2 or len(set(names)) != len(names):
+        raise ValueError("Phase 2 requires at least two distinct experts")
     dataset = JsonlRecordDataset(data_path)
     if not len(dataset) or len(dataset) != int(prepared["records"]):
         raise RuntimeError("Prepared dataset record count mismatch")
@@ -384,13 +382,13 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
     for name in names:
         load_adapter_state(model, name, bundle[name])
     del bundle
-    sums = torch.zeros(3, device=distributed.device, dtype=torch.float64)
+    sums = torch.zeros(len(names), device=distributed.device, dtype=torch.float64)
     counts = torch.zeros(4, device=distributed.device, dtype=torch.int64)
     index = {}
     rank_stats = {}
     for i in tqdm(
         shard_indices(len(dataset), distributed.rank, distributed.world_size),
-        desc=f"Council preprocessing rank {distributed.rank}",
+        desc=f"Council pass rank {distributed.rank}",
     ):
         record = dataset[i]
         if record.sample_id in index:
@@ -406,14 +404,9 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
         temporary.replace(root / filename)
         index[record.sample_id] = {"file": filename, "sha256": file_sha256(root / filename)}
         sums += scores.to(distributed.device)
-        counts += counts.new_tensor(
-            [
-                1,
-                len(value["token_positions"]),
-                len(value["step_js"]),
-                int(len(value["step_js"]) == 0),
-            ]
-        )
+        tokens = len(value["token_positions"])
+        steps = len(value["step_offsets"]) - 1
+        counts += counts.new_tensor([1, tokens, steps, int(tokens == 0)])
         for key, number in stats.items():
             rank_stats[key] = rank_stats.get(key, 0) + number
     write_json(root / f"index-rank{distributed.rank}.json", index)
@@ -422,62 +415,41 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
     all_reduce_tensor(counts)
     barrier()
     if distributed.is_main:
-        combined, anomalies = {}, {}
+        combined, statistics = {}, {}
         for rank in range(distributed.world_size):
             rank_index = read_json(root / f"index-rank{rank}.json")
             if set(combined) & set(rank_index):
                 raise RuntimeError("Duplicate council samples across ranks")
             combined.update(rank_index)
             for key, number in read_json(root / f"stats-rank{rank}.json").items():
-                anomalies[key] = anomalies.get(key, 0) + number
+                statistics[key] = statistics.get(key, 0) + number
         if len(combined) != len(dataset) or not int(counts[1]):
             raise RuntimeError("Council cache incomplete or no reasoning tokens")
         write_json(root / "index.json", combined)
         summaries: dict[str, list[torch.Tensor]] = {
-            key: []
-            for key in (
-                "support_size",
-                "union_size",
-                "js",
-                "rho",
-                "target_tail_mass",
-                "raw_k",
-                "selected_k",
-                "gold_present",
-            )
+            key: [] for key in ("k", "js", "q", "tail_mass", "variance_mask", "gold_in_support")
         }
         for entry in combined.values():
             v = load_file(str(root / entry["file"]))
-            for key, tensor in {
-                "support_size": v["support_offsets"].diff(),
-                "union_size": v["union_sizes"],
-                "js": v["step_js"],
-                "rho": v["step_rho"],
-                "target_tail_mass": v["tail_log_target"].exp(),
-                "raw_k": v["raw_k"],
-                "selected_k": v["selected_k"],
-                "gold_present": v["gold_present_before_add"],
-            }.items():
-                summaries[key].append(tensor)
+            summaries["k"].append(v["k"])
+            summaries["js"].append(v["js"])
+            summaries["q"].append(v["q"])
+            summaries["tail_mass"].append(1.0 - v["q"])
+            summaries["variance_mask"].append(v["support_mask"])
+            summaries["gold_in_support"].append(v["gold_in_support"])
         diagnostics = {
-            key: distribution_summary(
-                torch.cat(values, dim=1 if key in ("raw_k", "selected_k") else 0)
-            )
-            for key, values in summaries.items()
-            if key not in ("raw_k", "selected_k")
+            key: distribution_summary(torch.cat(values)) for key, values in summaries.items()
         }
-        for key in ("raw_k", "selected_k"):
-            per_expert = torch.cat(summaries[key], 1)
-            diagnostics[key + "_histogram_by_expert"] = [
-                torch.bincount(row.long(), minlength=513).tolist() for row in per_expert
-            ]
-        scores = sums / len(dataset)
-        best = select_best_expert(scores)
-        best_path = root / "best_expert.pt"
-        # Persist only the winning adapter, so output-space training loads no council weights.
-        best_temporary = best_path.with_suffix(".pt.tmp")
-        torch.save(load_adapter_bundle(bundle_path)[names[best]], best_temporary)
-        best_temporary.replace(best_path)
+        all_k = torch.cat(summaries["k"]).long()
+        diagnostics["k1_fraction"] = float((all_k == 1).double().mean())
+        diagnostics["gold_missing_fraction"] = 1.0 - float(
+            torch.cat(summaries["gold_in_support"]).double().mean()
+        )
+        medoid = _medoid_from_bundle(bundle_path, names, config)
+        init_path = root / "student_init.pt"
+        init_temporary = init_path.with_suffix(".pt.tmp")
+        torch.save(load_adapter_bundle(bundle_path)[medoid.medoid_name], init_temporary)
+        init_temporary.replace(init_path)
         disk_bytes = sum((root / entry["file"]).stat().st_size for entry in combined.values())
         manifest = {
             "artifact": "stage2_council_cache",
@@ -489,36 +461,38 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
             "steps": int(counts[2]),
             "empty_samples": int(counts[3]),
             "adapter_names": names,
-            "expert_sft_scores": scores.cpu().tolist(),
-            "selected_expert_index": best,
-            "selected_expert": names[best],
-            "tie_breaking": "first minimum in adapter_names order",
-            "initialization_scoring": MASK_SEMANTICS + "-temperature1",
+            "expert_sft_scores": (sums / len(dataset)).cpu().tolist(),
+            "medoid": medoid.to_json(),
+            "selected_expert_index": medoid.medoid_index,
+            "selected_expert": medoid.medoid_name,
+            "initialization": "medoid_cloning_projection_distance",
+            "tie_breaking": "first minimum D_m in adapter_names order",
             "index_file": "index.json",
             "index_file_sha256": file_sha256(root / "index.json"),
-            "best_expert_file": best_path.name,
-            "best_expert_file_sha256": file_sha256(best_path),
+            "student_init_file": init_path.name,
+            "student_init_file_sha256": file_sha256(init_path),
             "prepared_manifest_fingerprint": fingerprint(prepared),
             "stage1_manifest_fingerprint": fingerprint(teachers),
             "stage1_prepared_manifest_fingerprint": teachers["prepared_manifest_fingerprint"],
             "stage1_training_dataset_identity_verified": teachers["prepared_manifest_fingerprint"]
             == fingerprint(prepared),
             "diagnostics": diagnostics,
-            "numerical_anomalies": anomalies,
+            "statistics": statistics,
             "preprocessing_wall_seconds": time.perf_counter() - started,
             "disk_bytes": disk_bytes,
-            "initialization_disk_bytes": best_path.stat().st_size,
+            "initialization_disk_bytes": init_path.stat().st_size,
             "cache_directory": str(root.resolve()),
             "cache_status_at_creation": "miss",
         }
         write_json(root / "manifest.json", manifest)
         LOGGER.info(
-            "Council cache built: expert_sft=%s selected=%s anomalies=%s wall=%.1fs bytes=%d",
-            manifest["expert_sft_scores"],
-            names[best],
-            anomalies,
+            "Council cache built: medoid=%s D_m=%s k_mean=%.2f k1=%.3f js_median=%.4f wall=%.1fs",
+            medoid.medoid_name,
+            [round(x, 4) for x in medoid.sums.tolist()],
+            diagnostics["k"]["mean"],
+            diagnostics["k1_fraction"],
+            diagnostics["js"]["median"],
             manifest["preprocessing_wall_seconds"],
-            disk_bytes,
         )
     barrier()
     return read_json(root / "manifest.json")

@@ -44,7 +44,7 @@ class TrainingPerformanceLogger:
         self.common = {"run_fingerprint": run_fingerprint, "rank": rank}
         self.started = time.perf_counter()
         self.update_started: float | None = None
-        self.local_examples = self.prefix_tokens = self.reasoning_tokens = 0
+        self.local_examples = self.sequence_tokens = self.reasoning_tokens = 0
         self.update_peak_allocated = self.update_peak_reserved = 0
         self.session_peak_allocated = self.session_peak_reserved = 0
         self.completed_windows = self.timed_windows = 0
@@ -110,10 +110,10 @@ class TrainingPerformanceLogger:
         **cursor: Any,
     ) -> None:
         memory = self._memory()
-        prefix = int(result.metrics["prefix_tokens"])
+        sequence = int(result.metrics["sequence_tokens"])
         reasoning = int(result.metrics["reasoning_tokens"])
         self.local_examples += 1
-        self.prefix_tokens += prefix
+        self.sequence_tokens += sequence
         self.reasoning_tokens += reasoning
         self.logger.log(
             "stage2_sample_performance",
@@ -121,14 +121,11 @@ class TrainingPerformanceLogger:
             **cursor,
             sample_id=sample_id,
             record_gradient_wall_seconds=record_gradient_wall_seconds,
-            prefix_tokens=prefix,
+            sequence_tokens=sequence,
             reasoning_tokens=reasoning,
+            supervised_tokens=int(result.metrics["supervised_tokens"]),
             retained_steps=result.steps,
-            discarded_steps=result.discarded_steps,
             head_chunks=int(result.metrics["head_chunks"]),
-            cached_steps=int(result.metrics["cached_steps"]),
-            recomputed_steps=int(result.metrics["recomputed_steps"]),
-            teacher_head_chunk_sweeps=int(result.metrics["teacher_head_chunk_sweeps"]),
             **memory,
         )
 
@@ -157,9 +154,11 @@ class TrainingPerformanceLogger:
             "update_window_wall_seconds": elapsed,
             "session_elapsed_wall_seconds": now - self.started,
             "local_examples": self.local_examples,
-            "local_prefix_tokens": self.prefix_tokens,
+            "local_sequence_tokens": self.sequence_tokens,
             "local_reasoning_tokens": self.reasoning_tokens,
-            "local_prefix_tokens_per_second": self.prefix_tokens / elapsed if elapsed > 0 else None,
+            "local_sequence_tokens_per_second": self.sequence_tokens / elapsed
+            if elapsed > 0
+            else None,
             "local_examples_per_second": self.local_examples / elapsed if elapsed > 0 else None,
             "timing_warmup": warmup,
             "mean_update_wall_seconds_after_warmup": mean,
@@ -182,7 +181,7 @@ class TrainingPerformanceLogger:
             **summary,
         )
         self.update_started = None
-        self.local_examples = self.prefix_tokens = self.reasoning_tokens = 0
+        self.local_examples = self.sequence_tokens = self.reasoning_tokens = 0
         self.update_peak_allocated = self.update_peak_reserved = 0
         # Keep the next window independent of the previous sample/optimizer peak.
         if self.device.type == "cuda":

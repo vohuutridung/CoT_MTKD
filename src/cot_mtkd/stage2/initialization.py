@@ -11,12 +11,12 @@ from ..utils.manifest import require_file_sha256
 
 
 def create_cached_student(config, distributed, cache):
-    """Copy the complete best-expert LoRA; no teacher adapters are instantiated."""
+    """Medoid Cloning: copy the medoid expert LoRA verbatim as the student."""
     model = create_student_model(
         config["model"], config["lora"], distributed.device, int(config["seed"])
     )
     path = require_file_sha256(
-        cache.directory, cache.manifest, "best_expert_file", "best_expert_file_sha256"
+        cache.directory, cache.manifest, "student_init_file", "student_init_file_sha256"
     )
     load_adapter_state(model, "student", torch.load(path, weights_only=True, map_location="cpu"))
     if int(config["stage2"]["max_length"]) > int(model.config.max_position_embeddings):

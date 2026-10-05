@@ -17,9 +17,8 @@ def sample_result():
         steps=2,
         discarded_steps=1,
         metrics={
-            "prefix_tokens": 10, "reasoning_tokens": 5,
-            "head_chunks": 3, "cached_steps": 1, "recomputed_steps": 1,
-            "teacher_head_chunk_sweeps": 5,
+            "sequence_tokens": 10, "reasoning_tokens": 5,
+            "supervised_tokens": 7, "head_chunks": 3,
         },
     )
 
@@ -65,11 +64,11 @@ class Stage2PerformanceTest(unittest.TestCase):
         self.assertEqual(session["config_fingerprint"], "config")
         self.assertEqual(sample["sample_id"], "sample")
         self.assertEqual(sample["record_gradient_wall_seconds"], 2.5)
-        self.assertEqual(sample["cached_steps"], 1)
-        self.assertEqual(sample["recomputed_steps"], 1)
+        self.assertEqual(sample["sequence_tokens"], 10)
+        self.assertEqual(sample["supervised_tokens"], 7)
         self.assertEqual(summary["update_window_wall_seconds"], 4)
         self.assertEqual(summary["session_elapsed_wall_seconds"], 14)
-        self.assertEqual(summary["local_prefix_tokens_per_second"], 2.5)
+        self.assertEqual(summary["local_sequence_tokens_per_second"], 2.5)
         self.assertIsNone(summary["peak_allocated_gib"])
         self.assertIsNone(summary["eta_remaining_wall_seconds_estimate"])
         self.assertEqual(update["data_step_before"], 0)
