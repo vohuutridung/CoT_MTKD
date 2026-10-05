@@ -15,6 +15,7 @@ from test_stage2_online import LORA, tiny_online_council, two_step_record
 
 from cot_mtkd.data.schema import TokenRegion
 from cot_mtkd.models.multi_adapter import extract_adapter_state, set_active_adapter
+from cot_mtkd.stage2 import council_cache as council_cache_module
 from cot_mtkd.stage2.council import (
     council_signals,
     dynamic_temperature,
@@ -272,6 +273,15 @@ class CouncilToolTest(unittest.TestCase):
         )
         self.assertEqual(float(single["kl"][0]), 0.0)
         self.assertEqual(float(single["entropy"][0]), 0.0)
+
+    def test_distribution_summary_quantiles_match_when_torch_quantile_refuses(self):
+        values = torch.linspace(-1, 3, 41, dtype=torch.float64)
+        direct = council_cache_module.distribution_summary(values)
+        self.assertAlmostEqual(direct["p95"], float(torch.quantile(values, 0.95)))
+        with patch.object(council_cache_module, "_TORCH_QUANTILE_LIMIT", 4):
+            forced = council_cache_module.distribution_summary(values)
+        for key in ("median", "p90", "p95", "mean", "min", "max"):
+            self.assertAlmostEqual(forced[key], direct[key])
 
 
 class MedoidTest(unittest.TestCase):

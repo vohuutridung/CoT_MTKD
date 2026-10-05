@@ -48,6 +48,8 @@ from .teachers import ensure_stage2_teachers, require_teacher_dataset
 
 LOGGER = logging.getLogger(__name__)
 CACHE_VERSION = 2
+# torch.quantile rejects inputs larger than 2^24 elements.
+_TORCH_QUANTILE_LIMIT = 1 << 24
 SUPPORT_SEMANTICS = "kneedle-on-sorted-consensus-pbar-full-vocab-or-kmax-no-gold-exclusion-v1"
 MASK_SEMANTICS = "complete-REASONING-content-tokens-per-step-v1"
 STORAGE = "int32-ragged-support-float32-variance-mask-int32-k-float64-js-q-bool-gold-v1"
@@ -123,18 +125,38 @@ def cache_identity(config: dict[str, Any], prepared: dict, teachers: dict) -> di
     }
 
 
+def _linear_quantile(ordered: torch.Tensor, q: float) -> float:
+    """Linear interpolation on an ascending 1-D tensor, matching ``torch.quantile``."""
+    count = ordered.numel()
+    if count == 1:
+        return float(ordered[0])
+    position = q * (count - 1)
+    lower = math.floor(position)
+    upper = min(lower + 1, count - 1)
+    if lower == upper:
+        return float(ordered[lower])
+    weight = position - lower
+    return float(ordered[lower] * (1.0 - weight) + ordered[upper] * weight)
+
+
 def distribution_summary(values: torch.Tensor) -> dict:
-    values = values.double().flatten()
+    values = values.detach().double().flatten()
     if not len(values):
         return {"count": 0}
     low, high = float(values.min()), float(values.max())
     histogram_low, histogram_high = (low - 0.5, high + 0.5) if low == high else (low, high)
+    if len(values) <= _TORCH_QUANTILE_LIMIT:
+        median, p90, p95 = (float(torch.quantile(values, q)) for q in (0.5, 0.90, 0.95))
+    else:
+        # The council pass can exceed 2^24 reasoning tokens. Sort once; torch.quantile cannot.
+        ordered = torch.sort(values).values
+        median, p90, p95 = (_linear_quantile(ordered, q) for q in (0.5, 0.90, 0.95))
     return {
         "count": len(values),
         "mean": float(values.mean()),
-        "median": float(torch.quantile(values, 0.5)),
-        "p90": float(torch.quantile(values, 0.90)),
-        "p95": float(torch.quantile(values, 0.95)),
+        "median": median,
+        "p90": p90,
+        "p95": p95,
         "max": high,
         "min": low,
         "histogram": torch.histc(values, bins=20, min=histogram_low, max=histogram_high)
