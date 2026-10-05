@@ -11,7 +11,6 @@ dataset:
   keep_all_grades: true
 model:
   name_or_path: Qwen/Qwen2.5-7B-Instruct
-  revision: a09a35458c702b33eeacc393d103063234e8bc28
 tokenization:
   max_length: 32768
   padding_side: right

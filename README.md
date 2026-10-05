@@ -117,6 +117,32 @@ task/mixed norms, raw/capped/weighted repulsion norms and cap factors. The metho
 identifier and config fingerprint reject checkpoints from older formulations;
 changing the forward mode alone remains resume-compatible.
 
+### Change the backbone quickly
+
+Example: Phase 1 with [DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B),
+after setup on one GPU. To switch again, change only `MODEL` and `RUN`.
+
+```bash
+MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+RUN="deepseek_r1_qwen_1_5b"
+
+.venv/bin/python -m cot_mtkd.cli.prepare_data \
+  --config configs/data/s1k_1_1.yaml \
+  --set "model.name_or_path=$MODEL" \
+  --set "output_dir=artifacts/prepared/$RUN"
+
+.venv/bin/python -m cot_mtkd.cli.train_stage1 \
+  --config configs/stage1/qwen25_7b_m3.yaml \
+  --set "model.name_or_path=$MODEL" \
+  --set "paths.prepared=artifacts/prepared/$RUN" \
+  --set "paths.output=artifacts/stage1/$RUN"
+```
+
+`prepare_data` retokenizes the same 996 CoT samples; `train_stage1` trains three
+experts. These commands keep the repo's current training format; DeepSeek's
+[native chat format](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B/blob/main/tokenizer_config.json)
+differs. Phase 2/evaluation must use the same model overrides and new experts/cache.
+
 ### Phase 2 with the existing Hugging Face experts
 
 After the same setup, use this sequence if you want the existing `duyentl04/abc`

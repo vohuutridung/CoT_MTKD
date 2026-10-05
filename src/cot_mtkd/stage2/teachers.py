@@ -56,9 +56,6 @@ def _validate_adapter(config: dict[str, Any], source_config: dict[str, Any]) -> 
     )
     if any(config.get(key) for key in unsupported):
         raise ValueError("Hub adapter uses LoRA features unsupported by the Phase-2 council")
-    revision = config.get("revision")
-    if revision is not None and revision != source_config["model"].get("revision"):
-        raise RuntimeError("Hub adapter base-model revision mismatch")
 
 
 def canonical_adapter_state(path: Path, lora: dict[str, Any]) -> dict[str, torch.Tensor]:

@@ -85,7 +85,7 @@ def cache_identity(config: dict[str, Any], prepared: dict, teachers: dict) -> di
         "teacher_checkpoint_checksums": teachers.get("hub_file_sha256", {}),
         "backbone": {
             k: config["model"].get(k)
-            for k in ("name_or_path", "revision", "dtype", "attn_implementation")
+            for k in ("name_or_path", "dtype", "attn_implementation")
         },
         "tokenizer_fingerprint": prepared["tokenizer_fingerprint"],
         "search_k": int(config["aggregation"]["search_k"]),

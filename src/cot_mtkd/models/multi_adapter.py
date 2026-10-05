@@ -15,7 +15,7 @@ LOGGER = logging.getLogger(__name__)
 def require_same_model_source(
     actual: dict[str, Any], expected: dict[str, Any], context: str
 ) -> None:
-    keys = ("name_or_path", "revision")
+    keys = ("name_or_path",)
     actual_source = {key: actual.get(key) for key in keys}
     expected_source = {key: expected.get(key) for key in keys}
     if actual_source != expected_source:
@@ -44,7 +44,6 @@ def load_tokenizer(model_config: dict[str, Any]):
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_config["name_or_path"],
-        revision=model_config.get("revision"),
         use_fast=True,
         trust_remote_code=False,
     )
@@ -60,7 +59,6 @@ def load_base_causal_lm(model_config: dict[str, Any], device: torch.device):
     from transformers import AutoModelForCausalLM
 
     kwargs: dict[str, Any] = {
-        "revision": model_config.get("revision"),
         "torch_dtype": torch_dtype(model_config.get("dtype", "bfloat16")),
         "trust_remote_code": False,
         "low_cpu_mem_usage": True,

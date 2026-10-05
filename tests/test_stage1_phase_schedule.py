@@ -103,7 +103,6 @@ class Stage1PhaseScheduleTest(unittest.TestCase):
                 "seed": 42,
                 "model": {
                     "name_or_path": "tiny",
-                    "revision": "test",
                     "dtype": "float32",
                 },
                 "lora": {

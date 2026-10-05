@@ -49,7 +49,7 @@ class HubTeachersTest(unittest.TestCase):
     def tearDownClass(cls):
         torch.set_num_threads(cls.threads)
 
-    def fixture(self, root):
+    def fixture(self, root, *, legacy_backbone_revision=None):
         snapshot = root / "hub"
         self.model.save_pretrained(
             snapshot,
@@ -58,10 +58,12 @@ class HubTeachersTest(unittest.TestCase):
             save_embedding_layers=False,
         )
         source_config = {
-            "model": {"name_or_path": "fixture/model", "revision": "base-fixed"},
+            "model": {"name_or_path": "fixture/model"},
             "lora": LORA,
             "seed": 42,
         }
+        if legacy_backbone_revision is not None:
+            source_config["model"]["revision"] = legacy_backbone_revision
         write_config_snapshot(snapshot / "config.yaml", source_config)
         original = {
             "artifact": "stage1_checkpoint",
@@ -125,6 +127,26 @@ class HubTeachersTest(unittest.TestCase):
                 "cot_mtkd.stage2.teachers.snapshot_download", side_effect=AssertionError("network")
             ):
                 self.assertEqual(ensure_stage2_teachers(config), manifest)
+
+    def test_legacy_backbone_and_adapter_pins_do_not_block_hub_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, config, _ = self.fixture(
+                Path(directory), legacy_backbone_revision="historical-backbone-pin"
+            )
+            config["model"].pop("revision")
+            for name in self.names:
+                path = snapshot / name / "adapter_config.json"
+                adapter = read_json(path)
+                adapter["revision"] = "another-historical-pin"
+                write_json(path, adapter)
+            with patch(
+                "cot_mtkd.stage2.teachers.snapshot_download", return_value=str(snapshot)
+            ) as download:
+                manifest = ensure_stage2_teachers(config)
+                config["model"]["revision"] = "ignored-legacy-setting"
+                self.assertEqual(ensure_stage2_teachers(config), manifest)
+                download.assert_called_once()
+            self.assertEqual(manifest["adapter_names"], self.names)
 
     def test_corrupted_or_changed_cached_sources_are_rejected(self):
         for change in ("weight", "bundle", "source", "revision", "configured_checksum"):
@@ -264,7 +286,7 @@ class HubTeachersTest(unittest.TestCase):
                 if change == "checksum":
                     config["teacher_source"]["weight_sha256"]["expert_0"] = "0" * 64
                 elif change == "base":
-                    config["model"]["revision"] = "different-base"
+                    config["model"]["name_or_path"] = "different-base"
                 elif change == "alpha":
                     config["lora"]["alpha"] = 9
                 else:
@@ -295,7 +317,7 @@ class HubTeachersTest(unittest.TestCase):
         stage1 = {
             "artifact": "stage1_hub_import",
             "prepared_manifest_fingerprint": "old",
-            "config": {"model": {"name_or_path": "fixture/model", "revision": "fixed"}},
+            "config": {"model": {"name_or_path": "fixture/model"}},
             "tokenizer_fingerprint": "tokenizer",
         }
         prepared = {"config": stage1["config"], "tokenizer_fingerprint": "tokenizer"}

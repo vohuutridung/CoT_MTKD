@@ -132,7 +132,7 @@ class CouncilCacheTest(unittest.TestCase):
 
     def test_identity_invalidates_static_changes_but_never_epoch_or_sft_weight(self):
         config = output_config()
-        config["model"] = {"name_or_path": "fixture", "revision": "a", "dtype": "float32"}
+        config["model"] = {"name_or_path": "fixture", "dtype": "float32"}
         prepared = {"data_file_sha256": "data", "tokenizer_fingerprint": "tokenizer"}
         teachers = {"adapter_bundle_sha256": "weights"}
         original = fingerprint(cache_identity(config, prepared, teachers))
@@ -148,11 +148,15 @@ class CouncilCacheTest(unittest.TestCase):
         changed = copy.deepcopy(config)
         changed["aggregation"]["sft_weight"] = 0.5
         self.assertEqual(original, fingerprint(cache_identity(changed, prepared, teachers)))
+        for revision in (None, "legacy-pin", "different-legacy-pin"):
+            changed = copy.deepcopy(config)
+            changed["model"]["revision"] = revision
+            self.assertEqual(original, fingerprint(cache_identity(changed, prepared, teachers)))
         for section, field, value in (
             ("aggregation", "js_temperature", 2.0),
             ("aggregation", "kd_temperature", 1.0),
             ("stage2", "max_length", 32),
-            ("model", "revision", "b"),
+            ("model", "name_or_path", "different-model"),
         ):
             changed = copy.deepcopy(config)
             changed[section][field] = value

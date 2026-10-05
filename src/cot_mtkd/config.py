@@ -24,6 +24,10 @@ def load_config(path: str | Path, overrides: Iterable[str] = ()) -> dict[str, An
     config = copy.deepcopy(loaded)
     for override in overrides:
         apply_override(config, override)
+    # Backbone loading follows the model ID's default Hub branch.
+    # Discard old pins before snapshotting or fingerprinting the config.
+    if isinstance(config.get("model"), dict):
+        config["model"].pop("revision", None)
     config["_config_path"] = str(config_path)
     config["_project_root"] = str(project_root())
     _resolve_path_fields(config)

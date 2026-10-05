@@ -320,7 +320,6 @@ class Stage2UpdateTest(unittest.TestCase):
             decoy_hash = file_sha256(decoy_path)
             model_config = {
                 "name_or_path": "fixture/model",
-                "revision": "immutable-test-revision",
                 "dtype": "float32",
                 "gradient_checkpointing": True,
             }
