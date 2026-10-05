@@ -13,6 +13,15 @@ from cot_mtkd.models.chunked_head import forward_hidden
 from cot_mtkd.models.multi_adapter import (
     adapter_parameter_groups,
     create_multi_adapter_model,
+    set_all_adapters_trainable,
+)
+from cot_mtkd.stage1.gac_gradient import stable_gac_gradients
+from cot_mtkd.stage1.rbf import (
+    BandwidthEMA,
+    effective_update_distances,
+    interaction_bandwidths,
+    rbf_kernel,
+    repulsion_updates,
 )
 from cot_mtkd.stage1.trainer import (
     _planned_window_counts,
@@ -136,7 +145,13 @@ class Stage1OnePassTest(unittest.TestCase):
         }
         with patch("cot_mtkd.models.multi_adapter.load_base_causal_lm", return_value=base):
             model, names = create_multi_adapter_model({}, lora, 3, torch.device("cpu"))
-        parameters = [list(group.values()) for group in adapter_parameter_groups(model, names)]
+        groups = adapter_parameter_groups(model, names)
+        parameters = [list(group.values()) for group in groups]
+        with torch.no_grad():
+            for current in groups:
+                for key, value in current.items():
+                    if "lora_B" in key:
+                        value.normal_(std=0.02)
         ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]])
         batch = {
             "input_ids": ids,
@@ -256,6 +271,36 @@ class Stage1OnePassTest(unittest.TestCase):
             old_results[0][0], old_results[0][1], fallback_combined[0], strict=True
         ):
             self.assertTrue(torch.allclose(actual, sft + scale * dpp, atol=2.0e-5, rtol=1.0e-4))
+        # Compare the full new pseudo-gradient, including nonzero RBF repulsion.
+        tokens = old_results[0][3]
+        full_scale = 0.1 * tokens / old_probe.dpp_sample_count
+        _, full_one_pass = one_pass_expert_gradients(
+            model, names, parameters, batch, 0, 0, 42, config, device,
+            combined_dpp_scale=full_scale,
+        )
+        full_two_pass = [
+            replay_expert_gradients(
+                model, name, expert, current, batch, old_probe, 0, 0, 42, 4, device,
+                combined_dpp_scale=full_scale,
+            )
+            for expert, (name, current) in enumerate(zip(names, parameters, strict=True))
+        ]
+        set_all_adapters_trainable(model, names)
+        distances = effective_update_distances(groups, 1.0)
+        h_base = BandwidthEMA().update(distances)
+        h_gac, h_rbf = interaction_bandwidths(h_base)
+        repulsion, _, _ = repulsion_updates(groups, 1.0, h_rbf, distances=distances)
+        self.assertTrue(any(value.abs().max() > 0 for current in repulsion for value in current))
+        kg = rbf_kernel(distances.detach(), h_gac)
+        finals = []
+        for results in (full_one_pass, full_two_pass):
+            tasks = [[value / tokens for value in result[0]] for result in results]
+            final, _ = stable_gac_gradients(tasks, repulsion, kg, beta=0.5, rbf_weight=0.5)
+            finals.append(final)
+        for left, right in zip(finals[0], finals[1], strict=True):
+            for one, two in zip(left, right, strict=True):
+                torch.testing.assert_close(one, two, atol=2e-5, rtol=1e-4)
+
         keep = [index for index in range(ids.shape[1]) if index not in (5, 6)]
         short_batch = {key: value[:, keep] for key, value in batch.items()}
         short_probe = probe_stage1_dpp(model, names, short_batch, 0, 1, 42, config, device)
@@ -277,7 +322,7 @@ class Stage1OnePassTest(unittest.TestCase):
         ]
         total_tokens = old_results[0][3] + short_separate[0][3]
         total_dpp_samples = old_probe.dpp_sample_count + short_probe.dpp_sample_count
-        dpp_weight = 0.2
+        dpp_weight = 0.1
         window_scale = dpp_weight * total_tokens / total_dpp_samples
         _, long_combined = one_pass_expert_gradients(
             model,

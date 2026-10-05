@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -15,9 +16,10 @@ from cot_mtkd.data.schema import PreparedRecord
 from cot_mtkd.models.chunked_head import full_vocab_probe
 from cot_mtkd.stage1.rbf import effective_update_distances
 from cot_mtkd.stage1.trainer import (
+    _save_training_checkpoint,
     one_pass_expert_gradients,
     replay_expert_gradients,
-    compose_objective_gradients,
+    stable_gac_gradients,
     train_stage1,
 )
 from cot_mtkd.utils.distributed import DistributedContext
@@ -57,20 +59,21 @@ def prepared_record(index: int) -> PreparedRecord:
 
 
 class Stage1PhaseScheduleTest(unittest.TestCase):
-    def test_every_update_is_full_in_both_forward_modes(self) -> None:
+    def test_sft_only_then_hard_switch_in_both_forward_modes(self) -> None:
         for mode in ("one_pass", "two_pass"):
             with self.subTest(mode=mode):
-                self._assert_full_training(mode)
+                self._assert_gac_training(mode)
 
-    def test_single_update_starts_with_full_interaction(self) -> None:
-        self._assert_full_training("one_pass", record_count=2)
+    def test_single_update_stays_in_sft_warmup(self) -> None:
+        self._assert_gac_training("one_pass", record_count=2)
 
-    def test_full_interaction_handles_windows_without_reasoning(self) -> None:
-        self._assert_full_training("one_pass", record_count=2, no_reasoning=True)
+    def test_gac_handles_windows_without_reasoning(self) -> None:
+        self._assert_gac_training("one_pass", no_reasoning=True)
 
-    def _assert_full_training(
-        self, mode: str, record_count: int = 12, no_reasoning: bool = False
-    ) -> None:
+    def _assert_gac_training(
+        self, mode: str, record_count: int = 12, no_reasoning: bool = False,
+        resume_after: int | None = None,
+    ) -> dict:
         torch.manual_seed(41)
         base = Qwen2ForCausalLM(
             Qwen2Config(
@@ -125,11 +128,14 @@ class Stage1PhaseScheduleTest(unittest.TestCase):
                     "micro_batch_size": 1,
                     "global_batch_size": 2,
                     "gradient_accumulation_steps": None,
-                    "dpp_weight": 0.2,
-                    "rbf_weight": 0.01,
-                    "interaction_mode": "full",
+                    "dpp_weight": 0.1,
+                    "gac_beta": 0.5,
+                    "gac_bandwidth_scale": 0.5,
+                    "rbf_weight": 0.5,
+                    "rbf_bandwidth_scale": 1.0,
+                    "sft_warmup_fraction": 0.10,
                     "max_grad_norm": 1.0,
-                    "checkpoint_every_steps": 100,
+                    "checkpoint_every_steps": 1,
                     "log_every_steps": 1,
                     "resume_from": None,
                 },
@@ -166,7 +172,7 @@ class Stage1PhaseScheduleTest(unittest.TestCase):
             with (
                 patch(
                     "cot_mtkd.models.multi_adapter.load_base_causal_lm",
-                    return_value=base,
+                    side_effect=lambda *args, **kwargs: copy.deepcopy(base),
                 ),
                 patch(
                     "cot_mtkd.stage1.trainer.read_json",
@@ -200,56 +206,96 @@ class Stage1PhaseScheduleTest(unittest.TestCase):
                     wraps=replay_expert_gradients,
                 ) as replay,
                 patch(
-                    "cot_mtkd.stage1.trainer.compose_objective_gradients",
-                    wraps=compose_objective_gradients,
+                    "cot_mtkd.stage1.trainer.stable_gac_gradients",
+                    wraps=stable_gac_gradients,
                 ) as objective,
             ):
+                if resume_after is not None:
+                    class InterruptedForTest(Exception):
+                        pass
+
+                    def save_then_interrupt(*args, **kwargs):
+                        _save_training_checkpoint(*args, **kwargs)
+                        if args[6] == resume_after:
+                            raise InterruptedForTest()
+
+                    with (
+                        patch("cot_mtkd.stage1.trainer._save_training_checkpoint", side_effect=save_then_interrupt),
+                        self.assertRaises(InterruptedForTest),
+                    ):
+                        train_stage1(config, distributed)
+                    saved = torch.load(root / "output" / "checkpoint.pt", weights_only=False)
+                    self.assertEqual(saved["global_step"], resume_after)
+                    self.assertEqual(saved["batch_in_epoch"], 2 * resume_after)
+                    config["stage1"]["resume_from"] = str(root / "output" / "checkpoint.pt")
                 result = train_stage1(config, distributed)
-            self.assertEqual(probe_calls.call_count, 0 if no_reasoning else record_count * 3)
-            self.assertEqual(rbf_calls.call_count, total_steps)
-            self.assertEqual(objective.call_count, total_steps)
+            phases = ["sft_only"] + ["full_interaction"] * (total_steps - 1)
+            self.assertEqual(probe_calls.call_count, 0 if no_reasoning else (record_count - 2) * 3)
+            self.assertEqual(rbf_calls.call_count, total_steps - 1)
+            self.assertEqual(objective.call_count, total_steps - 1)
             for call in objective.call_args_list:
                 self.assertEqual(len(call.args[1]), 3)
-                self.assertEqual(call.args[2], config["stage1"]["rbf_weight"])
+                self.assertEqual(call.kwargs["rbf_weight"], config["stage1"]["rbf_weight"])
+                self.assertEqual(call.kwargs["beta"], 0.5)
             active_calls = one_pass if mode == "one_pass" else replay
-            self.assertEqual(
-                active_calls.call_count, record_count * (1 if mode == "one_pass" else 3)
-            )
+            multiplier = 1 if mode == "one_pass" else 3
+            self.assertEqual(active_calls.call_count, (record_count - 2) * multiplier)
             for call in active_calls.call_args_list:
-                self.assertIsNotNone(call.kwargs["combined_dpp_scale"])
+                scale = call.kwargs["combined_dpp_scale"]
                 if no_reasoning:
-                    self.assertEqual(call.kwargs["combined_dpp_scale"], 0.0)
+                    self.assertEqual(scale, 0.0)
                 else:
-                    self.assertGreater(call.kwargs["combined_dpp_scale"], 0.0)
+                    self.assertGreater(scale, 0.0)
             self.assertEqual(result["global_step"], total_steps)
+            self.assertEqual(result["method"], "sft_dpp_rbf_local_gac")
             with (root / "output" / "metrics.jsonl").open(encoding="utf-8") as handle:
                 steps = [json.loads(line) for line in handle if '"event": "stage1_step"' in line]
-            self.assertEqual(
-                [item["interaction_phase"] for item in steps],
-                ["full"] * total_steps,
-            )
+            self.assertEqual([item["update_mode"] for item in steps], phases)
             self.assertEqual(len(steps), total_steps)
-            for step in steps:
-                self.assertEqual(step["interaction"], 1.0)
-                self.assertEqual(step["task_gradient_kind"], "sft_plus_weighted_dpp")
-                self.assertIsNotNone(step["bandwidth"])
-                self.assertTrue(step["probe_computed"])
-                self.assertTrue(step["rbf_computed"])
-                self.assertEqual(step["objective"], "sft_dpp_rbf")
-                self.assertNotIn("repulsion_cap_factors", step)
-                self.assertEqual(len(step["rbf_task_gradient_ratios"]), 3)
-                self.assertGreaterEqual(step["rbf_loss"], 0.0)
-                self.assertLessEqual(step["rbf_loss"], 1.0)
-                self.assertAlmostEqual(step["phase1_loss"], 3 * step["sft_nll"] + 0.2 * step["dpp_loss"] + 0.01 * step["rbf_loss"])
-                if no_reasoning:
+            for phase, step in zip(phases, steps, strict=True):
+                active = phase != "sft_only"
+                self.assertEqual(step["task_gradient_kind"], "sft_plus_weighted_dpp" if phase == "full_interaction" else "sft")
+                self.assertEqual(step["h_base"] is not None, active)
+                self.assertEqual(step["probe_computed"], active)
+                self.assertEqual(step["rbf_computed"], active)
+                self.assertEqual(step["objective"], "sft_dpp_rbf_local_gac")
+                self.assertNotIn("phase1_loss", step)  # GAC is a pseudo-gradient, not scalar-loss backward.
+                self.assertEqual(len(step["repulsion_cap_factors"]), 3 if active else 0)
+                self.assertTrue(all(0 <= value <= 1 for value in step["repulsion_cap_factors"]))
+                if not active or no_reasoning:
                     self.assertEqual(step["dpp_loss"], 0.0)
                 else:
                     self.assertGreater(step["dpp_loss"], 0.0)
+                self.assertNotIn("interaction", step)
+                self.assertNotIn("gamma", step)
+                self.assertTrue(step["gac_self_bound_satisfied"])
+                self.assertGreaterEqual(step["gac_self_coefficient_min"], 0.5)
+                for own, cross in zip(step["gac_self_coefficients"], step["gac_cross_coefficients"], strict=True):
+                    self.assertAlmostEqual(own + cross, 1.0)
+                if active:
+                    self.assertAlmostEqual(step["h_gac"], 0.5 * step["h_base"])
+                    self.assertAlmostEqual(step["h_rbf"], step["h_base"])
+                    for pair, distance in step["pairwise_distances"].items():
+                        kg = step["gac_pairwise_kernels"][pair]
+                        kr = step["rbf_pairwise_kernels"][pair]
+                        self.assertLessEqual(kg, kr)
+                        self.assertGreaterEqual(distance, 0.0)
+                    for capped, mixed, weighted in zip(
+                        step["capped_repulsion_norms"], step["mixed_task_gradient_norms"],
+                        step["weighted_repulsion_norms"], strict=True,
+                    ):
+                        self.assertLessEqual(capped, mixed + 1e-12)
+                        self.assertAlmostEqual(weighted, 0.5 * capped)
+                else:
+                    self.assertEqual(step["pairwise_distances"], {})
+            self.assertEqual(steps[0]["optimizer_progress"], 0.0)
+            if total_steps == 11:
+                self.assertEqual(steps[1]["optimizer_progress"], 0.10)
             order = list(DistributedSampler(records, num_replicas=1, rank=0, seed=42))
             for window, step in enumerate(steps):
                 # Count the actual shuffled samples in this accumulation window;
                 # unequal trace lengths must not become a mean of batch means.
-                expected_count = 3 * sum(
+                expected_count = 0 if step["update_mode"] == "sft_only" else 3 * sum(
                     records[index].region_ids.count(2)
                     for index in order[2 * window : 2 * window + 2]
                 )
@@ -272,6 +318,21 @@ class Stage1PhaseScheduleTest(unittest.TestCase):
                         places=5,
                     )
                 self.assertEqual(sum(step["selected_k_histogram"][:8]), 0)
+            checkpoint = torch.load(root / "output" / "checkpoint.pt", weights_only=False)
+            return {"adapters": checkpoint["adapter_states"], "bandwidth": checkpoint["bandwidth"], "steps": steps}
+
+    def test_checkpoint_resume_before_and_after_exact_ten_percent_boundary(self) -> None:
+        for mode in ("one_pass", "two_pass"):
+            baseline = self._assert_gac_training(mode, record_count=22)
+            for resume_after in (1, 2):
+                with self.subTest(mode=mode, resume_after=resume_after):
+                    resumed = self._assert_gac_training(mode, record_count=22, resume_after=resume_after)
+                    self.assertEqual(resumed["bandwidth"], baseline["bandwidth"])
+                    self.assertEqual([s["update_mode"] for s in resumed["steps"]],
+                                     [s["update_mode"] for s in baseline["steps"]])
+                    for name, values in baseline["adapters"].items():
+                        for key, expected in values.items():
+                            torch.testing.assert_close(resumed["adapters"][name][key], expected, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

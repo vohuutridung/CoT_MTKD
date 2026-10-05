@@ -55,7 +55,8 @@ Meaning of each command:
 2. `prepare` downloads and tokenizes the training corpus, saving it in
    `artifacts/prepared/s1k_1_1_cot_only/` for both phases.
 3. `stage1-stress` checks Phase-1 VRAM and update completion on the longest real
-   sample and synthetic 32k samples; report: `artifacts/stage1/stress_memory.json`.
+   sample and synthetic 32k samples in SFT-only/full-interaction modes (four cases);
+   report: `artifacts/stage1/stress_memory.json`.
 4. `stage1` trains the three experts and saves their adapters, checkpoint and
    manifest in `artifacts/stage1/main/`.
 5. `stage2-cache` precomputes teacher targets and selects the best expert for
@@ -67,6 +68,54 @@ Meaning of each command:
 8. The `evaluate` command benchmarks that local student on AIME 2025, AIME 2024,
    AMC and MATH-500, saving results in `artifacts/evaluation/p_align_local/`.
    Evaluation is optional after training finishes.
+
+### Phase 1 on `phase1-gac`
+
+This branch implements local GAC with a separate own-task contribution and
+unnormalized sharing from other experts. The method identifier is
+`sft_dpp_rbf_local_gac`. CoT-only preprocessing retains 996 samples and never
+reads `deepseek_attempt`. Kneedle, union support and the normalized step-level
+DPP loss retain their `output-space` semantics. Phase 2 is unchanged.
+
+The frozen Qwen2.5-7B-Instruct backbone has three LoRA adapters (rank/alpha 16,
+dropout 0.05, existing target modules). SFT uses all labeled assistant tokens;
+DPP uses reasoning tokens only. Its loss per step remains
+`[M log(1 + eps_s) - logdet(L_s + eps_s I)] / M`, averaged over steps per
+sample, then samples with reasoning.
+
+For each optimizer window after SFT warmup:
+
+1. Form `g_task_i = g_SFT_i + 0.1 * g_DPP_i`. SFT is normalized by global
+   labeled-token count; DPP by global reasoning-sample count. Their contributions
+   are combined before one transformer VJP per expert.
+2. Compute `Delta W_i = (alpha/r) B_i A_i` and reuse the existing normalized
+   squared Frobenius distance `D_ij`, averaged over LoRA modules. Low-rank
+   computation avoids materializing full `B A`; `D_ij` is not squared again.
+3. Keep the base bandwidth heuristic `median(D_ij for i<j) / log(M+1)`, floor
+   `1e-12` and EMA decay 0.9. Set `h_G = 0.5 * h_base` and `h_R = h_base`.
+   The kernels are `K_G = exp(-D/h_G)` and `K_R = exp(-D/h_R)`.
+4. Set `a_ji = beta/(M-1) * K_G[j,i]` for `j != i`, with `beta=0.5`.
+   Form `g_mix_i = (1 - sum_{j!=i} a_ji) * g_task_i + sum_{j!=i} a_ji * g_task_j`.
+   Cross-expert coefficients are used directly. The diagonal is excluded and
+   the own-task coefficient is at least 0.5 with the default beta.
+5. Compute the outward direction `r_i = -grad_i mean_{j<k} K_R[j,k]`, holding
+   bandwidth fixed. Keep the existing cap
+   `c_i = min(1, norm(g_mix_i)/(norm(r_i)+1e-12))`.
+   Form `g_full_i = g_mix_i - 0.5 * c_i * r_i`, clip each expert to norm 1,
+   and apply its AdamW optimizer and cosine learning-rate scheduler.
+
+Update mode uses `progress = global_step / max(total_updates - 1, 1)`:
+`progress < 0.10` gives `sft_only`, which skips support probing, DPP, sharing
+and RBF; `progress >= 0.10` switches directly to `full_interaction`.
+The restored optimizer-step cursor selects the same mode on checkpoint resume.
+`one_pass` remains the default and `two_pass` replays the same dropout seeds.
+Epochs/global batch/microbatch/learning rate remain 3/16/1/5e-5.
+
+GAC remains a pseudo-gradient update. Logs report SFT/DPP losses, pairwise
+D/K_G/K_R, both scaled bandwidths and the base bandwidth, own/cross coefficients,
+task/mixed norms, raw/capped/weighted repulsion norms and cap factors. The method
+identifier and config fingerprint reject checkpoints from older formulations;
+changing the forward mode alone remains resume-compatible.
 
 ### Phase 2 with the existing Hugging Face experts
 

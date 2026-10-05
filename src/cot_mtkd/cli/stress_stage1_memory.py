@@ -23,13 +23,22 @@ from ..models.multi_adapter import (
     require_same_model_source,
     set_all_adapters_trainable,
 )
-from ..stage1.objective import compose_objective_gradients
-from ..stage1.rbf import BandwidthEMA, effective_update_distances, rbf_repulsion_gradients
+from ..stage1.gac_gradient import stable_gac_gradients
+from ..stage1.rbf import (
+    BandwidthEMA,
+    effective_update_distances,
+    interaction_bandwidths,
+    rbf_kernel,
+    repulsion_updates,
+)
 from ..stage1.trainer import (
     _batch_to_device,
     _optimizer_and_scheduler,
+    _pairwise_statistics,
     _run_compatible_config,
+    _validate_stage1_config,
     one_pass_expert_gradients,
+    sft_only_expert_gradients,
 )
 from ..utils.manifest import fingerprint, read_json, require_file_sha256
 from ..utils.seed import seed_everything
@@ -42,7 +51,7 @@ from ..utils.training import (
 
 TARGET_LENGTH = 32_768
 GIB = 1024**3
-PHASES = ("full",)
+PHASES = ("sft_only", "full_interaction")
 
 
 def extend_reasoning(record: PreparedRecord, target_length: int) -> PreparedRecord:
@@ -113,7 +122,7 @@ def _run_microbatch(
     device: torch.device,
     iteration: int,
 ) -> dict[str, Any]:
-    """Exercise one optimizer update using the trainer's full interaction path.
+    """Exercise one optimizer update using the trainer's phase-specific path.
 
     This is a single-sample optimizer window. Its token/sample normalizers
     match training, but its time is not a global-batch optimizer-step time.
@@ -127,42 +136,81 @@ def _run_microbatch(
     dpp_samples = int(torch.unique(views["reasoning_batch_indices"]).numel())
     if sft_tokens <= 0:
         raise ValueError("Stress sample has no labeled response tokens")
-    combined_dpp_scale = (
-        float(config["stage1"]["dpp_weight"]) * sft_tokens / dpp_samples
-        if dpp_samples
-        else 0.0
-    )
-    probe, results = one_pass_expert_gradients(
-        model,
-        names,
-        parameters,
-        batch,
-        iteration,
-        iteration,
-        int(config["seed"]),
-        config,
-        device,
-        combined_dpp_scale=combined_dpp_scale,
-    )
-    if probe.dpp_sample_count != dpp_samples:
-        raise RuntimeError("Stress DPP sample count differs from its planned denominator")
+    combined_dpp_scale = None
+    if phase == "sft_only":
+        results = (
+            sft_only_expert_gradients(
+                model,
+                name,
+                expert,
+                current,
+                batch,
+                iteration,
+                iteration,
+                int(config["seed"]),
+                int(config["runtime"]["lm_head_chunk_tokens"]),
+                device,
+            )
+            for expert, (name, current) in enumerate(zip(names, parameters, strict=True))
+        )
+    else:
+        combined_dpp_scale = (
+            float(config["stage1"]["dpp_weight"]) * sft_tokens / dpp_samples
+            if dpp_samples else 0.0
+        )
+        probe, results = one_pass_expert_gradients(
+            model,
+            names,
+            parameters,
+            batch,
+            iteration,
+            iteration,
+            int(config["seed"]),
+            config,
+            device,
+            combined_dpp_scale=combined_dpp_scale,
+        )
+        if probe.dpp_sample_count != dpp_samples:
+            raise RuntimeError("Stress DPP sample count differs from its planned denominator")
     for expert, (task, _dpp, _, _) in enumerate(results):
         add_gradients_(task_buffers[expert], task)
     for values in task_buffers:
         for value in values:
             value.div_(sft_tokens)
-    set_all_adapters_trainable(model, names)
-    scaling = float(config["lora"]["alpha"]) / float(config["lora"]["rank"])
-    distances_for_step = effective_update_distances(groups, scaling)
-    current_bandwidth = bandwidth.update(distances_for_step)
-    rbf = rbf_repulsion_gradients(
-        groups, scaling, current_bandwidth, distances=distances_for_step
-    )
-    final, diagnostics = compose_objective_gradients(
-        task_buffers,
-        rbf.gradients,
-        float(config["stage1"]["rbf_weight"]),
-    )
+    details: dict[str, Any] = {}
+    if phase == "sft_only":
+        final = task_buffers
+    else:
+        set_all_adapters_trainable(model, names)
+        scaling = float(config["lora"]["alpha"]) / float(config["lora"]["rank"])
+        distances_for_step = effective_update_distances(groups, scaling)
+        h_base = bandwidth.update(distances_for_step)
+        h_gac, h_rbf = interaction_bandwidths(
+            h_base,
+            float(config["stage1"].get("gac_bandwidth_scale", 0.5)),
+            float(config["stage1"].get("rbf_bandwidth_scale", 1.0)),
+        )
+        gac_kernel = rbf_kernel(distances_for_step.detach(), h_gac)
+        repulsion, repulsion_kernel, distances = repulsion_updates(
+            groups, scaling, h_rbf, distances=distances_for_step
+        )
+        final, diagnostics = stable_gac_gradients(
+            task_buffers, repulsion, gac_kernel,
+            beta=float(config["stage1"].get("gac_beta", 0.5)),
+            rbf_weight=float(config["stage1"]["rbf_weight"]),
+        )
+        details = {
+            "h_base": h_base, "h_gac": h_gac, "h_rbf": h_rbf,
+            "pairwise_distances": _pairwise_statistics(distances, names),
+            "gac_pairwise_kernels": _pairwise_statistics(gac_kernel, names),
+            "rbf_pairwise_kernels": _pairwise_statistics(repulsion_kernel, names),
+            "gac_cross_coefficients": diagnostics.cross_coefficients,
+            "gac_self_coefficients": diagnostics.self_coefficients,
+            "repulsion_norms_before_cap": diagnostics.repulsion_norms_before_cap,
+            "repulsion_cap_factors": diagnostics.repulsion_cap_factors,
+            "capped_repulsion_norms": diagnostics.capped_repulsion_norms,
+            "weighted_repulsion_norms": diagnostics.weighted_repulsion_norms,
+        }
     for values, current, optimizer, scheduler in zip(
         final, parameters, optimizers, schedulers, strict=True
     ):
@@ -175,10 +223,9 @@ def _run_microbatch(
         optimizer.zero_grad(set_to_none=True)
     return {
         "response_tokens": sft_tokens,
-        "dpp_samples": dpp_samples,
+        "dpp_samples": dpp_samples if phase != "sft_only" else 0,
         "combined_dpp_scale": combined_dpp_scale,
-        "rbf_loss": rbf.loss,
-        "rbf_task_gradient_ratios": list(diagnostics.rbf_task_ratios),
+        **details,
     }
 
 
@@ -249,7 +296,7 @@ def run_case(
         "case": name,
         "case_id": f"{name}_{phase}",
         "status": status,
-        "interaction_phase": phase,
+        "update_mode": phase,
         "sample_id": record.sample_id,
         "sequence_length": len(record.input_ids),
         **details,
@@ -285,7 +332,7 @@ def memory_recommendation(cases: list[dict[str, Any]]) -> tuple[str, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Stress full Phase-1 interactions on two long samples with warm-up"
+        description="Stress SFT-only/full-interaction GAC Phase-1 paths on two long samples with warm-up"
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", default="artifacts/stage1/stress_memory.json")
@@ -303,6 +350,7 @@ def main() -> None:
     if "H200" not in gpu_name.upper():
         raise RuntimeError(f"Expected H200; visible GPU is {gpu_name}")
     config = load_config(arguments.config)
+    _validate_stage1_config(config)
     if config["stage1"].get("forward_mode", "one_pass") != "one_pass":
         raise ValueError("Stress test requires stage1.forward_mode: one_pass")
     if int(config["stage1"]["micro_batch_size"]) != 1:
@@ -388,7 +436,7 @@ def main() -> None:
             torch.cuda.get_device_properties(device).total_memory / GIB, 3
         ),
         "forward_mode": "one_pass",
-        "interaction_phases": list(PHASES),
+        "update_modes": list(PHASES),
         "gradient_checkpointing": bool(config["model"].get("gradient_checkpointing", False)),
         "lm_head_chunk_tokens": int(config["runtime"]["lm_head_chunk_tokens"]),
         "probe_hidden_device": config["runtime"].get("probe_hidden_device", "cpu"),

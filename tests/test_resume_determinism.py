@@ -15,8 +15,14 @@ from cot_mtkd.models.multi_adapter import (
     set_active_adapter,
     set_all_adapters_trainable,
 )
-from cot_mtkd.stage1.objective import compose_objective_gradients
-from cot_mtkd.stage1.rbf import BandwidthEMA, effective_update_distances, rbf_repulsion_gradients
+from cot_mtkd.stage1.gac_gradient import stable_gac_gradients
+from cot_mtkd.stage1.rbf import (
+    BandwidthEMA,
+    effective_update_distances,
+    interaction_bandwidths,
+    rbf_kernel,
+    repulsion_updates,
+)
 from cot_mtkd.stage1.trainer import (
     _load_training_checkpoint,
     _optimizer_and_scheduler,
@@ -40,7 +46,7 @@ LORA = {
     ],
 }
 TRAINING = {
-    "stage1": {"learning_rate": 1.0e-3, "rbf_weight": 0.01, "max_grad_norm": 1.0},
+    "stage1": {"learning_rate": 1.0e-3, "rbf_weight": 0.5, "max_grad_norm": 1.0},
     "optimizer": {
         "betas": [0.9, 0.999],
         "eps": 1.0e-8,
@@ -74,7 +80,7 @@ def build_training_state():
     return model, names, groups, parameters, optimizers, schedulers, bandwidth
 
 
-def run_step(state, step: int) -> tuple[list[float], float, float]:
+def run_step(state, step: int) -> tuple[list[float], str, float]:
     model, names, groups, parameters, optimizers, schedulers, bandwidth = state
     model.train()
     input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
@@ -93,15 +99,19 @@ def run_step(state, step: int) -> tuple[list[float], float, float]:
     set_all_adapters_trainable(model, names)
     distances = effective_update_distances(groups, scaling=1.0)
     current_bandwidth = bandwidth.update(distances)
-    rbf = rbf_repulsion_gradients(groups, 1.0, current_bandwidth, distances=distances)
-    gradients, _ = compose_objective_gradients(task_gradients, rbf.gradients, TRAINING["stage1"]["rbf_weight"])
+    h_gac, h_rbf = interaction_bandwidths(current_bandwidth)
+    repulsion, _, _ = repulsion_updates(groups, 1.0, h_rbf, distances=distances)
+    gradients, _ = stable_gac_gradients(
+        task_gradients, repulsion, rbf_kernel(distances.detach(), h_gac),
+        beta=0.5, rbf_weight=TRAINING["stage1"]["rbf_weight"],
+    )
     for current, values, optimizer, scheduler in zip(parameters, gradients, optimizers, schedulers, strict=True):
         global_clip_grad_list_(values, TRAINING["stage1"]["max_grad_norm"])
         assign_gradients(current, values)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
-    return losses, 1.0, current_bandwidth
+    return losses, "full_interaction", current_bandwidth
 
 
 class ResumeDeterminismTest(unittest.TestCase):

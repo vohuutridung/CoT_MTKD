@@ -64,6 +64,27 @@ def rbf_kernel(
     return torch.exp(-distance_squared.float() / bandwidth)
 
 
+def interaction_bandwidths(
+    base_bandwidth: float,
+    gac_scale: float = 0.5,
+    rbf_scale: float = 1.0,
+) -> tuple[float, float]:
+    """Scale the already-floored EMA bandwidth; GAC is no wider than RBF.
+
+    Distances already are normalized squared Frobenius quantities. Kernels
+    consume them directly as exp(-D/h), without another square or bandwidth floor.
+    """
+    if not math.isfinite(base_bandwidth) or base_bandwidth <= 0.0:
+        raise ValueError("Base bandwidth must be finite and positive")
+    if not (math.isfinite(gac_scale) and math.isfinite(rbf_scale)
+            and 0.0 < gac_scale <= rbf_scale):
+        raise ValueError("Bandwidth scales require 0 < gac_bandwidth_scale <= rbf_bandwidth_scale")
+    h_gac, h_rbf = base_bandwidth * gac_scale, base_bandwidth * rbf_scale
+    if not (math.isfinite(h_gac) and math.isfinite(h_rbf) and h_gac > 0 and h_rbf > 0):
+        raise ValueError("Scaled bandwidths must be finite and positive")
+    return h_gac, h_rbf
+
+
 @dataclass
 class BandwidthEMA:
     decay: float = 0.9
@@ -150,3 +171,18 @@ def rbf_repulsion_gradients(
             cursor += 1
         grouped_gradients.append(current)
     return RBFGradients(grouped_gradients, float(potential.detach().item()), kernel.detach(), distances.detach())
+
+
+def repulsion_updates(
+    groups: list[OrderedDict[str, torch.nn.Parameter]],
+    scaling: float,
+    bandwidth: float,
+    distances: torch.Tensor | None = None,
+) -> tuple[list[list[torch.Tensor]], torch.Tensor, torch.Tensor]:
+    """Return outward directions -grad(mean pairwise RBF) for the GAC update.
+
+    GAC subtracts these directions from its descent gradient after norm capping.
+    """
+    result = rbf_repulsion_gradients(groups, scaling, bandwidth, distances=distances)
+    updates = [[-value for value in current] for current in result.gradients]
+    return updates, result.kernel, result.distances

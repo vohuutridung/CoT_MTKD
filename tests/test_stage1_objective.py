@@ -15,15 +15,14 @@ from cot_mtkd.models.multi_adapter import (
     set_all_adapters_trainable,
 )
 from cot_mtkd.stage1.dpp import normalized_support_features, step_dpp_loss
-from cot_mtkd.stage1.objective import STAGE1_METHOD, compose_objective_gradients
-from cot_mtkd.stage1.rbf import rbf_repulsion_gradients
+from cot_mtkd.stage1.gac_gradient import STAGE1_METHOD, stable_gac_gradients
+from cot_mtkd.stage1.rbf import rbf_kernel, rbf_repulsion_gradients
 from cot_mtkd.stage1.trainer import _run_compatible_config, one_pass_expert_gradients
-from cot_mtkd.utils.training import global_clip_grad_list_
 
 
 class Stage1ObjectiveTest(unittest.TestCase):
-    def test_accumulated_gradients_match_one_dense_scalar_objective(self) -> None:
-        """Compare the actual split VJPs with backward of all three loss terms."""
+    def test_accumulated_task_gradients_and_gac_match_dense_reference(self) -> None:
+        """Compare split VJPs with dense SFT/DPP backward, then verify GAC and RBF sign."""
         torch.manual_seed(17)
         base = Qwen2ForCausalLM(
             Qwen2Config(
@@ -87,7 +86,7 @@ class Stage1ObjectiveTest(unittest.TestCase):
                 42,
                 config,
                 torch.device("cpu"),
-                combined_dpp_scale=0.2 * total_tokens / len(batches),
+                combined_dpp_scale=0.1 * total_tokens / len(batches),
             )
             probes.append(probe)
             for destination, result in zip(task, results, strict=True):
@@ -96,7 +95,11 @@ class Stage1ObjectiveTest(unittest.TestCase):
         set_all_adapters_trainable(model, names)
         fixed_bandwidth = 0.01
         rbf = rbf_repulsion_gradients(groups, 1.0, fixed_bandwidth)
-        actual, _ = compose_objective_gradients(task, rbf.gradients, 0.01)
+        repulsion = [[-value for value in current] for current in rbf.gradients]
+        actual, _ = stable_gac_gradients(
+            task, repulsion, rbf_kernel(rbf.distances, 0.5 * fixed_bandwidth),
+            beta=0.5, rbf_weight=0.5,
+        )
 
         sft_sum, dpp_sum = torch.tensor(0.0), torch.tensor(0.0)
         for batch, probe in zip(batches, probes, strict=True):
@@ -144,48 +147,39 @@ class Stage1ObjectiveTest(unittest.TestCase):
                         modules.append(difference.square().mean())
                 pair_distances.append(torch.stack(modules).mean())
         dense_rbf = torch.exp(-torch.stack(pair_distances) / fixed_bandwidth).mean()
-        loss = sft_sum / total_tokens + 0.2 * dpp_sum / len(batches) + 0.01 * dense_rbf
-        expected = torch.autograd.grad(loss, [value for current in parameters for value in current])
-        for full, split in zip(
-            expected, [value for current in actual for value in current], strict=True
-        ):
-            torch.testing.assert_close(split, full, atol=3e-5, rtol=5e-4)
+        task_loss = sft_sum / total_tokens + 0.1 * dpp_sum / len(batches)
+        flat_parameters = [value for current in parameters for value in current]
+        dense_task = torch.autograd.grad(task_loss, flat_parameters)
+        dense_rbf_grad = torch.autograd.grad(dense_rbf, flat_parameters)
+        expected_task = torch.stack([
+            torch.cat([value.flatten() for value in dense_task[index * len(parameters[0]):(index + 1) * len(parameters[0])]])
+            for index in range(3)
+        ])
+        split_task = torch.stack([torch.cat([value.flatten() for value in current]) for current in task])
+        torch.testing.assert_close(split_task, expected_task, atol=3e-5, rtol=5e-4)
+        dense_regularizer = torch.stack([
+            torch.cat([value.flatten() for value in dense_rbf_grad[index * len(parameters[0]):(index + 1) * len(parameters[0])]])
+            for index in range(3)
+        ])
+        kernel = torch.eye(3)
+        indices = torch.triu_indices(3, 3, 1)
+        kernel[indices[0], indices[1]] = torch.exp(-torch.stack(pair_distances).detach() / (0.5 * fixed_bandwidth))
+        kernel[indices[1], indices[0]] = kernel[indices[0], indices[1]]
+        kernel.fill_diagonal_(0.0)
+        cross = 0.25 * kernel
+        expected_mixed = (1 - cross.sum(dim=0))[:, None] * expected_task + cross.T @ expected_task
+        caps = (expected_mixed.norm(dim=1) / (dense_regularizer.norm(dim=1) + 1e-12)).clamp(max=1)
+        expected = expected_mixed + 0.5 * caps[:, None] * dense_regularizer
+        actual_flat = torch.stack([torch.cat([value.flatten() for value in current]) for current in actual])
+        torch.testing.assert_close(actual_flat, expected, atol=3e-5, rtol=5e-4)
 
-    def test_gradients_are_local_and_large_rbf_gradient_is_not_capped(self) -> None:
-        task = [[torch.tensor([1.0, 2.0])], [torch.tensor([3.0, 4.0])]]
-        rbf = [[torch.tensor([1000.0, -2000.0])], [torch.tensor([-5.0, 7.0])]]
-        final, diagnostics = compose_objective_gradients(task, rbf, 0.01)
-        torch.testing.assert_close(final[0][0], torch.tensor([11.0, -18.0]))
-        torch.testing.assert_close(final[1][0], torch.tensor([2.95, 4.07]))
-        self.assertAlmostEqual(diagnostics.rbf_task_ratios[0], 10.0, places=5)
-        # Altering another expert's task never changes expert zero's update.
-        changed, _ = compose_objective_gradients(
-            [task[0], [torch.tensor([-999.0, 88.0])]], rbf, 0.01
-        )
-        torch.testing.assert_close(changed[0][0], final[0][0], atol=0, rtol=0)
-        norm = global_clip_grad_list_(final[0], 1.0)
-        self.assertGreater(norm, 1.0)
-        self.assertAlmostEqual(float(final[0][0].norm()), 1.0, places=6)
-
-    def test_zero_weight_is_exactly_independent_task_gradient(self) -> None:
-        task = [[torch.tensor([1.0])], [torch.tensor([3.0])]]
-        final, diagnostics = compose_objective_gradients(
-            task, [[torch.tensor([40.0])], [torch.tensor([-40.0])]], 0.0
-        )
-        for expected, actual in zip(task, final, strict=True):
-            torch.testing.assert_close(expected[0], actual[0], atol=0, rtol=0)
-        self.assertEqual(diagnostics.weighted_rbf_norms, (0.0, 0.0))
-
-    def test_rejects_invalid_weight_and_mismatched_parameter_shapes(self) -> None:
-        for weight in [-1.0, float("nan"), float("inf")]:
-            with self.subTest(weight=weight), self.assertRaisesRegex(ValueError, "finite"):
-                compose_objective_gradients([[torch.ones(1)]], [[torch.ones(1)]], weight)
-        with self.assertRaisesRegex(ValueError, "matching shapes"):
-            compose_objective_gradients([[torch.ones(1)]], [[torch.ones(2)]], 0.01)
-
-    def test_resume_fingerprint_always_encodes_the_scalar_objective(self) -> None:
+    def test_resume_fingerprint_encodes_gac_and_differs_from_no_gac(self) -> None:
+        from cot_mtkd.utils.manifest import fingerprint
         settings = _run_compatible_config({"stage1": {"forward_mode": "one_pass"}})
         self.assertEqual(settings["stage1"]["objective"], STAGE1_METHOD)
+        for previous_method in ("sft_dpp_rbf", "sft_dpp_rbf_gac"):
+            previous = {"stage1": {"objective": previous_method}}
+            self.assertNotEqual(fingerprint(settings), fingerprint(previous))
 
 
 if __name__ == "__main__":

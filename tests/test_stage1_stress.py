@@ -17,7 +17,7 @@ from cot_mtkd.cli.stress_stage1_memory import (
 from cot_mtkd.data.collator import LongCoTCollator, shifted_token_views
 from cot_mtkd.data.schema import PreparedRecord
 from cot_mtkd.models.multi_adapter import adapter_parameter_groups, create_multi_adapter_model
-from cot_mtkd.stage1.objective import compose_objective_gradients
+from cot_mtkd.stage1.gac_gradient import stable_gac_gradients
 from cot_mtkd.stage1.rbf import BandwidthEMA
 from cot_mtkd.stage1.trainer import (
     _optimizer_and_scheduler,
@@ -71,8 +71,11 @@ def stress_config() -> dict:
         "stage1": {
             "learning_rate": 1.0e-3,
             "global_batch_size": 16,
-            "dpp_weight": 0.2,
-            "rbf_weight": 0.01,
+            "dpp_weight": 0.1,
+            "rbf_weight": 0.5,
+            "gac_beta": 0.5,
+            "gac_bandwidth_scale": 0.5,
+            "rbf_bandwidth_scale": 1.0,
             "max_grad_norm": 1.0,
         },
         "runtime": {"lm_head_chunk_tokens": 32768, "probe_hidden_device": "cpu"},
@@ -84,7 +87,7 @@ def stress_config() -> dict:
 
 
 class Stage1StressTest(unittest.TestCase):
-    def test_tiny_qwen_runs_full_from_warmup_with_checkpointing_and_dropout(self) -> None:
+    def test_tiny_qwen_runs_sft_only_and_full_interaction_with_checkpointing_and_dropout(self) -> None:
         torch.manual_seed(17)
         base = Qwen2ForCausalLM(
             Qwen2Config(
@@ -120,7 +123,7 @@ class Stage1StressTest(unittest.TestCase):
                 wraps=one_pass_expert_gradients,
             ) as one_pass,
             patch(
-                "cot_mtkd.cli.stress_stage1_memory.compose_objective_gradients", wraps=compose_objective_gradients
+                "cot_mtkd.cli.stress_stage1_memory.stable_gac_gradients", wraps=stable_gac_gradients
             ) as objective,
         ):
             reports = [
@@ -142,15 +145,16 @@ class Stage1StressTest(unittest.TestCase):
                 )
                 for index, phase in enumerate(PHASES)
             ]
-        self.assertEqual(PHASES, ("full",))
-        self.assertEqual(resets.call_count, 1)
+        self.assertEqual(PHASES, ("sft_only", "full_interaction"))
+        self.assertEqual(resets.call_count, 2)
         self.assertEqual(one_pass.call_count, 2)
         self.assertEqual(objective.call_count, 2)
         for call in one_pass.call_args_list:
-            self.assertAlmostEqual(call.kwargs["combined_dpp_scale"], 0.2 * 12)
+            self.assertAlmostEqual(call.kwargs["combined_dpp_scale"], 0.1 * 12)
         for call in objective.call_args_list:
             self.assertEqual(len(call.args[1]), 3)
-            self.assertEqual(call.args[2], 0.01)
+            self.assertEqual(call.kwargs["rbf_weight"], 0.5)
+            self.assertEqual(call.kwargs["beta"], 0.5)
         for report in reports:
             self.assertEqual(report["status"], "ok")
             self.assertEqual(report["completed_warmup_iterations"], 1)
@@ -161,7 +165,7 @@ class Stage1StressTest(unittest.TestCase):
             self.assertEqual(report["timing_unit"], "one_microbatch_with_optimizer_step")
             self.assertEqual(report["response_tokens"], 12)
             self.assertTrue(report["memory_includes_warmup"])
-        self.assertEqual([report["dpp_samples"] for report in reports], [1])
+        self.assertEqual([report["dpp_samples"] for report in reports], [0, 1])
         for old, current in zip(initial, parameters, strict=True):
             self.assertTrue(any(not torch.equal(a, b) for a, b in zip(old, current, strict=True)))
             self.assertTrue(all(torch.isfinite(value).all() for value in current))
@@ -189,16 +193,20 @@ class Stage1StressTest(unittest.TestCase):
                 for _ in parameters
             ]
 
-        def inspect_objective(task, rbf, rbf_weight):
+        def inspect_objective(task, repulsion, kernel, *, beta, rbf_weight):
             expected = 1.0 + 2.0 * config["stage1"]["dpp_weight"]
             for values in task:
                 self.assertTrue(torch.allclose(values[0], torch.tensor([expected])))
-            return compose_objective_gradients(task, rbf, rbf_weight)
+            return stable_gac_gradients(task, repulsion, kernel, beta=beta, rbf_weight=rbf_weight)
 
         with (
             patch(
                 "cot_mtkd.cli.stress_stage1_memory.one_pass_expert_gradients",
                 side_effect=fake_one_pass,
+            ),
+            patch(
+                "cot_mtkd.cli.stress_stage1_memory.sft_only_expert_gradients",
+                return_value=([torch.tensor([float(tokens)])], [], 0.0, tokens),
             ),
             patch("cot_mtkd.cli.stress_stage1_memory.set_all_adapters_trainable"),
             patch(
@@ -206,11 +214,11 @@ class Stage1StressTest(unittest.TestCase):
                 return_value=torch.ones(3, 3),
             ),
             patch(
-                "cot_mtkd.cli.stress_stage1_memory.rbf_repulsion_gradients",
-                return_value=SimpleNamespace(gradients=[[torch.zeros(1)]] * 3, loss=0.0),
+                "cot_mtkd.cli.stress_stage1_memory.repulsion_updates",
+                return_value=([[torch.zeros(1)]] * 3, torch.eye(3), torch.ones(3, 3)),
             ),
             patch(
-                "cot_mtkd.cli.stress_stage1_memory.compose_objective_gradients", side_effect=inspect_objective
+                "cot_mtkd.cli.stress_stage1_memory.stable_gac_gradients", side_effect=inspect_objective
             ) as objective,
         ):
             for index, phase in enumerate(PHASES):
@@ -247,7 +255,7 @@ class Stage1StressTest(unittest.TestCase):
         ):
             result = run_case(
                 "mock",
-                "full",
+                "full_interaction",
                 stress_record(),
                 None,
                 None,
@@ -287,7 +295,7 @@ class Stage1StressTest(unittest.TestCase):
             ):
                 result = run_case(
                     "mock",
-                    "full",
+                    "full_interaction",
                     stress_record(),
                     None,
                     None,
@@ -336,7 +344,7 @@ class Stage1StressTest(unittest.TestCase):
         ):
             result = run_case(
                 "mock",
-                "full",
+                "full_interaction",
                 stress_record(),
                 None,
                 None,
@@ -361,7 +369,7 @@ class Stage1StressTest(unittest.TestCase):
         self.assertEqual(result["max_memory_reserved_bytes"], 125 * GIB)
 
     def test_invalid_phase_and_repetition_counts_fail_before_cuda(self) -> None:
-        for phase, warmup, repetitions in (("unknown", 1, 1), ("full", -1, 1), ("full", 1, 0)):
+        for phase, warmup, repetitions in (("unknown", 1, 1), ("full_interaction", -1, 1), ("full_interaction", 1, 0)):
             with self.subTest(phase=phase, warmup=warmup, repetitions=repetitions):
                 with self.assertRaises(ValueError), patch("torch.cuda.synchronize") as synchronize:
                     run_case(

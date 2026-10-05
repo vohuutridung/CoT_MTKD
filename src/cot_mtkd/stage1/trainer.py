@@ -61,9 +61,15 @@ from ..utils.training import (
     zeros_like_parameters,
 )
 from .dpp import DPPMetrics, normalized_support_features, step_dpp_loss
-from .objective import STAGE1_METHOD, compose_objective_gradients
+from .gac_gradient import STAGE1_METHOD, GACDiagnostics, stable_gac_gradients
 from .kneedle import build_union_support, local_k_from_probe
-from .rbf import BandwidthEMA, effective_update_distances, rbf_repulsion_gradients
+from .rbf import (
+    BandwidthEMA,
+    effective_update_distances,
+    interaction_bandwidths,
+    rbf_kernel,
+    repulsion_updates,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -415,7 +421,7 @@ def sft_only_expert_gradients(
     chunk_tokens: int,
     device: torch.device,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], float, int]:
-    """SFT-only reference helper for gradient checks, outside the training loop."""
+    """Warm-up path: one expert forward and one SFT transformer VJP."""
     views = shifted_token_views(batch)
     set_active_adapter(model, adapter_name)
     model.train()
@@ -486,7 +492,33 @@ def _run_compatible_config(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(value.get("stage1"), dict):
         value["stage1"].pop("forward_mode", None)
         value["stage1"].setdefault("objective", STAGE1_METHOD)
+        for key, default in (
+            ("gac_beta", 0.5), ("gac_bandwidth_scale", 0.5),
+            ("rbf_bandwidth_scale", 1.0), ("sft_warmup_fraction", 0.10),
+        ):
+            value["stage1"].setdefault(key, default)
     return value
+
+
+def _stage1_update_mode(
+    global_step: int, total_steps: int, sft_warmup_fraction: float = 0.10
+) -> str:
+    """Hard switch using the existing completed-update progress convention."""
+    if global_step < 0 or total_steps <= 0:
+        raise ValueError("Optimizer step must be non-negative and total_steps positive")
+    if not math.isfinite(sft_warmup_fraction) or not 0.0 <= sft_warmup_fraction <= 1.0:
+        raise ValueError("sft_warmup_fraction must be finite and in [0, 1]")
+    progress = global_step / max(total_steps - 1, 1)
+    return "sft_only" if progress < sft_warmup_fraction else "full_interaction"
+
+
+def _pairwise_statistics(matrix: torch.Tensor | None, names: list[str]) -> dict[str, float]:
+    if matrix is None:
+        return {}
+    indices = torch.triu_indices(len(names), len(names), 1, device=matrix.device)
+    values = matrix[indices[0], indices[1]].detach().cpu().tolist()
+    pairs = ((names[i], names[j]) for i in range(len(names)) for j in range(i + 1, len(names)))
+    return {f"{left}/{right}": float(value) for (left, right), value in zip(pairs, values, strict=True)}
 
 
 def _validate_stage1_config(config: dict[str, Any]) -> None:
@@ -502,8 +534,9 @@ def _validate_stage1_config(config: dict[str, Any]) -> None:
         raise ValueError("stage1.epochs must be positive")
     if float(config["stage1"]["learning_rate"]) <= 0.0:
         raise ValueError("stage1.learning_rate must be positive")
-    if float(config["stage1"]["dpp_weight"]) < 0.0:
-        raise ValueError("stage1.dpp_weight must be non-negative")
+    dpp_weight = float(config["stage1"]["dpp_weight"])
+    if not math.isfinite(dpp_weight) or dpp_weight < 0.0:
+        raise ValueError("stage1.dpp_weight must be finite and non-negative")
     rbf_weight = float(config["stage1"]["rbf_weight"])
     if not math.isfinite(rbf_weight) or rbf_weight < 0.0:
         raise ValueError("stage1.rbf_weight must be finite and non-negative")
@@ -516,19 +549,23 @@ def _validate_stage1_config(config: dict[str, Any]) -> None:
     search_k = int(config["kneedle"].get("search_k", 512))
     k_min = int(config["kneedle"].get("k_min", 8))
     if experts < 2:
-        raise ValueError("SFT/DPP/RBF Stage 1 requires at least two experts")
+        raise ValueError("GAC Stage 1 requires at least two experts")
     if not (1 <= search_k <= 512) or k_min < 1:
         raise ValueError("Kneedle requires 1 <= search_k <= 512 and positive k_min")
-    if config["stage1"].get("interaction_mode", "full") != "full":
-        raise ValueError("Stage 1 requires interaction_mode: full from the first update")
-    old_interaction_settings = [
-        key for key in config["stage1"]
-        if key.startswith("interaction_") and key != "interaction_mode"
-    ]
-    if old_interaction_settings:
-        raise ValueError(
-            f"Remove obsolete interaction schedule settings: {old_interaction_settings}"
-        )
+    obsolete = [key for key in config["stage1"] if key.startswith(("interaction_", "gamma_"))]
+    if obsolete:
+        raise ValueError(f"Remove obsolete interaction settings: {obsolete}; use sft_warmup_fraction")
+    beta = float(config["stage1"].get("gac_beta", 0.5))
+    if not math.isfinite(beta) or not 0.0 <= beta <= 1.0:
+        raise ValueError("stage1.gac_beta must be finite and in [0, 1]")
+    warmup = float(config["stage1"].get("sft_warmup_fraction", 0.10))
+    if not math.isfinite(warmup) or not 0.0 <= warmup <= 1.0:
+        raise ValueError("stage1.sft_warmup_fraction must be finite and in [0, 1]")
+    interaction_bandwidths(
+        1.0,
+        float(config["stage1"].get("gac_bandwidth_scale", 0.5)),
+        float(config["stage1"].get("rbf_bandwidth_scale", 1.0)),
+    )
     jitter = float(config["dpp"]["jitter"])
     maximum_jitter = float(config["dpp"]["max_jitter"])
     if not (0.0 < jitter <= maximum_jitter):
@@ -850,29 +887,53 @@ def train_stage1(
             rng_stream = (
                 epoch * len(dataloader) + batch_index
             ) * distributed.world_size + distributed.rank
-            # Every optimizer window uses the full interaction. Precombine SFT
-            # and weighted DPP before the VJP, retaining their global denominators.
-            if full_window_counts is None:
-                local_counts = torch.tensor(
-                    planned_counts[global_step],
-                    device=distributed.device,
-                    dtype=torch.float64,
-                )
-                all_reduce_tensor(local_counts)
-                full_window_counts = (
-                    int(local_counts[0].item()),
-                    int(local_counts[1].item()),
-                )
-            if full_window_counts[0] <= 0:
-                raise ValueError("An optimizer window has no SFT tokens")
-            combined_dpp_scale = (
-                float(config["stage1"]["dpp_weight"])
-                * full_window_counts[0]
-                / full_window_counts[1]
-                if full_window_counts[1] > 0
-                else 0.0
+            progress = global_step / max(total_steps - 1, 1)
+            update_mode = _stage1_update_mode(
+                global_step, total_steps,
+                float(config["stage1"].get("sft_warmup_fraction", 0.10)),
             )
-            if forward_mode == "one_pass":
+            combined_dpp_scale: float | None = None
+            if update_mode == "full_interaction":
+                if full_window_counts is None:
+                    local_counts = torch.tensor(
+                        planned_counts[global_step],
+                        device=distributed.device,
+                        dtype=torch.float64,
+                    )
+                    all_reduce_tensor(local_counts)
+                    full_window_counts = (
+                        int(local_counts[0].item()),
+                        int(local_counts[1].item()),
+                    )
+                if full_window_counts[0] <= 0:
+                    raise ValueError("A full-phase optimizer window has no SFT tokens")
+                combined_dpp_scale = (
+                    float(config["stage1"]["dpp_weight"])
+                    * full_window_counts[0]
+                    / full_window_counts[1]
+                    if full_window_counts[1] > 0
+                    else 0.0
+                )
+            if update_mode == "sft_only":
+                probe = _empty_probe(distributed.device, len(adapter_names))
+                expert_results = (
+                    sft_only_expert_gradients(
+                        model,
+                        adapter_name,
+                        expert,
+                        parameters,
+                        batch,
+                        global_step,
+                        rng_stream,
+                        int(config["seed"]),
+                        chunk_tokens,
+                        distributed.device,
+                    )
+                    for expert, (adapter_name, parameters) in enumerate(
+                        zip(adapter_names, parameter_lists, strict=True)
+                    )
+                )
+            elif forward_mode == "one_pass":
                 probe, expert_results = one_pass_expert_gradients(
                     model,
                     adapter_names,
@@ -970,29 +1031,50 @@ def train_stage1(
             )
             all_reduce_tensor(probe_statistics)
             all_reduce_tensor(support_histograms)
-            if (int(counts[0].item()), int(counts[1].item())) != full_window_counts:
+            if (
+                update_mode == "full_interaction"
+                and (int(counts[0].item()), int(counts[1].item())) != full_window_counts
+            ):
                 raise RuntimeError(
                     "Precomputed full-phase loss denominators do not match"
                 )
             for values in task_buffers:
                 divide_gradients_(values, float(counts[0].item()))
-            set_all_adapters_trainable(model, adapter_names)
-            distances_for_step = effective_update_distances(groups, scaling)
-            current_bandwidth = bandwidth.update(distances_for_step)
-            rbf = rbf_repulsion_gradients(
-                groups, scaling, current_bandwidth, distances=distances_for_step
-            )
-            final_gradients, diagnostics = compose_objective_gradients(
-                task_buffers,
-                rbf.gradients,
-                float(config["stage1"]["rbf_weight"]),
-            )
+            distances: torch.Tensor | None = None
+            gac_kernel: torch.Tensor | None = None
+            repulsion_kernel: torch.Tensor | None = None
+            h_base: float | None = None
+            h_gac: float | None = None
+            h_rbf: float | None = None
+            diagnostics: GACDiagnostics | None = None
+            if update_mode == "sft_only":
+                final_gradients = task_buffers
+            else:
+                set_all_adapters_trainable(model, adapter_names)
+                distances_for_step = effective_update_distances(groups, scaling)
+                h_base = bandwidth.update(distances_for_step)
+                h_gac, h_rbf = interaction_bandwidths(
+                    h_base,
+                    float(config["stage1"].get("gac_bandwidth_scale", 0.5)),
+                    float(config["stage1"].get("rbf_bandwidth_scale", 1.0)),
+                )
+                gac_kernel = rbf_kernel(distances_for_step.detach(), h_gac)
+                repulsion, repulsion_kernel, distances = repulsion_updates(
+                    groups, scaling, h_rbf, distances=distances_for_step
+                )
+                final_gradients, diagnostics = stable_gac_gradients(
+                    task_buffers,
+                    repulsion,
+                    gac_kernel,
+                    beta=float(config["stage1"].get("gac_beta", 0.5)),
+                    rbf_weight=float(config["stage1"]["rbf_weight"]),
+                )
             preclip_norms = [
                 global_clip_grad_list_(values, float(config["stage1"]["max_grad_norm"]))
                 for values in final_gradients
             ]
             if not all(math.isfinite(norm) for norm in preclip_norms):
-                raise FloatingPointError("Phase-1 scalar objective produced a non-finite gradient")
+                raise FloatingPointError("Phase-1 GAC update produced a non-finite gradient")
             for parameters, gradients, optimizer, scheduler in zip(
                 parameter_lists, final_gradients, optimizers, schedulers, strict=True
             ):
@@ -1007,12 +1089,12 @@ def train_stage1(
                 and global_step % int(config["stage1"]["log_every_steps"]) == 0
             ):
                 off_diagonal = (
-                    rbf.distances[
+                    distances[
                         torch.triu_indices(
                             len(adapter_names), len(adapter_names), 1
                         ).unbind()
                     ]
-                    if rbf.distances is not None
+                    if distances is not None
                     else None
                 )
                 metrics.log(
@@ -1020,26 +1102,27 @@ def train_stage1(
                     step=global_step,
                     epoch=epoch,
                     forward_mode=forward_mode,
-                    interaction_phase="full",
-                    task_gradient_kind="sft_plus_weighted_dpp",
+                    update_mode=update_mode,
+                    optimizer_progress=progress,
+                    task_gradient_kind=(
+                        "sft_plus_weighted_dpp" if update_mode == "full_interaction" else "sft"
+                    ),
                     objective=STAGE1_METHOD,
-                    probe_computed=True,
-                    rbf_computed=True,
+                    probe_computed=update_mode == "full_interaction",
+                    gac_computed=update_mode == "full_interaction",
+                    rbf_computed=update_mode == "full_interaction",
                     sft_nll=float(
                         losses[0].item()
                         / max(counts[0].item() * len(adapter_names), 1.0)
                     ),
                     dpp_loss=float(losses[1].item() / max(counts[1].item(), 1.0)),
-                    rbf_loss=rbf.loss,
-                    weighted_rbf_loss=float(config["stage1"]["rbf_weight"]) * rbf.loss,
-                    phase1_loss=(
-                        float(losses[0].item() / max(counts[0].item(), 1.0))
-                        + float(config["stage1"]["dpp_weight"]) * float(losses[1].item() / max(counts[1].item(), 1.0))
-                        + float(config["stage1"]["rbf_weight"]) * rbf.loss
-                    ),
-                    interaction=1.0,
                     learning_rate=optimizers[0].param_groups[0]["lr"],
-                    bandwidth=current_bandwidth,
+                    h_base=h_base,
+                    h_gac=h_gac,
+                    h_rbf=h_rbf,
+                    pairwise_distances=_pairwise_statistics(distances, adapter_names),
+                    gac_pairwise_kernels=_pairwise_statistics(gac_kernel, adapter_names),
+                    rbf_pairwise_kernels=_pairwise_statistics(repulsion_kernel, adapter_names),
                     mean_delta_w_distance=(
                         float(off_diagonal.mean().item())
                         if off_diagonal is not None
@@ -1068,10 +1151,29 @@ def train_stage1(
                     raw_k_histogram=support_histograms[0].tolist(),
                     selected_k_histogram=support_histograms[1].tolist(),
                     cholesky_fallbacks=int(probe_statistics[4].item()),
-                    task_gradient_norms=diagnostics.task_norms,
-                    rbf_gradient_norms=diagnostics.rbf_norms,
-                    weighted_rbf_gradient_norms=diagnostics.weighted_rbf_norms,
-                    rbf_task_gradient_ratios=diagnostics.rbf_task_ratios,
+                    task_gradient_norms=(diagnostics.task_norms if diagnostics else preclip_norms),
+                    mixed_task_gradient_norms=(diagnostics.mixed_task_norms if diagnostics else ()),
+                    gac_cross_coefficients=(
+                        diagnostics.cross_coefficients if diagnostics else (0.0,) * len(adapter_names)
+                    ),
+                    gac_self_coefficients=(
+                        diagnostics.self_coefficients if diagnostics else (1.0,) * len(adapter_names)
+                    ),
+                    gac_self_coefficient_min=(
+                        min(diagnostics.self_coefficients) if diagnostics else 1.0
+                    ),
+                    gac_self_coefficient_bound=1.0 - float(config["stage1"].get("gac_beta", 0.5)),
+                    gac_self_bound_satisfied=(
+                        min(diagnostics.self_coefficients)
+                        >= 1.0 - float(config["stage1"].get("gac_beta", 0.5)) - 1.0e-12
+                        if diagnostics else True
+                    ),
+                    repulsion_norms_before_cap=(
+                        diagnostics.repulsion_norms_before_cap if diagnostics else ()
+                    ),
+                    repulsion_cap_factors=(diagnostics.repulsion_cap_factors if diagnostics else ()),
+                    capped_repulsion_norms=(diagnostics.capped_repulsion_norms if diagnostics else ()),
+                    weighted_repulsion_norms=(diagnostics.weighted_repulsion_norms if diagnostics else ()),
                     preclip_gradient_norms=preclip_norms,
                 )
             if (

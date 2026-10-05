@@ -13,7 +13,7 @@ lora:
   dropout: 0.05
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 stage1:
-  objective: sft_dpp_rbf
+  objective: sft_dpp_rbf_local_gac
   num_experts: 3
   forward_mode: one_pass
   epochs: 3
@@ -21,10 +21,12 @@ stage1:
   micro_batch_size: 1
   global_batch_size: 16
   gradient_accumulation_steps: null
-  dpp_weight: 0.2
-  # Starting value for the uncapped mean-pair RBF loss; tune using gradient ratios.
-  rbf_weight: 0.01
-  interaction_mode: full
+  dpp_weight: 0.1
+  gac_beta: 0.5
+  gac_bandwidth_scale: 0.5
+  rbf_weight: 0.5
+  rbf_bandwidth_scale: 1.0
+  sft_warmup_fraction: 0.10
   max_grad_norm: 1.0
   checkpoint_every_steps: 10
   log_every_steps: 1

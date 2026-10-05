@@ -7,7 +7,9 @@ import torch
 
 from cot_mtkd.stage1.rbf import (
     effective_update_distances,
+    interaction_bandwidths,
     low_rank_squared_distance,
+    rbf_kernel,
     rbf_repulsion_gradients,
     rbf_repulsion_loss,
 )
@@ -23,6 +25,19 @@ def group(a: torch.Tensor, b: torch.Tensor):
 
 
 class RBFTest(unittest.TestCase):
+    def test_separate_bandwidths_use_squared_distance_directly(self) -> None:
+        distances = torch.tensor([[0.0, 0.2, 0.7], [0.2, 0.0, 1.3], [0.7, 1.3, 0.0]])
+        h_gac, h_rbf = interaction_bandwidths(0.8)
+        self.assertEqual((h_gac, h_rbf), (0.4, 0.8))
+        gac = rbf_kernel(distances, h_gac)
+        rbf = rbf_kernel(distances, h_rbf)
+        torch.testing.assert_close(gac, torch.exp(-distances / 0.4), atol=0, rtol=0)
+        torch.testing.assert_close(rbf, torch.exp(-distances / 0.8), atol=0, rtol=0)
+        self.assertTrue(torch.all(gac[distances > 0] < rbf[distances > 0]))
+        self.assertTrue(torch.all(gac[distances == 0] == 1))
+        self.assertTrue(torch.all(rbf[distances == 0] == 1))
+        self.assertEqual(interaction_bandwidths(1e-12), (0.5e-12, 1e-12))
+
     def test_potential_is_unordered_pair_mean_and_bandwidth_is_detached(self) -> None:
         distances = torch.tensor(
             [[0.0, 0.1, 0.2], [0.1, 0.0, 0.3], [0.2, 0.3, 0.0]], requires_grad=True
