@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from typing import Any, Protocol
 
+import yaml
 from tqdm.auto import tqdm
 
 from ..models.multi_adapter import require_same_model_source
@@ -196,6 +197,20 @@ def _length_capped_fraction(records: list[dict[str, Any]]) -> float:
     return sum(reason == "length" for reason in reasons) / len(reasons)
 
 
+def _write_eval_config(path: Path, value: dict[str, Any]) -> None:
+    """Replace an older evaluation snapshot so a new sampling setup can rerun."""
+    if path.is_file():
+        with path.open("r", encoding="utf-8") as handle:
+            existing = yaml.safe_load(handle)
+        if existing != value:
+            LOGGER.warning(
+                "Replacing evaluation config snapshot %s with the current settings",
+                path,
+            )
+            path.unlink()
+    write_config_snapshot(path, value)
+
+
 def evaluate(config: dict[str, Any], engine: StudentEngine | None = None) -> dict[str, Any]:
     """Generate n samples per problem with vLLM and grade Pass@1 / Pass@3."""
     stage2_dir = Path(config["paths"]["stage2"])
@@ -203,7 +218,7 @@ def evaluate(config: dict[str, Any], engine: StudentEngine | None = None) -> dic
     output_dir.mkdir(parents=True, exist_ok=True)
     public_config = {key: value for key, value in config.items() if not key.startswith("_")}
     config_snapshot = output_dir / "config.yaml"
-    write_config_snapshot(config_snapshot, public_config)
+    _write_eval_config(config_snapshot, public_config)
 
     stage2_manifest = read_json(stage2_dir / "manifest.json")
     require_file_sha256(stage2_dir, stage2_manifest, "adapter_bundle", "adapter_bundle_sha256")

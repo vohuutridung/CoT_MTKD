@@ -1,7 +1,11 @@
+import tempfile
 import unittest
+from pathlib import Path
+
+import yaml
 
 from cot_mtkd.evaluation.metrics import pass_metrics
-from cot_mtkd.evaluation.runner import generation_token_limit
+from cot_mtkd.evaluation.runner import _write_eval_config, generation_token_limit
 
 
 class PassMetricTests(unittest.TestCase):
@@ -20,6 +24,16 @@ class PassMetricTests(unittest.TestCase):
     def test_pass_metrics_reject_a_record_without_three_samples(self) -> None:
         with self.assertRaises(ValueError):
             pass_metrics([{"correct": [True]}])
+
+
+class EvalConfigSnapshotTests(unittest.TestCase):
+    def test_a_changed_snapshot_is_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("generation:\n  n: 1\n", encoding="utf-8")
+            _write_eval_config(path, {"generation": {"n": 3}})
+            with path.open(encoding="utf-8") as handle:
+                self.assertEqual(yaml.safe_load(handle), {"generation": {"n": 3}})
 
 
 class GenerationLimitTests(unittest.TestCase):
