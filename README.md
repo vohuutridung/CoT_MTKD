@@ -68,9 +68,11 @@ Meaning of each command:
 7. `stage2` trains the student for one epoch with
    `L_SFT + alpha * D_KL + beta * L_mass` (dynamic-temperature self-distillation on
    `V_k`) and saves its adapter, checkpoint and logs in `artifacts/stage2/council_local/`.
-8. The `evaluate` command benchmarks that local student on AIME 2025, AIME 2024,
-   AMC and MATH-500, saving results in `artifacts/evaluation/p_align_local/`.
-   Evaluation is optional after training finishes.
+8. The `evaluate` command benchmarks that local student with vLLM (3 samples,
+   temperature 0.6, top-p 0.9, repetition penalty 1.05, 4096-token context) on
+   AIME 2025, AIME 2024, AMC and MATH-500. Pass@1 is the mean of the three
+   samples; Pass@3 is whether any sample is correct. Results go to
+   `artifacts/evaluation/p_align_local/`. Evaluation is optional after training finishes.
 
 ### Phase 1 on `phase1-gac`
 
@@ -174,8 +176,8 @@ Meaning of each command:
    report: `artifacts/stage2/council_stress_memory.json`.
 6. `stage2` trains for one epoch, saving the student and logs in
    `artifacts/stage2/council/`.
-7. `evaluate` optionally benchmarks that student, saving results in
-   `artifacts/evaluation/p_align/`.
+7. `evaluate` optionally benchmarks that student with vLLM and writes Pass@1 /
+   Pass@3 to `artifacts/evaluation/p_align/`. Pass@1 averages all three samples.
 
 For either route, the student output directory contains `final/adapters/student/`,
 `checkpoint.pt`, `metrics.jsonl`, `performance.jsonl` and `reasoning_steps.jsonl`.

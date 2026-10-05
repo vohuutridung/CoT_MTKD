@@ -7,12 +7,16 @@ model:
   use_cache: true
 generation:
   prompt_prefix: "Please reason step by step, and put your final answer within \\boxed{}."
-  num_return_sequences: 3
-  do_sample: true
+  n: 3
   temperature: 0.6
   top_p: 0.9
   repetition_penalty: 1.05
-  max_new_tokens: 4096
+  max_tokens: 4096
+vllm:
+  max_model_len: 4096
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.8
+  max_lora_rank: 16
 benchmarks:
   - name: aime25
     dataset: yentinglin/aime_2025
