@@ -1,0 +1,77 @@
+schema_version: 3
+teacher_source:
+  type: huggingface
+  repo_id: duyentl04/abc
+  revision: 52aff0a878826b09fa62fa5a8229a6d49910ff6a
+  adapter_names: [expert_0, expert_1, expert_2]
+  weight_sha256:
+    expert_0: d3ff1ce81c7c014a37d77074bed25286f43bc90e42a0a9fff289cecfd4282a2b
+    expert_1: d579de75c7270ccfb5bede6aa8c80937883e4c3879d824d0a2ab81025af2218c
+    expert_2: be99ab3f0b8c5882b4ab127822ab41a8eada9700631917563921f3f853ba1078
+method: council_topk_dynamic_temperature_self_distillation
+seed: 42
+model:
+  name_or_path: Qwen/Qwen2.5-7B-Instruct
+  dtype: bfloat16
+  attn_implementation: flash_attention_2
+  gradient_checkpointing: true
+  use_cache: false
+lora:
+  rank: 16
+  alpha: 16
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+# Medoid Cloning: projection distance between LoRA A/B row spaces (ridge in fp32).
+medoid:
+  epsilon_rel: 1.0e-4
+  epsilon_abs: 1.0e-8
+  tau_b: 0.0
+# Council Top-k and the Phase-2 objective L_SFT + alpha * D_KL + beta * L_mass.
+council:
+  # Kneedle window N' on the sorted consensus p_bar: null = full vocabulary.
+  k_max: 256
+  mask_epsilon: 1.0e-12
+  # Dynamic temperature tau(JS): tau_min < 1 < tau_max.
+  tau_min: 0.5
+  tau_max: 2.0
+  temperature_schedule: linear   # linear | sigmoid | step
+  js_max: null                   # linear: null = ln M
+  sigmoid_gamma: 8.0             # sigmoid slope
+  sigmoid_center: null           # sigmoid inflection: null = council-cache JS median
+  step_theta_1: 0.1              # step thresholds (nats)
+  step_theta_2: 0.4
+  alpha: 1.0
+  beta: 0.25
+  epsilon_m: 1.0e-6
+logging:
+  reasoning_steps: true
+  performance: true
+stage2:
+  epochs: 1
+  learning_rate: 2.0e-5
+  micro_batch_size: 1
+  global_batch_size: 8
+  gradient_accumulation_steps: null
+  max_length: 32768
+  max_grad_norm: 1.0
+  checkpoint_every_steps: 10
+  log_every_steps: 1
+  resume_from: null
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+scheduler:
+  name: cosine
+  warmup_ratio: 0.10
+  min_lr_ratio: 0.0
+runtime:
+  lm_head_chunk_tokens: 4096
+  preprocessing_hidden_storage: cpu
+  dataloader_workers: 0
+paths:
+  prepared: artifacts/prepared/s1k_1_1_cot_only
+  stage1: artifacts/stage1/duyentl04_abc
+  teacher_cache_dir: artifacts/teacher_cache/council
+  output: artifacts/stage2/council
