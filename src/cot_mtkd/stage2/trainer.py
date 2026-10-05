@@ -61,6 +61,8 @@ def _stable_config(config: dict[str, Any]) -> dict[str, Any]:
     value = {key: dict(item) if isinstance(item, dict) else item for key, item in value.items()}
     if isinstance(value.get("stage2"), dict):
         value["stage2"].pop("resume_from", None)
+        if config.get("method") == OUTPUT_SPACE_METHOD:
+            value["stage2"].setdefault("incomplete_batch_policy", "drop")
     return value
 
 
@@ -94,7 +96,7 @@ def _validate_stage2_config(config: dict[str, Any]) -> None:
     section = "aggregation" if method == OUTPUT_SPACE_METHOD else "geometry"
     selector = config[section]
     selector_keys = (
-        ("js_temperature", "kd_temperature")
+        ("temperature",)
         if method == OUTPUT_SPACE_METHOD
         else ("temperature", "epsilon_a", "epsilon_u")
     )
@@ -110,6 +112,10 @@ def _validate_stage2_config(config: dict[str, Any]) -> None:
         from .council_cache import validate_council_config
 
         validate_council_config(config)
+        if config["stage2"].get("incomplete_batch_policy", "drop") != "drop":
+            raise ValueError(
+                "Calibrated Phase 2 uses incomplete_batch_policy: drop for exact global batches"
+            )
     if "hard_loss_weight" in config["stage2"] or "kd_loss_weight" in config["stage2"]:
         raise ValueError("Old hard/KD source weights are not part of the new Phase-2 objective")
     if not isinstance(config.get("logging", {}).get("reasoning_steps", True), bool):
@@ -146,6 +152,19 @@ def _record_collator(records):
     return records
 
 
+def full_global_batch_plan(record_count: int, stage2: dict, world_size: int) -> tuple[int, int]:
+    """Return per-rank full-window microbatches and the global omitted tail count."""
+    accumulation = gradient_accumulation_steps(stage2, world_size)
+    if record_count % world_size:
+        raise ValueError("Prepared record count must divide world_size without sampler padding")
+    windows = record_count // int(stage2["global_batch_size"])
+    if not windows:
+        raise ValueError(
+            "Training corpus is smaller than one full global batch; use a smaller dry-run batch"
+        )
+    return windows * accumulation, record_count - windows * int(stage2["global_batch_size"])
+
+
 def _save_checkpoint(
     path,
     model,
@@ -160,6 +179,7 @@ def _save_checkpoint(
     world_size,
     metrics,
     method: str = METHOD,
+    calibration: dict | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +196,7 @@ def _save_checkpoint(
             "batch_in_epoch": batch_in_epoch,
             "run_fingerprint": run_fingerprint,
             "metrics": metrics,
+            "disagreement_calibration": calibration,
             "sampler_state": {
                 "seed": base_seed,
                 "epoch": epoch,
@@ -192,10 +213,25 @@ def _save_checkpoint(
     temporary.replace(path)
 
 
-def _load_checkpoint(path, model, optimizer, scheduler, expected_run_fingerprint, method=METHOD):
+def _load_checkpoint(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    expected_run_fingerprint,
+    method=METHOD,
+    expected_calibration: dict | None = None,
+):
     value = torch.load(path, map_location="cpu", weights_only=False)
     if value.get("method") != method or value["run_fingerprint"] != expected_run_fingerprint:
         raise RuntimeError("Refusing to resume Phase 2 from a different method or configuration")
+    if (
+        expected_calibration is not None
+        and value.get("disagreement_calibration") != expected_calibration
+    ):
+        raise RuntimeError(
+            "Refusing Phase-2 checkpoint with missing/different fitted tau; start a new run"
+        )
     load_adapter_state(model, "student", value["student_state"])
     optimizer.load_state_dict(value["optimizer"])
     scheduler.load_state_dict(value["scheduler"])
@@ -306,7 +342,15 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
         drop_last=False,
     )
     epochs = int(config["stage2"]["epochs"])
-    total_steps = math.ceil(epochs * len(loader) / accumulation)
+    batches_per_epoch = len(loader)
+    dropped_tail_examples = 0
+    if method == OUTPUT_SPACE_METHOD:
+        batches_per_epoch, dropped_tail_examples = full_global_batch_plan(
+            len(dataset),
+            config["stage2"],
+            distributed.world_size,
+        )
+    total_steps = math.ceil(epochs * batches_per_epoch / accumulation)
     public_config = _stable_config(config)
     config_hash = fingerprint(public_config)
     run_hash = fingerprint(
@@ -349,7 +393,13 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
     resume = config["stage2"].get("resume_from")
     if resume:
         global_step, data_step, start_epoch, start_batch, last_metrics = _load_checkpoint(
-            resume, model, optimizer, scheduler, run_hash, method=method
+            resume,
+            model,
+            optimizer,
+            scheduler,
+            run_hash,
+            method=method,
+            expected_calibration=council["calibration"] if method == OUTPUT_SPACE_METHOD else None,
         )
         if start_epoch >= epochs:
             barrier()
@@ -375,7 +425,34 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
         selected_expert=council["selected_expert"],
         tie_breaking=council["tie_breaking"],
         numerical_anomalies=council["numerical_anomalies"],
+        calibration=council["calibration"],
+        diagnostics=council["diagnostics"],
+        training_examples_per_epoch=len(dataset) - dropped_tail_examples,
+        dropped_tail_examples_per_epoch=dropped_tail_examples,
     )
+    if method == OUTPUT_SPACE_METHOD:
+        LOGGER.info(
+            "Phase 2 epochs=%d global_batch_size=%d micro=%d world=%d accumulation=%d "
+            "temperature=%g sft_weight=%g disagreement_pooling_power=%g tau_quantile=%g tau=%g",
+            epochs,
+            int(config["stage2"]["global_batch_size"]),
+            micro,
+            distributed.world_size,
+            accumulation,
+            float(config["aggregation"]["temperature"]),
+            float(config["aggregation"]["sft_weight"]),
+            float(config["aggregation"]["disagreement_pooling_power"]),
+            float(config["aggregation"]["tau_quantile"]),
+            council["calibration"]["tau"],
+        )
+        if dropped_tail_examples:
+            LOGGER.info(
+                "Exact global batches: optimize %d/%d shuffled training examples per epoch; "
+                "omit final %d-example incomplete window. Tau still uses the full training corpus.",
+                len(dataset) - dropped_tail_examples,
+                len(dataset),
+                dropped_tail_examples,
+            )
     step_logger = None
     if method == OUTPUT_SPACE_METHOD and config.get("logging", {}).get("reasoning_steps", True):
         step_logger = create_reasoning_logger(
@@ -397,11 +474,13 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
     buffer = zeros_like_parameters(parameters)
     # Example/step counts and losses; reduction follows fixed K then example mean.
     # The remaining slots hold method statistics and KD/SFT/tail diagnostics.
-    totals = torch.zeros(18, device=distributed.device, dtype=torch.float64)
+    totals = torch.zeros(19, device=distributed.device, dtype=torch.float64)
     accumulated = 0
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
         for batch_index, records in enumerate(loader):
+            if batch_index >= batches_per_epoch:
+                break
             if epoch == start_epoch and batch_index < start_batch:
                 continue
             for sample_index, record in enumerate(records):
@@ -462,6 +541,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                         result.metrics.get("tail_probability_clamps", 0),
                         result.metrics.get("tail_roundoff_corrections", 0),
                         result.metrics.get("tail_complement_fallbacks", 0),
+                        result.metrics.get("token_js_sum", 0),
                     ]
                 )
                 if performance is not None:
@@ -478,12 +558,18 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     )
                 del result
             accumulated += 1
-            final_batch = epoch + 1 == epochs and batch_index + 1 == len(loader)
+            final_batch = epoch + 1 == epochs and batch_index + 1 == batches_per_epoch
             if accumulated < accumulation and not final_batch:
                 continue
             all_reduce_grad_lists([buffer])
             all_reduce_tensor(totals)
             counts = totals.cpu().tolist()
+            if method == OUTPUT_SPACE_METHOD and int(counts[0]) != int(
+                config["stage2"]["global_batch_size"]
+            ):
+                raise RuntimeError(
+                    "Phase-2 optimizer window does not match configured global batch size"
+                )
             updated, norm = apply_accumulated_update(
                 parameters,
                 buffer,
@@ -516,19 +602,28 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             }
             if method == OUTPUT_SPACE_METHOD:
                 last_metrics.update(
+                    configured_global_batch_size=int(config["stage2"]["global_batch_size"]),
+                    effective_global_batch_size=int(counts[0]),
+                    partial_batch=int(counts[0]) != int(config["stage2"]["global_batch_size"]),
                     sft_loss=counts[10] / counts[0],
                     weighted_sft_loss=counts[11] / counts[0],
                     student_tail_mass=counts[12] / counts[0],
+                    student_support_mass=1 - counts[12] / counts[0],
                     target_tail_mass=counts[13] / counts[0],
+                    target_support_mass=1 - counts[13] / counts[0],
                     target_entropy=counts[14] / counts[0],
                     tail_probability_clamps=int(counts[15]),
                     tail_roundoff_corrections=int(counts[16]),
                     tail_complement_fallbacks=int(counts[17]),
-                    js_temperature=float(config["aggregation"]["js_temperature"]),
-                    kd_temperature=float(config["aggregation"]["kd_temperature"]),
-                    disagreement_mean=counts[5] / max(counts[1], 1),
+                    temperature=float(config["aggregation"]["temperature"]),
+                    js_temperature=float(config["aggregation"]["temperature"]),
+                    kd_temperature=float(config["aggregation"]["temperature"]),
+                    tau=council["calibration"]["tau"],
+                    tau_quantile=council["calibration"]["tau_quantile"],
+                    disagreement_pooling_power=council["calibration"]["disagreement_pooling_power"],
+                    step_disagreement_mean=counts[5] / max(counts[1], 1),
                     rho_mean=counts[6] / max(counts[1], 1),
-                    js_mean=counts[5] * math.log(len(adapter_names)) / max(counts[1], 1),
+                    token_js_mean=counts[18] / max(counts[1], 1),
                 )
             else:
                 last_metrics.update(
@@ -558,7 +653,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     int(counts[1]),
                     optimizer.param_groups[0]["lr"],
                     (
-                        f" JS={last_metrics['js_mean']:.6g} nats rho={last_metrics['rho_mean']:.6g}"
+                        f" Delta={last_metrics['step_disagreement_mean']:.6g} nats rho={last_metrics['rho_mean']:.6g}"
                         if method == OUTPUT_SPACE_METHOD
                         else ""
                     ),
@@ -592,6 +687,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                     distributed.world_size,
                     last_metrics,
                     method=method,
+                    calibration=council["calibration"] if method == OUTPUT_SPACE_METHOD else None,
                 )
             buffer = zeros_like_parameters(parameters)
             totals.zero_()
@@ -615,6 +711,7 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
             distributed.world_size,
             last_metrics,
             method=method,
+            calibration=council["calibration"] if method == OUTPUT_SPACE_METHOD else None,
         )
         manifest = {
             "schema_version": 2,
@@ -653,6 +750,34 @@ def train_stage2(config: dict[str, Any], distributed: DistributedContext) -> dic
                 }
                 for rank in range(distributed.world_size)
             ]
+        if method == OUTPUT_SPACE_METHOD:
+            from .diagnostics import summarize_reasoning_logs
+
+            diagnostics = {
+                "artifact": "stage2_calibrated_diagnostics",
+                "run_fingerprint": run_hash,
+                "calibration": council["calibration"],
+                "training_corpus_cache": council["diagnostics"],
+                "observed_training": summarize_reasoning_logs(
+                    [
+                        output_dir / reasoning_log_filename(rank, distributed.world_size)
+                        for rank in range(distributed.world_size)
+                    ],
+                    run_hash,
+                )
+                if step_logger is not None
+                else {"available": False, "reason": "reasoning_steps logging disabled"},
+            }
+            write_json(output_dir / "diagnostics.json", diagnostics)
+            manifest.update(
+                disagreement_calibration=council["calibration"],
+                council_cache_version=council["cache_version"],
+                diagnostics_file="diagnostics.json",
+                diagnostics_file_sha256=file_sha256(output_dir / "diagnostics.json"),
+                training_examples_per_epoch=len(dataset) - dropped_tail_examples,
+                dropped_tail_examples_per_epoch=dropped_tail_examples,
+                incomplete_batch_policy="drop",
+            )
         if performance is not None:
             manifest["performance_logs"] = [
                 {

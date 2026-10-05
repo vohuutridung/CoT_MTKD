@@ -8,19 +8,19 @@ from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
-
-from test_output_space_online import output_config
+from test_output_space_online import compile_fixture_target, output_config
 from test_stage2_online import tiny_online_council, two_step_record
-from cot_mtkd.stage1.kneedle import build_union_support, local_k_from_probe
+
 from cot_mtkd.models.chunked_head import full_vocab_probe
+from cot_mtkd.stage1.kneedle import build_union_support, local_k_from_probe
 from cot_mtkd.stage2.council_cache import (
     CACHE_VERSION,
     CouncilCache,
     cache_identity,
-    compile_record,
     select_best_expert,
     validate_council_config,
 )
+from cot_mtkd.stage2.disagreement import fit_disagreement_calibration
 from cot_mtkd.stage2.output_space import unpack_cached_target
 from cot_mtkd.stage2.output_space_losses import support_from_probes
 from cot_mtkd.utils.manifest import file_sha256, fingerprint, write_json
@@ -88,7 +88,7 @@ class CouncilCacheTest(unittest.TestCase):
 
     def test_cache_roundtrip_preserves_support_js_target_and_checksums(self):
         model, names, _ = tiny_online_council(False)
-        value, _, _ = compile_record(
+        value, _, _ = compile_fixture_target(
             model, names, two_step_record(), output_config(), torch.device("cpu")
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -113,6 +113,8 @@ class CouncilCacheTest(unittest.TestCase):
                     "fingerprint": key,
                     "identity": identity,
                     "records": 1,
+                    "steps": len(value["step_disagreement"]),
+                    "calibration": fit_disagreement_calibration(value["step_disagreement"]),
                     "index_file": "index.json",
                     "index_file_sha256": file_sha256(root / "index.json"),
                 },
@@ -130,7 +132,7 @@ class CouncilCacheTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
                 CouncilCache(root, key).get("sample")
 
-    def test_identity_invalidates_static_changes_but_never_epoch_or_sft_weight(self):
+    def test_identity_invalidates_calibration_temperature_sft_but_not_epoch_or_batch(self):
         config = output_config()
         config["model"] = {"name_or_path": "fixture", "dtype": "float32"}
         prepared = {"data_file_sha256": "data", "tokenizer_fingerprint": "tokenizer"}
@@ -147,14 +149,15 @@ class CouncilCacheTest(unittest.TestCase):
             self.assertEqual(original, fingerprint(cache_identity(changed, prepared, teachers)))
         changed = copy.deepcopy(config)
         changed["aggregation"]["sft_weight"] = 0.5
-        self.assertEqual(original, fingerprint(cache_identity(changed, prepared, teachers)))
+        self.assertNotEqual(original, fingerprint(cache_identity(changed, prepared, teachers)))
         for revision in (None, "legacy-pin", "different-legacy-pin"):
             changed = copy.deepcopy(config)
             changed["model"]["revision"] = revision
             self.assertEqual(original, fingerprint(cache_identity(changed, prepared, teachers)))
         for section, field, value in (
-            ("aggregation", "js_temperature", 2.0),
-            ("aggregation", "kd_temperature", 1.0),
+            ("aggregation", "temperature", 2.0),
+            ("aggregation", "disagreement_pooling_power", 1.0),
+            ("aggregation", "tau_quantile", 0.5),
             ("stage2", "max_length", 32),
             ("model", "name_or_path", "different-model"),
         ):
@@ -172,10 +175,14 @@ class CouncilCacheTest(unittest.TestCase):
         for field, value in (
             ("search_k", 256),
             ("k_min", 4),
-            ("temperature", 2.0),
+            ("js_temperature", 1.0),
             ("k_max", 64),
             ("sft_weight", -1),
-            ("kd_temperature", float("nan")),
+            ("temperature", float("nan")),
+            ("temperature", 0.0),
+            ("disagreement_pooling_power", 0.0),
+            ("tau_quantile", 0.0),
+            ("tau_quantile", 1.0),
         ):
             changed = copy.deepcopy(config)
             changed["aggregation"][field] = value
@@ -184,22 +191,24 @@ class CouncilCacheTest(unittest.TestCase):
 
     def test_default_configs_and_global_batch_boundaries(self):
         import yaml
-        from cot_mtkd.stage2.trainer import gradient_accumulation_steps, _validate_stage2_config
+
+        from cot_mtkd.stage2.trainer import _validate_stage2_config, gradient_accumulation_steps
 
         root = Path(__file__).resolve().parents[1]
         for filename in ("qwen25_7b_output_space.yaml", "qwen25_7b_output_space_local.yaml"):
             config = yaml.safe_load((root / "configs" / "stage2" / filename).read_text())
             _validate_stage2_config(config)
             self.assertEqual(config["stage2"]["epochs"], 1)
-            self.assertEqual(config["stage2"]["global_batch_size"], 8)
+            self.assertEqual(config["stage2"]["global_batch_size"], 16)
             self.assertEqual(config["stage2"]["micro_batch_size"], 1)
-            self.assertEqual(config["aggregation"]["js_temperature"], 1.0)
-            self.assertEqual(config["aggregation"]["kd_temperature"], 2.0)
-            self.assertEqual(config["aggregation"]["sft_weight"], 0.25)
+            self.assertEqual(config["aggregation"]["temperature"], 1.0)
+            self.assertEqual(config["aggregation"]["disagreement_pooling_power"], 4.0)
+            self.assertEqual(config["aggregation"]["tau_quantile"], 0.75)
+            self.assertEqual(config["aggregation"]["sft_weight"], 0.01)
             self.assertNotIn("medoid", config["paths"])
-            for world, expected in ((1, 8), (2, 4), (4, 2), (8, 1)):
+            for world, expected in ((1, 16), (2, 8), (4, 4), (8, 2), (16, 1)):
                 self.assertEqual(gradient_accumulation_steps(config["stage2"], world), expected)
-            for world in (3, 16, 32, 0):
+            for world in (3, 32, 0):
                 with self.assertRaises(ValueError):
                     gradient_accumulation_steps(config["stage2"], world)
             changed = copy.deepcopy(config["stage2"])
@@ -208,13 +217,14 @@ class CouncilCacheTest(unittest.TestCase):
                 gradient_accumulation_steps(changed, 1)
             changed["gradient_accumulation_steps"] = None
             changed["micro_batch_size"] = 2
-            self.assertEqual(gradient_accumulation_steps(changed, 4), 1)
+            self.assertEqual(gradient_accumulation_steps(changed, 4), 2)
             changed["micro_batch_size"] = 1.5
             with self.assertRaises(ValueError):
                 gradient_accumulation_steps(changed, 4)
 
     def test_initializer_copies_full_winning_adapter_and_instantiates_only_student(self):
         from types import SimpleNamespace
+
         from cot_mtkd.models.multi_adapter import extract_adapter_state
         from cot_mtkd.stage2.initialization import create_cached_student
 
@@ -243,6 +253,18 @@ class CouncilCacheTest(unittest.TestCase):
             create.assert_called_once_with({}, {}, torch.device("cpu"), 42)
             for key, tensor in extract_adapter_state(actual, "student").items():
                 torch.testing.assert_close(tensor, winner[key], atol=0, rtol=0)
+
+    def test_full_global_batches_omit_only_incomplete_window_including_partial_microbatch(self):
+        from cot_mtkd.stage2.trainer import full_global_batch_plan
+
+        stage2 = {"micro_batch_size": 1, "global_batch_size": 16}
+        for world, expected in ((1, 992), (2, 496), (4, 248)):
+            self.assertEqual(full_global_batch_plan(996, stage2, world), (expected, 4))
+        stage2["micro_batch_size"] = 2
+        self.assertEqual(full_global_batch_plan(31, stage2, 1), (8, 15))
+        self.assertEqual(full_global_batch_plan(32, stage2, 1), (16, 0))
+        with self.assertRaisesRegex(ValueError, "smaller than one full"):
+            full_global_batch_plan(15, stage2, 1)
 
 
 if __name__ == "__main__":

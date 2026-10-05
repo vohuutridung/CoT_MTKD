@@ -22,6 +22,14 @@ from ..models.multi_adapter import (
 )
 from ..utils.distributed import all_reduce_tensor, barrier, shard_indices
 from ..utils.manifest import file_sha256, fingerprint, read_json, require_file_sha256, write_json
+from .disagreement import (
+    POOLING_METHOD,
+    RHO_MAPPING,
+    fit_disagreement_calibration,
+    pool_token_disagreement,
+    saturation_rho,
+    validate_calibration,
+)
 from .online import _select_adapter
 from .output_space import plan_record
 from .output_space_losses import (
@@ -34,24 +42,32 @@ from .output_space_losses import (
 from .teachers import ensure_stage2_teachers, require_teacher_dataset
 
 LOGGER = logging.getLogger(__name__)
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 SUPPORT_SEMANTICS = "phase1-local-nontarget-kneedle-union-plus-gold-ascending-unique-v1"
 MASK_SEMANTICS = "complete-retained-REASONING-content-only-token-step-sample-v1"
 
 
 def validate_council_config(config: dict[str, Any]) -> None:
     a = config["aggregation"]
-    for key in ("js_temperature", "kd_temperature"):
+    for key in ("temperature", "disagreement_pooling_power"):
+        if key not in a:
+            raise ValueError(f"Missing aggregation.{key}; use the calibrated Phase-2 config")
         if not math.isfinite(float(a[key])) or float(a[key]) <= 0:
             raise ValueError(f"aggregation.{key} must be finite and positive")
+    if (
+        "tau_quantile" not in a
+        or not math.isfinite(float(a["tau_quantile"]))
+        or not 0 < float(a["tau_quantile"]) < 1
+    ):
+        raise ValueError("aggregation.tau_quantile must lie strictly between 0 and 1")
     if not math.isfinite(float(a["sft_weight"])) or float(a["sft_weight"]) < 0:
         raise ValueError("aggregation.sft_weight must be finite and nonnegative")
     if a["search_k"] != 512 or a["k_min"] != 8:
         raise ValueError("Phase 2 reuses Phase-1 local Kneedle: search_k=512, k_min=8, no k_max")
     if a.get("teacher_execution") != "precomputed_support_tail":
         raise ValueError("Use precomputed_support_tail teacher execution")
-    if any(key in a for key in ("temperature", "medoid_temperature", "k_max")):
-        raise ValueError("Obsolete aggregation configuration")
+    if any(key in a for key in ("js_temperature", "kd_temperature", "medoid_temperature", "k_max")):
+        raise ValueError("Obsolete aggregation configuration; use one aggregation.temperature")
     if any(
         k in config["runtime"] for k in ("teacher_hidden_storage", "teacher_probability_cache_gib")
     ):
@@ -63,7 +79,7 @@ def validate_council_config(config: dict[str, Any]) -> None:
 
 
 def cache_identity(config: dict[str, Any], prepared: dict, teachers: dict) -> dict:
-    """Epoch, optimizer, batch size, sft_weight and resume never affect static q."""
+    """Bind the revised formulation; epochs/batch/optimizer/resume remain independent."""
     source = Path(__file__).resolve().parents[1]
     code_files = [
         "stage1/kneedle.py",
@@ -72,6 +88,7 @@ def cache_identity(config: dict[str, Any], prepared: dict, teachers: dict) -> di
         "stage2/council_cache.py",
         "stage2/output_space_losses.py",
         "stage2/output_space.py",
+        "stage2/disagreement.py",
         "data/token_spans.py",
         "data/schema.py",
     ]
@@ -84,19 +101,22 @@ def cache_identity(config: dict[str, Any], prepared: dict, teachers: dict) -> di
         "teacher_bundle_sha256": teachers["adapter_bundle_sha256"],
         "teacher_checkpoint_checksums": teachers.get("hub_file_sha256", {}),
         "backbone": {
-            k: config["model"].get(k)
-            for k in ("name_or_path", "dtype", "attn_implementation")
+            k: config["model"].get(k) for k in ("name_or_path", "dtype", "attn_implementation")
         },
         "tokenizer_fingerprint": prepared["tokenizer_fingerprint"],
         "search_k": int(config["aggregation"]["search_k"]),
         "k_min": int(config["aggregation"]["k_min"]),
-        "js_temperature": float(config["aggregation"]["js_temperature"]),
-        "kd_temperature": float(config["aggregation"]["kd_temperature"]),
+        "temperature": float(config["aggregation"]["temperature"]),
+        "disagreement_pooling_method": POOLING_METHOD,
+        "disagreement_pooling_power": float(config["aggregation"]["disagreement_pooling_power"]),
+        "tau_quantile": float(config["aggregation"]["tau_quantile"]),
+        "rho_mapping": RHO_MAPPING,
+        "sft_weight": float(config["aggregation"]["sft_weight"]),
         "max_length": int(config["stage2"]["max_length"]),
         "lm_head_chunk_tokens": int(config["runtime"]["lm_head_chunk_tokens"]),
         "support_semantics": SUPPORT_SEMANTICS,
         "mask_semantics": MASK_SEMANTICS,
-        "storage": "int32-ragged-support-float32-log-target-float64-js-rho-v1",
+        "storage": "int32-ragged-support-float32-log-target-float64-delta-calibrated-rho-v2",
         "torch_version": str(torch.__version__),
     }
 
@@ -118,8 +138,10 @@ def distribution_summary(values: torch.Tensor) -> dict:
         "count": len(values),
         "mean": float(values.mean()),
         "median": float(torch.quantile(values, 0.5)),
+        "p75": float(torch.quantile(values, 0.75)),
         "p90": float(torch.quantile(values, 0.90)),
         "p95": float(torch.quantile(values, 0.95)),
+        "p99": float(torch.quantile(values, 0.99)),
         "max": float(values.max()),
         "min": float(values.min()),
         "histogram": torch.histc(values, bins=20, min=histogram_low, max=histogram_high)
@@ -129,15 +151,25 @@ def distribution_summary(values: torch.Tensor) -> dict:
     }
 
 
+def threshold_summary(values: torch.Tensor, thresholds: tuple[float, ...]) -> dict:
+    summary = distribution_summary(values)
+    if len(values):
+        summary["fraction_above"] = {
+            f"{threshold:.2f}": float((values.double() > threshold).double().mean())
+            for threshold in thresholds
+        }
+    return summary
+
+
 @torch.no_grad()
 def compile_record(
     model, names, record, config, device
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict]:
-    """One decoder forward/expert/sample; SFT scoring shares the q pass.
+    """First pass: frozen teacher support+tail values and uncalibrated step scores.
 
     The first bounded head sweep reuses full_vocab_probe (gold exclusion) and
     Phase-1 Kneedle. A second head sweep computes logZ and reduced categories.
-    Reduced teacher values survive only within one step until its rho is known.
+    Ragged reduced teacher values are staged until the corpus quantile is fitted.
     No full teacher probability vector is constructed or persisted.
     """
     if len(names) != 3:
@@ -152,10 +184,10 @@ def compile_record(
         "step_offsets": torch.tensor(step_offsets, dtype=torch.int64),
         "support_offsets": torch.zeros(len(positions) + 1, dtype=torch.int64),
         "support_ids": torch.empty(0, dtype=torch.int32),
-        "support_log_target": torch.empty(0, dtype=torch.float32),
-        "tail_log_target": torch.empty(len(positions), dtype=torch.float32),
-        "step_js": torch.empty(plan.num_steps, dtype=torch.float64),
-        "step_rho": torch.empty(plan.num_steps, dtype=torch.float64),
+        "teacher_support_log_probabilities": torch.empty((3, 0), dtype=torch.float32),
+        "teacher_tail_log_probabilities": torch.empty((3, len(positions)), dtype=torch.float32),
+        "token_js_mean": torch.empty(plan.num_steps, dtype=torch.float64),
+        "step_disagreement": torch.empty(plan.num_steps, dtype=torch.float64),
         "raw_k": torch.empty((3, len(positions)), dtype=torch.int16),
         "selected_k": torch.empty((3, len(positions)), dtype=torch.int16),
         "union_sizes": torch.empty(len(positions), dtype=torch.int16),
@@ -183,7 +215,7 @@ def compile_record(
     parameter = next(head.parameters())
     chunk = int(config["runtime"]["lm_head_chunk_tokens"])
     a = config["aggregation"]
-    all_ids, all_logq = [], []
+    all_ids, all_teacher_logs = [], []
     cursor = 0
     for step_index, step in enumerate(plan.step_positions):
         targets = torch.tensor([record.input_ids[p] for p in step], device=parameter.device)
@@ -206,7 +238,7 @@ def compile_record(
         )
         del probes
         step_reduced = []
-        js_sum = 0.0
+        token_js_chunks = []
         for start in range(0, len(step), chunk):
             end = min(len(step), start + chunk)
             local_ids, local_mask = support[start:end], mask[start:end]
@@ -217,12 +249,12 @@ def compile_record(
                 ).float()
                 js_values.append(
                     local_js_log_distribution(
-                        logits, local_ids, local_mask, float(a["js_temperature"])
+                        logits, local_ids, local_mask, float(a["temperature"])
                     )
                 )
                 reduced.append(
                     reduced_log_distribution(
-                        logits, local_ids, local_mask, float(a["kd_temperature"]), stats
+                        logits, local_ids, local_mask, float(a["temperature"]), stats
                     ).double()
                 )
                 nll = torch.logsumexp(logits, -1) - logits.gather(
@@ -230,20 +262,26 @@ def compile_record(
                 ).squeeze(-1)
                 scores[expert] += nll.double().sum().cpu() / (len(step) * plan.num_steps)
                 del logits
-            js_sum += float(normalized_js_disagreement(torch.stack(js_values)).sum()) * math.log(3)
+            token_js_chunks.append(
+                (normalized_js_disagreement(torch.stack(js_values)) * math.log(3)).cpu()
+            )
             step_reduced.append(torch.stack(reduced).cpu())
-        js = js_sum / len(step)
-        rho = min(1.0, max(0.0, js / math.log(3)))
-        tensors["step_js"][step_index], tensors["step_rho"][step_index] = js, rho
+        token_js = torch.cat(token_js_chunks)
+        tensors["token_js_mean"][step_index] = token_js.mean()
+        tensors["step_disagreement"][step_index] = pool_token_disagreement(
+            token_js, float(a["disagreement_pooling_power"])
+        )
         # Ragged persistence: concatenate only valid support categories; tail
         # remains one FP32 log probability per supervised token.
         for chunk_index, start in enumerate(range(0, len(step), chunk)):
             end = min(len(step), start + chunk)
-            q = power_mean_log_target(step_reduced[chunk_index], rho)
+            reduced = step_reduced[chunk_index]
             valid = mask[start:end].cpu()
             all_ids.append(support[start:end].cpu()[valid].int())
-            all_logq.append(q[:, :-1][valid].float())
-            tensors["tail_log_target"][cursor + start : cursor + end] = q[:, -1].float()
+            all_teacher_logs.append(reduced[:, :, :-1][:, valid].float())
+            tensors["teacher_tail_log_probabilities"][:, cursor + start : cursor + end] = reduced[
+                :, :, -1
+            ].float()
         tensors["raw_k"][:, cursor : cursor + len(step)] = metadata["raw_k"].cpu().short()
         tensors["selected_k"][:, cursor : cursor + len(step)] = metadata["selected_k"].cpu().short()
         tensors["union_sizes"][cursor : cursor + len(step)] = metadata["union_sizes"].cpu().short()
@@ -256,8 +294,47 @@ def compile_record(
         ][cursor] + sizes.cumsum(0)
         cursor += len(step)
     tensors["support_ids"] = torch.cat(all_ids)
-    tensors["support_log_target"] = torch.cat(all_logq)
+    tensors["teacher_support_log_probabilities"] = torch.cat(all_teacher_logs, dim=1)
     return tensors, scores, stats
+
+
+@torch.no_grad()
+def finalize_record(
+    value: dict[str, torch.Tensor],
+    calibration: dict,
+    config: dict,
+) -> dict[str, torch.Tensor]:
+    """Second pass, CPU only: one corpus-fitted rho per step, no teacher forwards."""
+    validate_calibration(calibration, config["aggregation"])
+    result = {k: v for k, v in value.items() if not k.startswith("teacher_")}
+    result["step_rho"] = saturation_rho(value["step_disagreement"], calibration["tau"])
+    for key in ("tau", "tau_quantile", "disagreement_pooling_power"):
+        result[key] = torch.tensor(calibration[key], dtype=torch.float64)
+    result["temperature"] = torch.tensor(config["aggregation"]["temperature"], dtype=torch.float64)
+    offsets = value["support_offsets"]
+    result["support_log_target"] = torch.empty_like(value["teacher_support_log_probabilities"][0])
+    result["tail_log_target"] = torch.empty_like(value["teacher_tail_log_probabilities"][0])
+    chunk = int(config["runtime"]["lm_head_chunk_tokens"])
+    for step, (begin, end) in enumerate(
+        zip(value["step_offsets"][:-1], value["step_offsets"][1:], strict=True)
+    ):
+        for start in range(int(begin), int(end), chunk):
+            stop = min(int(end), start + chunk)
+            sizes = offsets[start + 1 : stop + 1] - offsets[start:stop]
+            width = int(sizes.max())
+            teacher = torch.full((3, stop - start, width + 1), -1e30, dtype=torch.float64)
+            for t in range(start, stop):
+                lo, hi = map(int, offsets[t : t + 2])
+                teacher[:, t - start, : hi - lo] = value["teacher_support_log_probabilities"][
+                    :, lo:hi
+                ]
+            teacher[:, :, -1] = value["teacher_tail_log_probabilities"][:, start:stop]
+            q = power_mean_log_target(teacher, float(result["step_rho"][step]))
+            for t in range(start, stop):
+                lo, hi = map(int, offsets[t : t + 2])
+                result["support_log_target"][lo:hi] = q[t - start, : hi - lo].float()
+            result["tail_log_target"][start:stop] = q[:, -1].float()
+    return result
 
 
 class CouncilCache:
@@ -270,12 +347,17 @@ class CouncilCache:
             self.manifest.get("artifact") != "stage2_council_cache"
             or self.manifest.get("cache_version") != CACHE_VERSION
         ):
-            raise RuntimeError("Council cache version mismatch")
+            raise RuntimeError(
+                "Council cache version mismatch; rebuild stage2-cache for calibrated Phase 2"
+            )
         if (
             self.manifest.get("fingerprint") != expected_fingerprint
             or fingerprint(self.manifest["identity"]) != expected_fingerprint
         ):
             raise RuntimeError("Council cache fingerprint mismatch")
+        validate_calibration(self.manifest.get("calibration", {}))
+        if self.manifest["calibration"]["num_reasoning_steps"] != self.manifest["steps"]:
+            raise RuntimeError("Council cache calibration step count mismatch")
         self.index = read_json(
             require_file_sha256(self.directory, self.manifest, "index_file", "index_file_sha256")
         )
@@ -302,7 +384,17 @@ class CouncilCache:
             if file_sha256(path) != entry["sha256"]:
                 raise RuntimeError(f"Council cache content checksum mismatch: {sample_id}")
             self.verified.add(sample_id)
-        return load_file(str(path), device="cpu")
+        value = load_file(str(path), device="cpu")
+        calibration = self.manifest["calibration"]
+        for key in ("tau", "tau_quantile", "disagreement_pooling_power"):
+            if key not in value or float(value[key]) != float(calibration[key]):
+                raise RuntimeError(
+                    f"{sample_id}: missing/mismatched calibrated {key}; rebuild stage2-cache"
+                )
+        expected_rho = saturation_rho(value["step_disagreement"], calibration["tau"])
+        if not torch.equal(value["step_rho"], expected_rho):
+            raise RuntimeError(f"{sample_id}: calibrated rho mismatch")
+        return value
 
     def verify_all(self) -> None:
         for sample_id, entry in self.index.items():
@@ -312,12 +404,14 @@ class CouncilCache:
 
 
 def load_council_cache(config: dict, prepared: dict, teachers: dict) -> CouncilCache:
+    validate_council_config(config)
     identity = cache_identity(config, prepared, teachers)
     key = fingerprint(identity)
     root = Path(config["paths"]["teacher_cache_dir"]) / key
     if not (root / "manifest.json").exists():
         raise RuntimeError(f"Council cache miss ({key}); run stage2-cache before training")
     cache = CouncilCache(root, key)
+    validate_calibration(cache.manifest["calibration"], config["aggregation"])
     cache.verify_all()
     LOGGER.info(
         "Council cache hit fingerprint=%s samples=%d disk_bytes=%d",
@@ -397,21 +491,21 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
             raise RuntimeError("Duplicate prepared sample ID")
         value, scores, stats = compile_record(model, names, record, config, distributed.device)
         filename = f"sample-{i:07d}.safetensors"
-        temporary = root / (filename + ".tmp")
+        temporary = root / (filename + ".uncalibrated.tmp")
         save_file(
             value,
             str(temporary),
             metadata={"format": f"cot-mtkd-council-v{CACHE_VERSION}", "fingerprint": cache_key},
         )
-        temporary.replace(root / filename)
-        index[record.sample_id] = {"file": filename, "sha256": file_sha256(root / filename)}
+        temporary.replace(root / (filename + ".uncalibrated"))
+        index[record.sample_id] = {"file": filename}
         sums += scores.to(distributed.device)
         counts += counts.new_tensor(
             [
                 1,
                 len(value["token_positions"]),
-                len(value["step_js"]),
-                int(len(value["step_js"]) == 0),
+                len(value["step_disagreement"]),
+                int(len(value["step_disagreement"]) == 0),
             ]
         )
         for key, number in stats.items():
@@ -420,6 +514,53 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
     write_json(root / f"stats-rank{distributed.rank}.json", rank_stats)
     all_reduce_tensor(sums)
     all_reduce_tensor(counts)
+    barrier()
+    # All ranks have completed the frozen-council pass. Fit exactly once from
+    # all valid training steps, unweighted by sample/step length, on rank zero.
+    if distributed.is_main:
+        pending = {}
+        training_disagreements = []
+        for rank in range(distributed.world_size):
+            rank_index = read_json(root / f"index-rank{rank}.json")
+            if set(pending) & set(rank_index):
+                raise RuntimeError("Duplicate council samples across ranks")
+            pending.update(rank_index)
+        if len(pending) != len(dataset) or not int(counts[1]):
+            raise RuntimeError("Council cache incomplete or no reasoning tokens")
+        for entry in pending.values():
+            v = load_file(str(root / (entry["file"] + ".uncalibrated")))
+            training_disagreements.append(v["step_disagreement"])
+        try:
+            calibration = fit_disagreement_calibration(
+                torch.cat(training_disagreements),
+                float(config["aggregation"]["disagreement_pooling_power"]),
+                float(config["aggregation"]["tau_quantile"]),
+            )
+            write_json(root / "calibration.json", calibration)
+        except ValueError as error:
+            # Publish the failure so other ranks do not wait at a barrier forever.
+            write_json(root / "calibration.json", {"error": str(error)})
+    barrier()
+    calibration = read_json(root / "calibration.json")
+    if "error" in calibration:
+        raise RuntimeError(calibration["error"])
+    validate_calibration(calibration, config["aggregation"])
+    for entry in tqdm(index.values(), desc=f"Calibrate cached targets rank {distributed.rank}"):
+        pending_path = root / (entry["file"] + ".uncalibrated")
+        value = finalize_record(load_file(str(pending_path)), calibration, config)
+        temporary = root / (entry["file"] + ".tmp")
+        save_file(
+            value,
+            str(temporary),
+            metadata={
+                "format": f"cot-mtkd-council-v{CACHE_VERSION}",
+                "fingerprint": cache_key,
+            },
+        )
+        temporary.replace(root / entry["file"])
+        entry["sha256"] = file_sha256(root / entry["file"])
+        pending_path.unlink()
+    write_json(root / f"index-rank{distributed.rank}.json", index)
     barrier()
     if distributed.is_main:
         combined, anomalies = {}, {}
@@ -438,9 +579,13 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
             for key in (
                 "support_size",
                 "union_size",
-                "js",
+                "token_js_mean",
+                "step_disagreement",
                 "rho",
                 "target_tail_mass",
+                "target_support_mass",
+                "step_target_tail_mass",
+                "step_support_size",
                 "raw_k",
                 "selected_k",
                 "gold_present",
@@ -448,12 +593,33 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
         }
         for entry in combined.values():
             v = load_file(str(root / entry["file"]))
+            support_sizes = v["support_offsets"].diff()
             for key, tensor in {
-                "support_size": v["support_offsets"].diff(),
+                "support_size": support_sizes,
                 "union_size": v["union_sizes"],
-                "js": v["step_js"],
+                "token_js_mean": v["token_js_mean"],
+                "step_disagreement": v["step_disagreement"],
                 "rho": v["step_rho"],
                 "target_tail_mass": v["tail_log_target"].exp(),
+                "target_support_mass": 1 - v["tail_log_target"].exp(),
+                "step_target_tail_mass": torch.tensor(
+                    [
+                        float(v["tail_log_target"][begin:end].exp().mean())
+                        for begin, end in zip(
+                            v["step_offsets"][:-1], v["step_offsets"][1:], strict=True
+                        )
+                    ],
+                    dtype=torch.float64,
+                ),
+                "step_support_size": torch.tensor(
+                    [
+                        float(support_sizes[begin:end].double().mean())
+                        for begin, end in zip(
+                            v["step_offsets"][:-1], v["step_offsets"][1:], strict=True
+                        )
+                    ],
+                    dtype=torch.float64,
+                ),
                 "raw_k": v["raw_k"],
                 "selected_k": v["selected_k"],
                 "gold_present": v["gold_present_before_add"],
@@ -471,6 +637,9 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
             diagnostics[key + "_histogram_by_expert"] = [
                 torch.bincount(row.long(), minlength=513).tolist() for row in per_expert
             ]
+        for key in ("target_tail_mass", "step_target_tail_mass"):
+            diagnostics[key] = threshold_summary(torch.cat(summaries[key]), (0.10, 0.25, 0.50))
+        diagnostics["rho"] = threshold_summary(torch.cat(summaries["rho"]), (0.25, 0.50, 0.75))
         scores = sums / len(dataset)
         best = select_best_expert(scores)
         best_path = root / "best_expert.pt"
@@ -482,6 +651,11 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
         manifest = {
             "artifact": "stage2_council_cache",
             "cache_version": CACHE_VERSION,
+            "calibration": calibration,
+            "tau": calibration["tau"],
+            "tau_quantile": calibration["tau_quantile"],
+            "disagreement_pooling_power": calibration["disagreement_pooling_power"],
+            "temperature": float(config["aggregation"]["temperature"]),
             "fingerprint": cache_key,
             "identity": identity,
             "records": len(combined),
@@ -512,6 +686,9 @@ def build_council_cache(config: dict[str, Any], distributed) -> dict:
             "cache_status_at_creation": "miss",
         }
         write_json(root / "manifest.json", manifest)
+        LOGGER.info(
+            "Phase 2 fitted training calibration=%s diagnostics=%s", calibration, diagnostics
+        )
         LOGGER.info(
             "Council cache built: expert_sft=%s selected=%s anomalies=%s wall=%.1fs bytes=%d",
             manifest["expert_sft_scores"],

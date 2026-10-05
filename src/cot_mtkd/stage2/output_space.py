@@ -11,6 +11,7 @@ from ..data.schema import PreparedRecord, TokenRegion
 from ..data.token_spans import validate_token_contract
 from ..models.chunked_head import decoder_and_lm_head, forward_hidden
 from ..utils.training import zeros_like_parameters
+from .disagreement import saturation_rho
 from .online import Phase2RecordPlan, RecordGradientResult, _select_adapter
 from .output_space_losses import cached_kd_sft_hidden_gradient
 
@@ -92,6 +93,26 @@ def compute_record_gradient(
     """Student-only training from validated static support+tail supervision."""
     if cached_target is None:
         raise RuntimeError("Output-space training requires a council cache; run stage2-cache")
+    required = (
+        "tau",
+        "tau_quantile",
+        "disagreement_pooling_power",
+        "temperature",
+        "step_disagreement",
+        "token_js_mean",
+        "step_rho",
+    )
+    if any(key not in cached_target for key in required):
+        raise RuntimeError("Missing fitted tau/calibrated target; rebuild stage2-cache")
+    aggregation = config["aggregation"]
+    for key in ("tau_quantile", "disagreement_pooling_power", "temperature"):
+        if float(cached_target[key]) != float(aggregation[key]):
+            raise RuntimeError(f"Cached {key} disagrees with Phase-2 config; rebuild stage2-cache")
+    tau = float(cached_target["tau"])
+    if not torch.equal(
+        cached_target["step_rho"], saturation_rho(cached_target["step_disagreement"], tau)
+    ):
+        raise RuntimeError("Cached calibrated rho is inconsistent; rebuild stage2-cache")
     plan = plan_record(record, tokenizer, int(config["stage2"]["max_length"]))
     timers: dict[str, float] = {}
     if not plan.num_steps:
@@ -153,7 +174,7 @@ def compute_record_gradient(
         mask,
         logq,
         weights,
-        float(aggregation["kd_temperature"]),
+        float(aggregation["temperature"]),
         float(aggregation["sft_weight"]),
         chunk,
         anomalies,
@@ -180,19 +201,25 @@ def compute_record_gradient(
                 "n_tokens": len(step),
                 "token_start": step[0],
                 "token_end": step[-1] + 1,
-                "js_mean": float(cached_target["step_js"][index]),
+                "token_js_mean": float(cached_target["token_js_mean"][index]),
                 "js_units": "nats",
+                "step_disagreement": float(cached_target["step_disagreement"][index]),
+                "disagreement_pooling_power": float(aggregation["disagreement_pooling_power"]),
+                "tau": tau,
+                "tau_quantile": float(aggregation["tau_quantile"]),
                 "rho": float(cached_target["step_rho"][index]),
-                "js_normalized": float(cached_target["step_rho"][index]),
-                "js_temperature": float(aggregation["js_temperature"]),
-                "kd_temperature": float(aggregation["kd_temperature"]),
+                "temperature": float(aggregation["temperature"]),
+                "js_temperature": float(aggregation["temperature"]),
+                "kd_temperature": float(aggregation["temperature"]),
                 "teacher_count": len(adapter_names),
                 "step_kd_loss": step_kd,
                 "step_sft_loss": step_sft,
                 "weighted_sft_loss": float(aggregation["sft_weight"]) * step_sft,
                 "step_total_loss": step_kd + float(aggregation["sft_weight"]) * step_sft,
                 "target_tail_mass": float(logq[start:end, -1].exp().mean()),
+                "target_support_mass": float((1 - logq[start:end, -1].exp()).mean()),
                 "student_tail_mass": float(tokens["student_tail"][start:end].mean()),
+                "student_support_mass": float((1 - tokens["student_tail"][start:end]).mean()),
                 "target_entropy": float(tokens["entropy"][start:end].mean()),
                 "support_size_mean": float(mask[start:end].sum(-1).float().mean()),
             }
@@ -204,13 +231,16 @@ def compute_record_gradient(
         plan.num_steps,
         plan.discarded_steps,
         {
-            "disagreement_sum": float(cached_target["step_rho"].sum()),
+            "disagreement_sum": float(cached_target["step_disagreement"].sum()),
+            "token_js_sum": float(cached_target["token_js_mean"].sum()),
             "rho_sum": float(cached_target["step_rho"].sum()),
             "kd_loss": kd,
             "sft_loss": sft,
             "weighted_sft_loss": weighted,
             "student_tail_mass": float((tokens["student_tail"] * weights).sum()),
+            "student_support_mass": float(((1 - tokens["student_tail"]) * weights).sum()),
             "target_tail_mass": float((logq[:, -1].exp() * weights).sum()),
+            "target_support_mass": float(((1 - logq[:, -1].exp()) * weights).sum()),
             "target_entropy": float((tokens["entropy"] * weights).sum()),
             "prefix_tokens": len(plan.input_ids),
             "reasoning_tokens": len(positions),

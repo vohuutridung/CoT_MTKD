@@ -543,8 +543,11 @@ def main() -> None:
             "lora_dropout": float(config["lora"]["dropout"]),
             **(
                 {
-                    "js_temperature": float(config["aggregation"]["js_temperature"]),
-                    "kd_temperature": float(config["aggregation"]["kd_temperature"]),
+                    "temperature": float(config["aggregation"]["temperature"]),
+                    "disagreement_pooling_power": float(
+                        config["aggregation"]["disagreement_pooling_power"]
+                    ),
+                    "tau_quantile": float(config["aggregation"]["tau_quantile"]),
                     "sft_weight": float(config["aggregation"]["sft_weight"]),
                 }
                 if output_space
@@ -618,13 +621,13 @@ def main() -> None:
         load_start = time.perf_counter()
         distributed = DistributedContext(0, 0, 1, device)
         if output_space:
-            from ..stage2.council_cache import compile_record, load_council_cache
-            from ..stage2.initialization import create_cached_student
             from ..models.multi_adapter import (
                 create_multi_adapter_model,
                 load_adapter_bundle,
                 load_adapter_state,
             )
+            from ..stage2.council_cache import compile_record, finalize_record, load_council_cache
+            from ..stage2.initialization import create_cached_student
 
             cache = load_council_cache(config, manifests["prepared"], manifests["stage1"])
             # Synthetic trajectories cannot reuse the real record's target.
@@ -637,7 +640,12 @@ def main() -> None:
             bundle = load_adapter_bundle(bundle_path)
             for name in names:
                 load_adapter_state(teachers, name, bundle[name])
-            synthetic_target, _, _ = compile_record(teachers, names, synthetic, config, device)
+            pending_target, _, _ = compile_record(teachers, names, synthetic, config, device)
+            # A stress-only synthetic sequence must never refit the corpus scale.
+            synthetic_target = finalize_record(
+                pending_target, cache.manifest["calibration"], config
+            )
+            report["disagreement_calibration"] = cache.manifest["calibration"]
             del teachers, bundle
             torch.cuda.empty_cache()
             report["synthetic_preprocessing_seconds_excluded_from_training"] = (

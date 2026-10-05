@@ -394,9 +394,10 @@ class Stage2UpdateTest(unittest.TestCase):
                 "_project_root": str(root),
             }
             config["aggregation"] = {
-                "js_temperature": 1.0,
-                "kd_temperature": 2.0,
-                "sft_weight": 0.25,
+                "temperature": 1.0,
+                "disagreement_pooling_power": 4.0,
+                "tau_quantile": 0.75,
+                "sft_weight": 0.01,
                 "search_k": 512,
                 "k_min": 8,
                 "teacher_execution": "precomputed_support_tail",
@@ -446,7 +447,23 @@ class Stage2UpdateTest(unittest.TestCase):
                 self.assertEqual(checkpoint["method"], method)
                 if method == OUTPUT_SPACE_METHOD:
                     self.assertEqual(manifest["loss_scalars"]["active_steps"], 4)
-                    self.assertIn("disagreement_mean", manifest["loss_scalars"])
+                    self.assertEqual(
+                        manifest["disagreement_calibration"], council_manifest["calibration"]
+                    )
+                    self.assertEqual(
+                        checkpoint["disagreement_calibration"], council_manifest["calibration"]
+                    )
+                    self.assertEqual(council_manifest["calibration"]["num_reasoning_steps"], 4)
+                    self.assertFalse(
+                        list(Path(council_manifest["cache_directory"]).glob("*.uncalibrated*"))
+                    )
+                    self.assertEqual(council_manifest["cache_version"], 2)
+                    diagnostics = json.loads((output / "diagnostics.json").read_text())
+                    self.assertEqual(diagnostics["observed_training"]["num_reasoning_steps"], 4)
+                    self.assertIn(
+                        "p99", diagnostics["observed_training"]["statistics"]["student_tail_mass"]
+                    )
+                    self.assertIn("step_disagreement_mean", manifest["loss_scalars"])
                     self.assertNotIn("anchor_ce_mean", manifest["loss_scalars"])
                     step_log = output / "reasoning_steps.jsonl"
                     rows = [json.loads(line) for line in step_log.read_text().splitlines()]
@@ -459,8 +476,14 @@ class Stage2UpdateTest(unittest.TestCase):
                         self.assertEqual(row["run_fingerprint"], manifest["run_fingerprint"])
                         self.assertEqual(row["data_step_before"], 0)
                         self.assertEqual(row["global_step_before"], 0)
-                        self.assertEqual(row["rho"], row["js_normalized"])
-                        self.assertAlmostEqual(row["js_mean"], row["rho"] * math.log(3))
+                        self.assertAlmostEqual(
+                            row["rho"],
+                            row["step_disagreement"] / (row["step_disagreement"] + row["tau"]),
+                        )
+                        self.assertEqual(row["temperature"], 1.0)
+                        self.assertAlmostEqual(
+                            row["weighted_sft_loss"], 0.01 * row["step_sft_loss"]
+                        )
                     for record in records:
                         sample_rows = [row for row in rows if row["sample_id"] == record.sample_id]
                         self.assertEqual(len(sample_rows), 2)

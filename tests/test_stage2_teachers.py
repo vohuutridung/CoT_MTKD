@@ -230,9 +230,10 @@ class HubTeachersTest(unittest.TestCase):
                 }
             )
             config["aggregation"] = {
-                "js_temperature": 1.0,
-                "kd_temperature": 2.0,
-                "sft_weight": 0.25,
+                "temperature": 1.0,
+                "disagreement_pooling_power": 4.0,
+                "tau_quantile": 0.75,
+                "sft_weight": 0.01,
                 "search_k": 512,
                 "k_min": 8,
                 "teacher_execution": "precomputed_support_tail",

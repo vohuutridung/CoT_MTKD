@@ -9,7 +9,7 @@ FlashAttention 2 is recommended; the loader falls back to SDPA when unavailable.
 `setup` does not install FlashAttention 2.
 
 ```bash
-git clone --branch output-space https://github.com/vohuutridung/CoT_MTKD.git
+git clone --branch phase1-gac https://github.com/vohuutridung/CoT_MTKD.git
 cd CoT_MTKD
 ./project_commands.sh setup
 
@@ -17,7 +17,7 @@ export CUDA_VISIBLE_DEVICES=0
 export NPROC_PER_NODE=1
 ```
 
-- `git clone` downloads the `output-space` branch; `cd` enters the repository.
+- `git clone` downloads the `phase1-gac` branch; `cd` enters the repository.
 - `setup` creates `.venv` and installs the project and test dependencies. All
   project commands use `.venv` automatically; activation is unnecessary.
 - `CUDA_VISIBLE_DEVICES=0` selects GPU 0 for preprocessing, training and evaluation.
@@ -28,7 +28,11 @@ export NPROC_PER_NODE=1
 ### Phase 1 → Phase 2 → evaluation
 
 After setup, run the complete sequence below. Continue past each stress check
-only if it succeeds. Phase 2 defaults are **1 epoch, global batch 8, microbatch 1**.
+only if it succeeds. Phase 2 defaults are **1 epoch, global batch 16, microbatch 1**,
+with temperature **1**, SFT weight **0.01**, disagreement pooling power **4** and
+training-corpus calibration quantile **0.75**. Incomplete optimizer windows are
+omitted to keep every effective batch exactly 16: the 996-sample corpus supplies
+62 updates over 992 shuffled examples; calibration still uses all 996 samples.
 
 ```bash
 export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space_local.yaml
@@ -75,7 +79,7 @@ This branch implements local GAC with a separate own-task contribution and
 unnormalized sharing from other experts. The method identifier is
 `sft_dpp_rbf_local_gac`. CoT-only preprocessing retains 996 samples and never
 reads `deepseek_attempt`. Kneedle, union support and the normalized step-level
-DPP loss retain their `output-space` semantics. Phase 2 is unchanged.
+DPP loss retain their `output-space` semantics. The revised Phase 2 is described below.
 
 The frozen Qwen2.5-7B-Instruct backbone has three LoRA adapters (rank/alpha 16,
 dropout 0.05, existing target modules). SFT uses all labeled assistant tokens;
@@ -175,4 +179,42 @@ Meaning of each command:
    `artifacts/evaluation/p_align/`.
 
 For either route, the student output directory contains `final/adapters/student/`,
-`checkpoint.pt`, `metrics.jsonl`, `performance.jsonl` and `reasoning_steps.jsonl`.
+`checkpoint.pt`, `metrics.jsonl`, `performance.jsonl`, `reasoning_steps.jsonl`
+and `diagnostics.json`.
+
+### Revised Phase 2 cache and diagnostics
+
+`stage2-cache` runs the three frozen teachers once per training sample and keeps
+the existing Kneedle union, target-token inclusion and tail bucket. It pools
+token JSDs into one disagreement score per step, fits one global scale from all
+training steps, then finalizes the adaptive power-mean targets on CPU. Reduced
+teacher values are staged temporarily and removed after finalization. Training
+loads only the student and final cached targets; it never refits calibration or
+forwards teachers. The synthetic stress case reuses the training-fitted scale.
+
+The configurable fields are `aggregation.temperature: 1.0`,
+`disagreement_pooling_power: 4.0`, `tau_quantile: 0.75` and `sft_weight: 0.01`.
+The token→step→sample loss averaging remains unchanged. A zero fitted quantile
+fails clearly instead of introducing an arbitrary scale. Rebuild `stage2-cache`
+and start a fresh student run: version-1 caches and old checkpoints are incompatible.
+
+For analysis, use **`diagnostics.json` in the student output directory**. It
+contains the fitted `tau`, disagreement/rho quantiles, support-size statistics,
+target support/tail statistics per token and step, and observed student coverage
+and loss statistics per step. Tail summaries include fractions above 0.10, 0.25
+and 0.50; rho summaries include fractions above 0.25, 0.50 and 0.75. Observed
+student summaries require the default `logging.reasoning_steps: true`.
+
+`reasoning_steps.jsonl` records `token_js_mean`, `step_disagreement`, `rho`,
+`tau`, pooling power, calibration quantile, target/student support and tail mass,
+and separate KD/SFT/weighted-SFT/total losses. The mean token JS remains a
+comparison statistic and no longer determines rho directly.
+
+The **cache** `manifest.json` is under
+`<paths.teacher_cache_dir>/<fingerprint>/`; its `diagnostics` includes per-expert
+raw/selected-K histograms. Token-level K, final support IDs/offsets and targets
+remain in `sample-XXXXXXX.safetensors`, located through cache `index.json`.
+The student `manifest.json` links to `diagnostics.json` and the cache fingerprint.
+
+Implementation details, the changed-file inventory and CPU fixture validation
+are recorded in [the Phase-2 validation report](docs/phase2_calibrated_validation.md).
