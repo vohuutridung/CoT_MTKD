@@ -57,7 +57,9 @@ runtime:
   dataloader_workers: 0
 cot_pruning:
   enabled: true
+  method: binary_search_prefix
   eta: 0.95
+  min_steps: 1
   candidate_batch_size: 1
   data_config: configs/data/trainhihi.yaml
   source_prepared: artifacts/prepared/s1k_1_1_cot_only
@@ -68,19 +70,13 @@ cot_pruning:
     aggregation: geometric_mean
     score_space: log_probability
   search:
-    method: greedy_deletion
-    rerank_after_each_deletion: true
-  correctness:
-    enabled: true
-    method: majority_vote
-    check_after_pruning_only: true
-    fallback_on_failure: true
-    max_new_tokens: 512
-    timeout_seconds: 10
+    method: binary_search
+    monotonicity_assumption: true
   output:
     save_original_reasoning: true
     save_pruned_reasoning: true
-    save_deletion_history: true
+    save_scores: true
+    save_search_metadata: true
 paths:
   prepared: artifacts/prepared/trainhihi
   stage1: artifacts/stage1/duyentl04_abc

@@ -1,15 +1,24 @@
 import math
 import unittest
 
-from cot_mtkd.stage2.cot_prune_run import majority_vote_correct, reasoning_step_texts
 from cot_mtkd.stage2.cot_prune import (
     ScoreCache,
+    binary_search_prefix,
     candidate_token_ids,
-    choose_fallback,
     fidelity_threshold,
-    greedy_delete,
+    sample_compression,
     token_cut_summary,
 )
+from cot_mtkd.stage2.cot_prune_run import reasoning_step_texts
+
+
+def _prefix_score(valid_from: int):
+    def score(kept: tuple[int, ...]) -> float:
+        if kept != tuple(range(len(kept))):
+            raise AssertionError(f"non-prefix scored: {kept}")
+        return 0.0 if len(kept) >= valid_from else -1.0
+
+    return score
 
 
 class TokenCutSummaryTests(unittest.TestCase):
@@ -31,153 +40,93 @@ class ReasoningSplitTests(unittest.TestCase):
             ["alpha", "beta", "gamma"],
         )
 
-    def test_majority_vote_uses_the_unique_winner(self) -> None:
-        self.assertEqual(majority_vote_correct(["4", "4", "5"], "4", 1)[0], True)
-        self.assertEqual(majority_vote_correct(["4", "5", "6"], "4", 1)[0], False)
 
+class BinaryPrefixPruneTests(unittest.TestCase):
+    def test_original_is_kept_when_nothing_shorter_is_valid(self) -> None:
+        result = binary_search_prefix(8, _prefix_score(8), 0.95)
+        self.assertEqual(result.kept, tuple(range(8)))
 
-class GreedyPruneTests(unittest.TestCase):
-    def test_nothing_can_be_deleted(self) -> None:
-        def score(kept: tuple[int, ...]) -> float:
-            return 0.0 if kept == (0, 1) else -1.0
+    def test_shortest_valid_prefix_is_selected(self) -> None:
+        result = binary_search_prefix(8, _prefix_score(4), 0.95)
+        self.assertEqual(result.kept, tuple(range(4)))
 
-        result = greedy_delete(2, score, 0.95)
-        self.assertEqual(result.kept, (0, 1))
-        self.assertEqual(result.history, ())
-
-    def test_one_redundant_step_is_removed(self) -> None:
-        def score(kept: tuple[int, ...]) -> float:
-            if kept == (0, 1):
-                return 0.0
-            if kept == (0,):
-                return -0.01
-            return -1.0
-
-        result = greedy_delete(2, score, 0.95)
-        self.assertEqual(result.kept, (0,))
-        self.assertEqual(result.history[0].deleted_step_index, 1)
-
-    def test_reranks_after_the_first_deletion(self) -> None:
+    def test_score_evaluations_are_logarithmic(self) -> None:
         calls: list[tuple[int, ...]] = []
 
         def score(kept: tuple[int, ...]) -> float:
             calls.append(kept)
-            table = {
-                (0, 1, 2): 0.0,
-                (1, 2): 0.0,
-                (0, 2): -1.0,
-                (0, 1): -1.0,
-                (2,): -10.0,
-                (1,): -0.01,
-                (0,): -10.0,
-                (): -10.0,
-            }
-            return table[kept]
+            return _prefix_score(20)(kept)
 
-        result = greedy_delete(3, score, 0.95)
-        self.assertEqual(result.kept, (1,))
-        self.assertEqual(
-            [item.deleted_step_index for item in result.history],
-            [0, 2],
-        )
-        second_round = [
-            kept for kept in calls if set(kept) <= {1, 2} and len(kept) == 1
-        ]
-        self.assertIn((1,), second_round)
-        self.assertIn((2,), second_round)
+        num_steps = 64
+        result = binary_search_prefix(num_steps, score, 0.95)
+        self.assertEqual(result.kept, tuple(range(20)))
+        self.assertEqual(result.num_score_evaluations, len(calls))
+        self.assertLessEqual(len(calls), math.floor(math.log2(num_steps)) + 3)
+        self.assertLess(len(calls), num_steps)
 
     def test_threshold_stays_at_the_original_score(self) -> None:
-        result = greedy_delete(
-            2,
-            lambda kept: 0.0 if len(kept) == 2 else -0.01,
-            0.95,
-        )
-        self.assertEqual(result.threshold, result.original_score + math.log(0.95))
-        self.assertTrue(result.history)
-        self.assertEqual(result.threshold, fidelity_threshold(result.original_score, 0.95))
-
-    def test_correctness_is_not_called_while_scoring_candidates(self) -> None:
-        checked: list[tuple[int, ...]] = []
-
         def score(kept: tuple[int, ...]) -> float:
-            if checked:
-                raise AssertionError("correctness ran during candidate scoring")
-            return 0.0
+            return -0.01 * (8 - len(kept))
 
-        result = greedy_delete(2, score, 0.5)
-        self.assertEqual(result.kept, ())
+        result = binary_search_prefix(8, score, 0.95)
+        self.assertLess(len(result.kept), 8)
+        self.assertEqual(result.threshold, result.original_score + math.log(0.95))
+        self.assertEqual(result.threshold, fidelity_threshold(result.original_score, 0.95))
+        self.assertNotEqual(result.threshold, result.final_score + math.log(0.95))
 
-        def is_correct(kept: tuple[int, ...]) -> bool:
-            checked.append(kept)
-            return True
+    def test_every_candidate_keeps_the_original_prompt(self) -> None:
+        prompt = [7, 8, 9]
+        steps = [[10], [11, 11], [12], [13]]
+        for length in range(0, len(steps) + 1):
+            sequence = candidate_token_ids(prompt, steps, tuple(range(length)), [4], [5, 6])
+            self.assertEqual(sequence[: len(prompt)], prompt)
 
-        accepted, correct, fallback = choose_fallback(result.states, is_correct)
-        self.assertEqual(accepted, ())
-        self.assertTrue(correct)
-        self.assertFalse(fallback)
-        self.assertEqual(checked, [()])
-
-    def test_fallback_walks_back_when_the_final_trace_is_wrong(self) -> None:
-        states = [(0, 1), (0,), ()]
-
-        def is_correct(kept: tuple[int, ...]) -> bool:
-            return kept == (0,)
-
-        accepted, correct, fallback = choose_fallback(states, is_correct)
-        self.assertEqual(accepted, (0,))
-        self.assertTrue(correct)
-        self.assertTrue(fallback)
+    def test_every_candidate_scores_the_same_answer_target(self) -> None:
+        solution = [5, 6]
+        steps = [[10], [11, 11], [12], [13]]
+        for length in range(0, len(steps) + 1):
+            sequence = candidate_token_ids([7, 8, 9], steps, tuple(range(length)), [4], solution)
+            self.assertEqual(sequence[-len(solution) :], solution)
 
     def test_eta_one_rejects_any_drop(self) -> None:
         def score(kept: tuple[int, ...]) -> float:
-            return 0.0 if len(kept) == 2 else -1.0e-6
+            return 0.0 if len(kept) == 4 else -1.0e-9
 
-        self.assertEqual(greedy_delete(2, score, 1.0).kept, (0, 1))
+        self.assertEqual(binary_search_prefix(4, score, 1.0).kept, tuple(range(4)))
 
-        def tied(kept: tuple[int, ...]) -> float:
-            return 0.0
+        result = binary_search_prefix(4, lambda kept: 0.0, 1.0, min_steps=1)
+        self.assertEqual(result.kept, (0,))
 
-        self.assertEqual(greedy_delete(2, tied, 1.0).kept, ())
+    def test_one_and_two_step_traces_without_a_shorter_prefix(self) -> None:
+        self.assertEqual(binary_search_prefix(1, _prefix_score(1), 0.95).kept, (0,))
+        self.assertEqual(binary_search_prefix(2, _prefix_score(2), 0.95).kept, (0, 1))
+        self.assertEqual(binary_search_prefix(0, lambda kept: 0.0, 0.95, min_steps=1).kept, ())
 
-    def test_lower_eta_prunes_more(self) -> None:
-        def score(kept: tuple[int, ...]) -> float:
-            return {2: 0.0, 1: -0.01, 0: -0.4}[len(kept)]
-
-        strict = greedy_delete(2, score, 0.99)
-        loose = greedy_delete(2, score, 0.5)
-        self.assertEqual(strict.kept, (1,))
-        self.assertEqual(loose.kept, ())
-        self.assertLess(len(loose.kept), len(strict.kept))
-
-    def test_score_cache_uses_step_indices(self) -> None:
+    def test_repeated_prefix_does_not_call_the_scorer_again(self) -> None:
         calls = 0
 
         def raw(kept: tuple[int, ...]) -> float:
             nonlocal calls
             calls += 1
-            return float(len(kept))
+            return 0.0 if len(kept) >= 2 else -1.0
 
         cached = ScoreCache(raw)
-        self.assertEqual(cached((1, 0)), cached(tuple([1, 0])))
-        self.assertEqual(calls, 1)
+        first = binary_search_prefix(4, cached, 0.95)
+        second = binary_search_prefix(4, cached, 0.95)
+        self.assertEqual(second.num_score_evaluations, 0)
+        self.assertEqual(calls, first.num_score_evaluations)
+        self.assertGreater(len(second.evaluated_prefix_lengths), 0)
 
-    def test_batched_scores_match_one_at_a_time(self) -> None:
-        def raw(kept: tuple[int, ...]) -> float:
-            return float(sum(kept))
-
-        sequential = greedy_delete(3, raw, 0.5)
-        batched = greedy_delete(3, raw, 0.5, score_many=lambda keys: [raw(key) for key in keys])
-        self.assertEqual(batched.kept, sequential.kept)
-        self.assertEqual(batched.history, sequential.history)
-
-    def test_prompt_tokens_are_copied_unchanged(self) -> None:
-        prefix = [7, 8, 9]
-        steps = [[1, 1], [2, 2], [3]]
-        original = candidate_token_ids(prefix, steps, (0, 1, 2), [4], [5])
-        shorter = candidate_token_ids(prefix, steps, (0, 2), [4], [5])
-        self.assertEqual(original[: len(prefix)], prefix)
-        self.assertEqual(shorter[: len(prefix)], prefix)
-        self.assertEqual(shorter, [7, 8, 9, 1, 1, 3, 4, 5])
+    def test_final_prefix_meets_the_fidelity_bound(self) -> None:
+        eta = 0.95
+        result = binary_search_prefix(8, _prefix_score(4), eta)
+        self.assertGreaterEqual(result.final_score, result.original_score + math.log(eta))
+        metrics = sample_compression(
+            8, len(result.kept), 80, 40, result.original_score, result.final_score
+        )
+        self.assertGreaterEqual(metrics["fidelity"], eta - 1e-12)
+        self.assertAlmostEqual(metrics["step_reduction"], 0.5)
+        self.assertAlmostEqual(metrics["token_reduction"], 0.5)
 
 
 if __name__ == "__main__":

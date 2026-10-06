@@ -14,7 +14,6 @@ from tqdm.auto import tqdm
 from ..data.prepare import write_prepared_dataset
 from ..data.schema import PreparedRecord, TokenRegion
 from ..data.serialize import reasoning_character_segments
-from ..evaluation.grading import grade_math, normalize_answer
 from ..models.chunked_head import (
     cross_entropy_from_hidden_no_grad,
     decoder_and_lm_head,
@@ -27,15 +26,15 @@ from ..models.multi_adapter import (
     load_tokenizer,
     require_same_model_source,
 )
-from ..signals.pag import answer_continuation_ids, record_pag_parts
+from ..signals.pag import record_pag_parts
 from ..utils.distributed import DistributedContext
 from ..utils.local_logging import JsonlLogger
 from ..utils.manifest import read_json, require_file_sha256, write_json
 from .cot_prune import (
     ScoreCache,
+    binary_search_prefix,
     candidate_token_ids,
-    choose_fallback,
-    greedy_delete,
+    sample_compression,
     token_cut_summary,
 )
 from .online import _select_adapter
@@ -66,25 +65,16 @@ def validate_pruning_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("cot_pruning.ensemble.aggregation must be geometric_mean")
     if pruning["ensemble"].get("score_space") != "log_probability":
         raise ValueError("cot_pruning.ensemble.score_space must be log_probability")
-    if pruning["search"].get("method") != "greedy_deletion":
-        raise ValueError("cot_pruning.search.method must be greedy_deletion")
-    if pruning["search"].get("rerank_after_each_deletion") is not True:
-        raise ValueError("cot_pruning.search.rerank_after_each_deletion must be true")
-    correctness = pruning["correctness"]
-    if (
-        correctness.get("enabled") is not True
-        or correctness.get("check_after_pruning_only") is not True
-    ):
-        raise ValueError("Correctness is checked only after greedy deletion stops")
-    if (
-        correctness.get("method") != "majority_vote"
-        or correctness.get("fallback_on_failure") is not True
-    ):
-        raise ValueError("cot_pruning.correctness requires majority_vote and fallback_on_failure")
+    if pruning.get("method") != "binary_search_prefix":
+        raise ValueError("cot_pruning.method must be binary_search_prefix")
+    if pruning["search"].get("method") != "binary_search":
+        raise ValueError("cot_pruning.search.method must be binary_search")
+    if pruning["search"].get("monotonicity_assumption") is not True:
+        raise ValueError("cot_pruning.search.monotonicity_assumption must be true")
+    if int(pruning.get("min_steps", 1)) < 0:
+        raise ValueError("cot_pruning.min_steps must be nonnegative")
     if int(pruning.get("candidate_batch_size", 1)) < 1:
         raise ValueError("cot_pruning.candidate_batch_size must be positive")
-    if int(correctness.get("max_new_tokens", 1)) < 1:
-        raise ValueError("cot_pruning.correctness.max_new_tokens must be positive")
     if not pruning.get("hf_repo"):
         raise ValueError("cot_pruning.hf_repo is required")
     if not pruning.get("data_config") or not pruning.get("source_prepared"):
@@ -92,24 +82,6 @@ def validate_pruning_config(config: dict[str, Any]) -> dict[str, Any]:
     if not pruning.get("export_dir"):
         raise ValueError("cot_pruning.export_dir is required")
     return pruning
-
-
-def majority_vote_correct(
-    predictions: Sequence[str], reference: str, timeout_seconds: float
-) -> tuple[bool, str | None]:
-    """Return whether the unique most common answer matches the ground truth."""
-    groups: dict[str, list[str]] = {}
-    for prediction in predictions:
-        groups.setdefault(normalize_answer(prediction), []).append(prediction)
-    if not groups:
-        return False, None
-    counts = [len(values) for values in groups.values()]
-    best = max(counts)
-    winners = [key for key, values in groups.items() if len(values) == best]
-    if len(winners) != 1:
-        return False, None
-    chosen = groups[winners[0]][0]
-    return grade_math(chosen, reference, True, timeout_seconds), chosen
 
 
 def _answer_logprob_sums(
@@ -155,8 +127,7 @@ class FrozenCouncil:
         self.device = distributed.device
         self.chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
         self.batch_size = int(pruning.get("candidate_batch_size", 1))
-        self.max_new_tokens = int(pruning["correctness"]["max_new_tokens"])
-        self.grade_timeout = float(pruning["correctness"].get("timeout_seconds", 10))
+        self.min_steps = int(pruning.get("min_steps", 1))
         stage1_dir = Path(config["paths"]["stage1"])
         teachers = ensure_stage2_teachers(config)
         bundle_path = require_file_sha256(
@@ -205,26 +176,6 @@ class FrozenCouncil:
                     totals[start + offset] += value
         count = len(self.names)
         return [value / count for value in totals]
-
-    def generate(self, name: str, prompt_ids: Sequence[int]) -> str:
-        _select_adapter(self.model, name, training=False)
-        self.model.eval()
-        room = int(self.model.config.max_position_embeddings) - len(prompt_ids)
-        if room < 1:
-            return ""
-        self.model.config.use_cache = True
-        token_ids = torch.tensor([list(prompt_ids)], dtype=torch.long, device=self.device)
-        with torch.inference_mode():
-            output = self.model.generate(
-                input_ids=token_ids,
-                attention_mask=torch.ones_like(token_ids),
-                max_new_tokens=min(self.max_new_tokens, room),
-                do_sample=False,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-        continuation = output[0, token_ids.shape[1] :]
-        return self.tokenizer.decode(continuation, skip_special_tokens=True)
 
 
 def _prepare_config(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
@@ -297,15 +248,18 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
             for row in rows
         ]
     )
+    count = len(rows)
     summary = {
-        "records": len(rows),
-        "mean_deleted": sum(row["pruning"]["num_deleted"] for row in rows) / len(rows),
+        "records": count,
+        "method": "binary_search_prefix",
+        "mean_deleted_steps": sum(row["pruning"]["num_deleted_steps"] for row in rows) / count,
+        "mean_step_reduction": sum(row["pruning"]["step_reduction"] for row in rows) / count,
+        "mean_token_reduction": sum(row["pruning"]["token_reduction"] for row in rows) / count,
+        "mean_fidelity": sum(row["pruning"]["fidelity"] for row in rows) / count,
         "mean_token_cut_percent": cuts["mean_token_cut_percent"],
         "overall_token_cut_percent": cuts["overall_token_cut_percent"],
         "total_original_reasoning_tokens": int(cuts["total_original_reasoning_tokens"]),
         "total_deleted_reasoning_tokens": int(cuts["total_deleted_reasoning_tokens"]),
-        "fallback_count": sum(bool(row["pruning"]["fallback_used"]) for row in rows),
-        "correct_count": sum(bool(row["pruning"]["correct_after_pruning"]) for row in rows),
         "prepared_manifest": prepared,
         "export_file": str(export_path),
         "hf_repo": pruning["hf_repo"],
@@ -313,17 +267,17 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
     write_json(export_dir / "summary.json", summary)
     _upload(rows, str(pruning["hf_repo"]), bool(pruning.get("hf_private", False)))
     LOGGER.info(
-        "Pruned %d samples into %s: mean deleted steps %.2f, "
+        "Pruned %d samples into %s: mean step reduction %.2f%%, "
         "mean token cut %.2f%%, overall token cut %.2f%% "
-        "(%d/%d reasoning tokens), fallbacks %d",
-        len(rows),
+        "(%d/%d reasoning tokens), mean fidelity %.4f",
+        count,
         output_dir,
-        summary["mean_deleted"],
+        100.0 * summary["mean_step_reduction"],
         summary["mean_token_cut_percent"],
         summary["overall_token_cut_percent"],
         summary["total_deleted_reasoning_tokens"],
         summary["total_original_reasoning_tokens"],
-        summary["fallback_count"],
+        summary["mean_fidelity"],
     )
     return summary
 
@@ -354,32 +308,38 @@ def _prune_record(
         )
 
     def score_many(keys: list[tuple[int, ...]]) -> list[float]:
+        for key in keys:
+            if key != tuple(range(len(key))):
+                raise RuntimeError(f"{record.sample_id}: search requested a non-prefix")
         sequences = [encode(key, True) for key in keys]
-        if any(sequence[: len(prefix)] != list(prefix) for sequence in sequences):
-            raise RuntimeError(f"{record.sample_id}: candidate changed the prompt tokens")
+        prompt_ids = list(prefix)
+        answer_ids = list(solution)
+        for sequence in sequences:
+            if sequence[: len(prompt_ids)] != prompt_ids:
+                raise RuntimeError(f"{record.sample_id}: candidate changed the prompt tokens")
+            if sequence[-answer_length:] != answer_ids:
+                raise RuntimeError(f"{record.sample_id}: candidate changed the answer target")
         return council.score_many(sequences, answer_length)
 
     cache = ScoreCache(lambda kept: score_many([kept])[0])
-    result = greedy_delete(len(steps), cache, eta, score_many=score_many)
-    correctness_calls: list[tuple[int, ...]] = []
-
-    def is_correct(kept: tuple[int, ...]) -> bool:
-        correctness_calls.append(kept)
-        predictions = [
-            council.generate(name, encode(kept, False)) for name in council.names
-        ]
-        accepted, _vote = majority_vote_correct(predictions, record.solution, council.grade_timeout)
-        return accepted
-
-    chosen, correct, fallback_used = choose_fallback(result.states, is_correct)
-    if not correctness_calls or correctness_calls[0] != result.kept:
-        raise RuntimeError("Correctness must start at the final pruned trace")
+    result = binary_search_prefix(len(steps), cache, eta, min_steps=council.min_steps)
+    chosen = result.kept
     original_tokens = sum(len(step) for step in steps)
     kept_tokens = sum(len(steps[index]) for index in chosen)
+    metrics = sample_compression(
+        len(steps),
+        len(chosen),
+        original_tokens,
+        kept_tokens,
+        result.original_score,
+        result.final_score,
+    )
     short_text = "\n\n".join(texts[index] for index in chosen)
-    history = [item.__dict__ for item in result.history] if pruning["output"].get(
-        "save_deletion_history", True
-    ) else []
+    evaluated = (
+        list(result.evaluated_prefix_lengths)
+        if pruning["output"].get("save_search_metadata", True)
+        else []
+    )
     payload = {
         "id": record.sample_id,
         "question": record.question,
@@ -395,27 +355,29 @@ def _prune_record(
         if pruning["output"].get("save_pruned_reasoning", True)
         else [],
         "pruning": {
+            "method": "binary_search_prefix",
             "eta": eta,
             "original_score": result.original_score,
-            "final_score": result.final_score if chosen == result.kept else cache(chosen),
+            "final_score": result.final_score,
             "threshold": result.threshold,
             "original_num_steps": len(steps),
             "final_num_steps": len(chosen),
-            "num_deleted": len(steps) - len(chosen),
+            "num_deleted_steps": len(steps) - len(chosen),
+            "num_score_evaluations": result.num_score_evaluations,
+            "evaluated_prefix_lengths": evaluated,
             "original_reasoning_tokens": original_tokens,
             "final_reasoning_tokens": kept_tokens,
             "deleted_reasoning_tokens": original_tokens - kept_tokens,
-            "correct_after_pruning": correct,
-            "fallback_used": fallback_used,
-            "deletion_history": history,
-            "accepted_steps": list(chosen),
+            "step_reduction": metrics["step_reduction"],
+            "token_reduction": metrics["token_reduction"],
+            "fidelity": metrics["fidelity"],
         },
     }
     details = payload["pruning"]
     LOGGER.info(
         "sample_id=%s original_num_steps=%d final_num_steps=%d original_score=%.6f "
-        "final_score=%.6f threshold=%.6f eta=%s num_deleted=%d "
-        "correct_after_pruning=%s fallback_used=%s",
+        "final_score=%.6f threshold=%.6f eta=%s num_deleted_steps=%d "
+        "num_score_evaluations=%d fidelity=%.4f",
         record.sample_id,
         details["original_num_steps"],
         details["final_num_steps"],
@@ -423,9 +385,9 @@ def _prune_record(
         details["final_score"],
         details["threshold"],
         eta,
-        details["num_deleted"],
-        details["correct_after_pruning"],
-        details["fallback_used"],
+        details["num_deleted_steps"],
+        details["num_score_evaluations"],
+        details["fidelity"],
     )
     logger.log("cot_prune", sample_id=record.sample_id, **details)
     return payload

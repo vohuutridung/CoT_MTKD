@@ -166,9 +166,10 @@ Meaning of each command:
 2. `prepare` builds the original tokenized corpus in `artifacts/prepared/s1k_1_1_cot_only/`.
 3. `fetch-teachers` downloads, verifies and imports the three experts into
    `artifacts/stage1/duyentl04_abc/`.
-4. `prune-cot` deletes redundant reasoning steps with those frozen experts,
-   writes the shortened corpus to `artifacts/prepared/trainhihi/`, and uploads
-   it to `sonspeed/Trainhihi`. Correctness generation runs only after deletion stops.
+4. `prune-cot` keeps the shortest reasoning prefix whose frozen-expert answer
+   likelihood stays at least 95% of the original trace. It assumes a longer
+   prefix is at least as valid as a shorter one, writes the shortened corpus to
+   `artifacts/prepared/trainhihi/`, and uploads it to `sonspeed/Trainhihi`.
 5. `stage2-cache` precomputes teacher targets on that shortened corpus and selects
    the initialization expert; cache: `artifacts/teacher_cache/output_space/`.
 6. `stage2-stress` checks student training VRAM and update completion;

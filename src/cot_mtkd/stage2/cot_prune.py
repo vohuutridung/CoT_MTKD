@@ -1,7 +1,14 @@
-"""Greedy deletion of existing reasoning steps.
+"""Shortest reasoning-prefix search for Phase-2 CoT pruning.
 
-The search only calls an ensemble score. Correctness generation is a separate
-step that runs after no further deletion is accepted.
+Only a prefix of the original steps may be kept. Steps in the middle are never
+deleted, reordered, or rewritten, and the prompt is not part of the search.
+
+Binary search assumes prefix validity is monotone: once a prefix clears the
+fixed threshold, every longer prefix is treated as valid too. The threshold is
+``S(R_original) + log(eta)`` and is not updated from later scores. This finds
+the shortest valid prefix under that assumption, not the shortest arbitrary
+subset. The score is the ensemble log-probability of the ground-truth answer
+only. No answer is generated.
 """
 
 from __future__ import annotations
@@ -12,24 +19,14 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class Deletion:
-    iteration: int
-    deleted_step_index: int
-    score_before: float
-    score_after: float
-    score_drop: float
-    remaining_num_steps: int
-
-
-@dataclass(frozen=True)
 class PruneResult:
     kept: tuple[int, ...]
     original_score: float
     final_score: float
     threshold: float
     eta: float
-    history: tuple[Deletion, ...]
-    states: tuple[tuple[int, ...], ...]
+    num_score_evaluations: int
+    evaluated_prefix_lengths: tuple[int, ...]
 
 
 class ScoreCache:
@@ -93,7 +90,7 @@ def candidate_token_ids(
     answer_prefix: Sequence[int] = (),
     solution: Sequence[int] = (),
 ) -> list[int]:
-    """Prompt tokens stay the original prefix. Only whole steps are removed."""
+    """Prompt tokens stay the original prefix. Only a whole-step suffix is dropped."""
     ids = [int(token) for token in prefix]
     for index in kept:
         ids.extend(int(token) for token in steps[int(index)])
@@ -102,56 +99,80 @@ def candidate_token_ids(
     return ids
 
 
-def greedy_delete(
+def binary_search_prefix(
     num_steps: int,
     score: Callable[[tuple[int, ...]], float],
     eta: float,
-    score_many: Callable[[list[tuple[int, ...]]], Sequence[float]] | None = None,
+    min_steps: int = 1,
 ) -> PruneResult:
-    """Delete the best remaining step, then rank every survivor again.
+    """Return the shortest prefix whose ensemble score clears the original threshold.
 
-    ``score`` receives original step indices in increasing order. It must be
-    the ensemble answer log-probability, not a generated-answer check.
+    ``score`` receives ``(0, 1, ..., k-1)`` and must be the geometric-mean
+    log-probability of the unchanged ground-truth answer. Validity is assumed
+    to be monotone in ``k``: a short prefix may fail, and lengthening it is
+    what makes the threshold pass. The search therefore takes ``O(log T)``
+    score evaluations. It does not try non-prefix subsets.
     """
     if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps < 0:
         raise ValueError("num_steps must be a nonnegative integer")
+    if isinstance(min_steps, bool) or not isinstance(min_steps, int) or min_steps < 0:
+        raise ValueError("min_steps must be a nonnegative integer")
     cached = score if isinstance(score, ScoreCache) else ScoreCache(score)
-    current = tuple(range(num_steps))
-    original_score = cached(current)
+    misses_before = cached.misses
+    evaluated: list[int] = []
+
+    def cached_prefix(length: int) -> float:
+        evaluated.append(length)
+        return cached(tuple(range(length)))
+
+    original_score = cached_prefix(num_steps)
     threshold = fidelity_threshold(original_score, eta)
-    states = [current]
-    history: list[Deletion] = []
-    while current:
-        trials_keys = [tuple(step for step in current if step != index) for index in current]
-        cached.ensure(trials_keys, score_many)
-        trials: list[tuple[float, int, tuple[int, ...]]] = []
-        for index, trial in zip(current, trials_keys, strict=True):
-            trials.append((cached(trial), index, trial))
-        best_score, best_index, best_trial = max(trials, key=lambda item: (item[0], -item[1]))
-        if best_score < threshold:
-            break
-        score_before = cached(current)
-        history.append(
-            Deletion(
-                iteration=len(history),
-                deleted_step_index=best_index,
-                score_before=score_before,
-                score_after=best_score,
-                score_drop=score_before - best_score,
-                remaining_num_steps=len(best_trial),
-            )
-        )
-        current = best_trial
-        states.append(current)
+    low = min_steps
+    high = num_steps
+    best_k = num_steps
+    while low <= high:
+        mid = (low + high) // 2
+        if cached_prefix(mid) >= threshold:
+            best_k = mid
+            high = mid - 1
+        else:
+            low = mid + 1
+    final_score = cached(tuple(range(best_k)))
+    if final_score < threshold:
+        raise RuntimeError("Selected prefix is below the fixed fidelity threshold")
     return PruneResult(
-        kept=current,
+        kept=tuple(range(best_k)),
         original_score=original_score,
-        final_score=cached(current),
+        final_score=final_score,
         threshold=threshold,
         eta=float(eta),
-        history=tuple(history),
-        states=tuple(states),
+        num_score_evaluations=cached.misses - misses_before,
+        evaluated_prefix_lengths=tuple(evaluated),
     )
+
+
+def sample_compression(
+    original_steps: int,
+    final_steps: int,
+    original_tokens: int,
+    final_tokens: int,
+    original_score: float,
+    final_score: float,
+) -> dict[str, float]:
+    """Step and token reduction, plus probability-space fidelity ``exp(S_final - S0)``."""
+    if original_steps < 0 or not 0 <= final_steps <= original_steps:
+        raise ValueError("final step count must lie within the original count")
+    if original_tokens < 0 or not 0 <= final_tokens <= original_tokens:
+        raise ValueError("final token count must lie within the original count")
+    if not math.isfinite(original_score) or not math.isfinite(final_score):
+        raise ValueError("scores must be finite")
+    step_reduction = 0.0 if original_steps == 0 else 1.0 - final_steps / original_steps
+    token_reduction = 0.0 if original_tokens == 0 else 1.0 - final_tokens / original_tokens
+    return {
+        "step_reduction": step_reduction,
+        "token_reduction": token_reduction,
+        "fidelity": math.exp(final_score - original_score),
+    }
 
 
 def token_cut_summary(cuts: Sequence[tuple[int, int]]) -> dict[str, float]:
@@ -179,22 +200,3 @@ def token_cut_summary(cuts: Sequence[tuple[int, int]]) -> dict[str, float]:
         "total_original_reasoning_tokens": float(total_original),
         "total_deleted_reasoning_tokens": float(total_deleted),
     }
-
-
-def choose_fallback(
-    states: Sequence[Sequence[int]],
-    is_correct: Callable[[tuple[int, ...]], bool],
-) -> tuple[tuple[int, ...], bool, bool]:
-    """Check the shortest trace first, then walk back toward the original.
-
-    The original trace is kept when every pruned trace fails. Samples are
-    never dropped. ``is_correct`` is not used by ``greedy_delete``.
-    """
-    if not states:
-        raise ValueError("fallback requires the original reasoning state")
-    ordered = [tuple(int(index) for index in state) for state in states]
-    final = ordered[-1]
-    for state in reversed(ordered):
-        if is_correct(state):
-            return state, True, state != final
-    return ordered[0], False, final != ordered[0]
