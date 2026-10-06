@@ -1,0 +1,23 @@
+schema_version: 1
+dataset:
+  name: sonspeed/Trainhihi
+  split: train
+  local_json: null
+  expected_records: null
+  expected_prepared_records: null
+  exclude_sample_ids: []
+  keep_all_grades: true
+  allow_empty_thinking: true
+model:
+  name_or_path: Qwen/Qwen2.5-7B-Instruct
+tokenization:
+  max_length: 32768
+  padding_side: right
+  truncation: reject_overlength
+  packing: false
+  add_special_tokens: false
+serialization:
+  response_field: deepseek_thinking_trajectory
+  system_prompt: You are Qwen, created by Alibaba Cloud. You are a helpful assistant.
+  step_pattern: "\\r?\\n[ \\t]*\\r?\\n+"
+output_dir: artifacts/prepared/trainhihi

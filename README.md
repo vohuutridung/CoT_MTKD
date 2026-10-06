@@ -153,6 +153,7 @@ export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space.yaml
 
 ./project_commands.sh prepare
 ./project_commands.sh fetch-teachers
+./project_commands.sh prune-cot
 ./project_commands.sh stage2-cache
 ./project_commands.sh stage2-stress
 ./project_commands.sh stage2
@@ -162,17 +163,28 @@ export STAGE2_CONFIG=configs/stage2/qwen25_7b_output_space.yaml
 Meaning of each command:
 
 1. `export STAGE2_CONFIG=...output_space.yaml` selects the pinned Hugging Face council.
-2. `prepare` builds the same tokenized corpus in `artifacts/prepared/s1k_1_1_cot_only/`.
+2. `prepare` builds the original tokenized corpus in `artifacts/prepared/s1k_1_1_cot_only/`.
 3. `fetch-teachers` downloads, verifies and imports the three experts into
    `artifacts/stage1/duyentl04_abc/`.
-4. `stage2-cache` precomputes teacher targets and selects the initialization expert;
-   cache: `artifacts/teacher_cache/output_space/`.
-5. `stage2-stress` checks student training VRAM and update completion;
+4. `prune-cot` deletes redundant reasoning steps with those frozen experts,
+   writes the shortened corpus to `artifacts/prepared/trainhihi/`, and uploads
+   it to `sonspeed/Trainhihi`. Correctness generation runs only after deletion stops.
+5. `stage2-cache` precomputes teacher targets on that shortened corpus and selects
+   the initialization expert; cache: `artifacts/teacher_cache/output_space/`.
+6. `stage2-stress` checks student training VRAM and update completion;
    report: `artifacts/stage2/output_space_stress_memory.json`.
-6. `stage2` trains for one epoch, saving the student and logs in
+7. `stage2` trains for one epoch on the pruned data, saving the student and logs in
    `artifacts/stage2/output_space/`.
-7. `evaluate` optionally benchmarks that student, saving results in
+8. `evaluate` optionally benchmarks that student, saving results in
    `artifacts/evaluation/p_align/`.
+
+To train from the uploaded dataset instead of pruning again:
+
+```bash
+./project_commands.sh fetch-pruned
+./project_commands.sh stage2-cache
+./project_commands.sh stage2
+```
 
 For either route, the student output directory contains `final/adapters/student/`,
 `checkpoint.pt`, `metrics.jsonl`, `performance.jsonl` and `reasoning_steps.jsonl`.

@@ -33,6 +33,33 @@ def crop_cache(past_key_values: Any, length: int) -> Any:
     return _crop_legacy_cache(past_key_values, length)
 
 
+def answer_continuation_ids(tokenizer: Any, solution: str) -> tuple[list[int], list[int]]:
+    """Tokenize the fixed answer marker plus the raw gold solution.
+
+    A token that crosses the marker/solution boundary counts as a solution
+    target, matching the existing PAG continuation.
+    """
+    prefix_text = pag_answer_prefix()
+    continuation = tokenizer(
+        prefix_text + solution,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+    )
+    continuation_ids = list(continuation["input_ids"])
+    offsets = [tuple(pair) for pair in continuation["offset_mapping"]]
+    solution_start = next(
+        (index for index, (_, end) in enumerate(offsets) if end > len(prefix_text)),
+        len(continuation_ids),
+    )
+    answer_prefix = continuation_ids[:solution_start]
+    solution_ids = continuation_ids[solution_start:]
+    if not answer_prefix:
+        raise ValueError("PAG literal answer prefix tokenized to an empty sequence")
+    if not solution_ids:
+        raise ValueError("Gold solution tokenized to an empty sequence")
+    return list(answer_prefix), list(solution_ids)
+
+
 def record_pag_parts(
     record: PreparedRecord, tokenizer: Any
 ) -> tuple[list[int], list[list[int]], list[int], list[int]]:
@@ -50,30 +77,11 @@ def record_pag_parts(
         [record.input_ids[index] for index in positions]
         for positions in positions_by_step
     ]
-    # Tokenize the literal answer prefix and raw solution jointly: BPE at this
-    # boundary is context-sensitive. A token crossing the character boundary is
-    # counted as the first solution target, preserving the exact continuation.
-    prefix_text = pag_answer_prefix()
-    continuation = tokenizer(
-        prefix_text + record.solution,
-        add_special_tokens=False,
-        return_offsets_mapping=True,
-    )
-    continuation_ids = list(continuation["input_ids"])
-    offsets = [tuple(pair) for pair in continuation["offset_mapping"]]
-    solution_start = next(
-        (index for index, (_, end) in enumerate(offsets) if end > len(prefix_text)),
-        len(continuation_ids),
-    )
-    answer_prefix = continuation_ids[:solution_start]
-    solution = continuation_ids[solution_start:]
-    if not answer_prefix:
-        raise ValueError("PAG literal answer prefix tokenized to an empty sequence")
-    if not solution:
-        raise ValueError(
-            f"Gold solution tokenized to an empty sequence for {record.sample_id}"
-        )
-    return prefix, steps, list(answer_prefix), list(solution)
+    try:
+        answer_prefix, solution = answer_continuation_ids(tokenizer, record.solution)
+    except ValueError as error:
+        raise ValueError(f"{error} for {record.sample_id}") from error
+    return prefix, steps, answer_prefix, solution
 
 
 def _score_solution_from_prefix_cache(

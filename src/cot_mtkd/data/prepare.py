@@ -53,11 +53,13 @@ def prepare_one(
     system_prompt: str,
     step_pattern: str,
     tokenizer_hash: str,
+    *,
+    allow_empty_thinking: bool = False,
 ) -> PreparedRecord:
     question = str(raw["question"])
     thinking = str(raw["deepseek_thinking_trajectory"]).replace("\r\n", "\n").replace("\r", "\n")
     solution = str(raw["solution"])
-    if not thinking.strip():
+    if not thinking.strip() and not allow_empty_thinking:
         raise ValueError(f"Empty CoT for {source_sample_id(raw, sample_index)}")
     serialized = serialize_record(question, thinking, system_prompt, step_pattern)
     encoded = tokenizer(
@@ -161,6 +163,9 @@ def write_prepared_dataset(
                 str(config["serialization"]["system_prompt"]),
                 str(config["serialization"]["step_pattern"]),
                 tokenizer_hash,
+                allow_empty_thinking=bool(
+                    config["dataset"].get("allow_empty_thinking", False)
+                ),
             )
             handle.write(json.dumps(prepared.to_dict(), ensure_ascii=False) + "\n")
             count += 1

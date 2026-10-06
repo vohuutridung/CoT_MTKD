@@ -55,8 +55,34 @@ runtime:
   lm_head_chunk_tokens: 4096
   preprocessing_hidden_storage: cpu
   dataloader_workers: 0
+cot_pruning:
+  enabled: true
+  eta: 0.95
+  candidate_batch_size: 1
+  data_config: configs/data/trainhihi.yaml
+  source_prepared: artifacts/prepared/s1k_1_1_cot_only
+  export_dir: artifacts/pruned/trainhihi
+  hf_repo: sonspeed/Trainhihi
+  hf_private: false
+  ensemble:
+    aggregation: geometric_mean
+    score_space: log_probability
+  search:
+    method: greedy_deletion
+    rerank_after_each_deletion: true
+  correctness:
+    enabled: true
+    method: majority_vote
+    check_after_pruning_only: true
+    fallback_on_failure: true
+    max_new_tokens: 512
+    timeout_seconds: 10
+  output:
+    save_original_reasoning: true
+    save_pruned_reasoning: true
+    save_deletion_history: true
 paths:
-  prepared: artifacts/prepared/s1k_1_1_cot_only
+  prepared: artifacts/prepared/trainhihi
   stage1: artifacts/stage1/duyentl04_abc
   teacher_cache_dir: artifacts/teacher_cache/output_space
   output: artifacts/stage2/output_space
