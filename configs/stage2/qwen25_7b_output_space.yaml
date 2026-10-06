@@ -57,10 +57,9 @@ runtime:
   dataloader_workers: 0
 cot_pruning:
   enabled: true
-  method: binary_search_prefix
+  method: beam_search
   eta: 0.95
   min_steps: 1
-  candidate_batch_size: 1
   data_config: configs/data/trainhihi.yaml
   source_prepared: artifacts/prepared/s1k_1_1_cot_only
   export_dir: artifacts/pruned/trainhihi
@@ -70,8 +69,12 @@ cot_pruning:
     aggregation: geometric_mean
     score_space: log_probability
   search:
-    method: binary_search
-    monotonicity_assumption: true
+    method: beam_search
+    beam_width: 4
+    max_deletions: null
+    candidate_batch_size: 8
+  cache:
+    enabled: true
   output:
     save_original_reasoning: true
     save_pruned_reasoning: true

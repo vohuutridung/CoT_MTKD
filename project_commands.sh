@@ -17,7 +17,7 @@ Commands:
   stage1        Train three CoT LoRA experts with GAC over SFT/DPP/RBF.
   stage1-stress Run four SFT-only/full-interaction H200 VRAM stress cases before Phase 1.
   fetch-teachers Download/import the trained duyentl04/abc experts for Phase 2.
-  prune-cot    Keep the shortest valid CoT prefix, write Phase-2 data, upload it.
+  prune-cot    Beam-search shorter CoT subsets, write Phase-2 data, upload it.
   fetch-pruned Download sonspeed/Trainhihi and tokenize it for Phase 2.
   supervision  Build legacy PAG/features (not used by the new Phase 2).
   cache         Compile legacy Top-512/tail targets (not used by the new Phase 2).

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Keep the shortest CoT prefix that preserves answer likelihood, then upload it.
+# Beam-search a shorter CoT subset that preserves answer likelihood, then upload it.
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 if [[ "${NPROC_PER_NODE:-1}" -gt 1 ]]; then

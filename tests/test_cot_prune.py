@@ -3,22 +3,13 @@ import unittest
 
 from cot_mtkd.stage2.cot_prune import (
     ScoreCache,
-    binary_search_prefix,
+    beam_search_subset,
     candidate_token_ids,
     fidelity_threshold,
     sample_compression,
     token_cut_summary,
 )
 from cot_mtkd.stage2.cot_prune_run import reasoning_step_texts
-
-
-def _prefix_score(valid_from: int):
-    def score(kept: tuple[int, ...]) -> float:
-        if kept != tuple(range(len(kept))):
-            raise AssertionError(f"non-prefix scored: {kept}")
-        return 0.0 if len(kept) >= valid_from else -1.0
-
-    return score
 
 
 class TokenCutSummaryTests(unittest.TestCase):
@@ -41,35 +32,99 @@ class ReasoningSplitTests(unittest.TestCase):
         )
 
 
-class BinaryPrefixPruneTests(unittest.TestCase):
-    def test_original_is_kept_when_nothing_shorter_is_valid(self) -> None:
-        result = binary_search_prefix(8, _prefix_score(8), 0.95)
-        self.assertEqual(result.kept, tuple(range(8)))
+def _table(values: dict[tuple[int, ...], float]):
+    def score(kept: tuple[int, ...]) -> float:
+        if kept != tuple(sorted(set(kept))):
+            raise AssertionError(f"unordered subset scored: {kept}")
+        return values[kept]
 
-    def test_shortest_valid_prefix_is_selected(self) -> None:
-        result = binary_search_prefix(8, _prefix_score(4), 0.95)
-        self.assertEqual(result.kept, tuple(range(4)))
+    return score
 
-    def test_score_evaluations_are_logarithmic(self) -> None:
+
+class BeamPruneTests(unittest.TestCase):
+    def test_original_is_kept_when_no_deletion_is_valid(self) -> None:
+        def score(kept: tuple[int, ...]) -> float:
+            return 0.0 if kept == (0, 1, 2) else -1.0
+
+        result = beam_search_subset(3, score, 0.95, beam_width=4)
+        self.assertEqual(result.kept, (0, 1, 2))
+        self.assertEqual(result.deleted_indices, ())
+        self.assertEqual(result.search_depth, 0)
+
+    def test_one_redundant_step_is_removed(self) -> None:
         calls: list[tuple[int, ...]] = []
 
         def score(kept: tuple[int, ...]) -> float:
             calls.append(kept)
-            return _prefix_score(20)(kept)
+            if kept == (0, 1, 2):
+                return 0.0
+            if kept == (0, 2):
+                return -0.01
+            return -1.0
 
-        num_steps = 64
-        result = binary_search_prefix(num_steps, score, 0.95)
-        self.assertEqual(result.kept, tuple(range(20)))
-        self.assertEqual(result.num_score_evaluations, len(calls))
-        self.assertLessEqual(len(calls), math.floor(math.log2(num_steps)) + 3)
-        self.assertLess(len(calls), num_steps)
+        result = beam_search_subset(3, score, 0.95, beam_width=4)
+        self.assertEqual(result.kept, (0, 2))
+        self.assertEqual(result.deleted_indices, (1,))
+        self.assertEqual(result.search_depth, 1)
+        self.assertEqual(result.num_score_evaluations, 4)
+        self.assertNotIn((0,), calls)
+        self.assertNotIn((2,), calls)
+
+    def test_two_deletions_can_succeed_when_one_does_not(self) -> None:
+        def score(kept: tuple[int, ...]) -> float:
+            if kept == (0, 1, 2):
+                return 0.0
+            if kept == (1, 2):
+                return -0.2
+            if kept == (2,):
+                return -0.01
+            return -1.0
+
+        result = beam_search_subset(3, score, 0.95, beam_width=1)
+        self.assertEqual(result.kept, (2,))
+        self.assertEqual(result.deleted_indices, (0, 1))
+        self.assertEqual(result.search_depth, 2)
+        blocked = beam_search_subset(3, score, 0.95, beam_width=1, max_deletions=1)
+        self.assertEqual(blocked.kept, (0, 1, 2))
+
+    def test_paths_that_meet_share_one_cached_score(self) -> None:
+        calls: list[tuple[int, ...]] = []
+
+        def score(kept: tuple[int, ...]) -> float:
+            calls.append(kept)
+            return 0.0 if len(kept) == 3 else -1.0
+
+        result = beam_search_subset(3, score, 0.95, beam_width=3)
+        self.assertEqual(len(calls), len(set(calls)))
+        self.assertEqual(result.num_score_evaluations, 7)
+        self.assertEqual(calls.count((2,)), 1)
+        self.assertEqual(calls.count((0,)), 1)
+
+    def test_non_monotonic_path_can_still_be_found(self) -> None:
+        seen: dict[tuple[int, ...], float] = {}
+
+        def score(kept: tuple[int, ...]) -> float:
+            if kept == (0, 1, 2):
+                value = 0.0
+            elif kept == (1, 2):
+                value = -0.2
+            elif kept == (2,):
+                value = -0.01
+            else:
+                value = -1.0
+            seen[kept] = value
+            return value
+
+        result = beam_search_subset(3, score, 0.95, beam_width=4)
+        self.assertEqual(result.kept, (2,))
+        self.assertGreater(seen[(0, 1, 2)], seen[(1, 2)])
+        self.assertGreater(seen[(2,)], seen[(1, 2)])
 
     def test_threshold_stays_at_the_original_score(self) -> None:
         def score(kept: tuple[int, ...]) -> float:
-            return -0.01 * (8 - len(kept))
+            return 0.0 if len(kept) == 3 else -0.01
 
-        result = binary_search_prefix(8, score, 0.95)
-        self.assertLess(len(result.kept), 8)
+        result = beam_search_subset(3, score, 0.95, beam_width=4)
         self.assertEqual(result.threshold, result.original_score + math.log(0.95))
         self.assertEqual(result.threshold, fidelity_threshold(result.original_score, 0.95))
         self.assertNotEqual(result.threshold, result.final_score + math.log(0.95))
@@ -77,56 +132,95 @@ class BinaryPrefixPruneTests(unittest.TestCase):
     def test_every_candidate_keeps_the_original_prompt(self) -> None:
         prompt = [7, 8, 9]
         steps = [[10], [11, 11], [12], [13]]
-        for length in range(0, len(steps) + 1):
-            sequence = candidate_token_ids(prompt, steps, tuple(range(length)), [4], [5, 6])
+        for kept in ((0, 1, 2, 3), (0, 2), (1, 3), ()):
+            sequence = candidate_token_ids(prompt, steps, kept, [4], [5, 6])
             self.assertEqual(sequence[: len(prompt)], prompt)
 
     def test_every_candidate_scores_the_same_answer_target(self) -> None:
         solution = [5, 6]
         steps = [[10], [11, 11], [12], [13]]
-        for length in range(0, len(steps) + 1):
-            sequence = candidate_token_ids([7, 8, 9], steps, tuple(range(length)), [4], solution)
+        for kept in ((0, 1, 2, 3), (0, 2), (3,), ()):
+            sequence = candidate_token_ids([7, 8, 9], steps, kept, [4], solution)
             self.assertEqual(sequence[-len(solution) :], solution)
 
-    def test_eta_one_rejects_any_drop(self) -> None:
+    def test_min_steps_blocks_shorter_states(self) -> None:
+        calls: list[tuple[int, ...]] = []
+
         def score(kept: tuple[int, ...]) -> float:
-            return 0.0 if len(kept) == 4 else -1.0e-9
+            calls.append(kept)
+            if len(kept) <= 1:
+                raise AssertionError("state below min_steps was scored")
+            return 0.0 if len(kept) == 3 else -1.0
 
-        self.assertEqual(binary_search_prefix(4, score, 1.0).kept, tuple(range(4)))
+        result = beam_search_subset(3, score, 0.95, beam_width=4, min_steps=2)
+        self.assertEqual(result.kept, (0, 1, 2))
+        self.assertTrue(all(len(kept) >= 2 for kept in calls))
 
-        result = binary_search_prefix(4, lambda kept: 0.0, 1.0, min_steps=1)
-        self.assertEqual(result.kept, (0,))
+    def test_eta_one_rejects_any_drop(self) -> None:
+        def dropping(kept: tuple[int, ...]) -> float:
+            return 0.0 if len(kept) == 3 else -1.0e-9
 
-    def test_one_and_two_step_traces_without_a_shorter_prefix(self) -> None:
-        self.assertEqual(binary_search_prefix(1, _prefix_score(1), 0.95).kept, (0,))
-        self.assertEqual(binary_search_prefix(2, _prefix_score(2), 0.95).kept, (0, 1))
-        self.assertEqual(binary_search_prefix(0, lambda kept: 0.0, 0.95, min_steps=1).kept, ())
+        self.assertEqual(beam_search_subset(3, dropping, 1.0, beam_width=4).kept, (0, 1, 2))
+        tied = beam_search_subset(3, lambda kept: 0.0, 1.0, beam_width=4)
+        self.assertEqual(tied.deleted_indices, (0,))
+        self.assertGreaterEqual(tied.final_score, tied.original_score)
 
-    def test_repeated_prefix_does_not_call_the_scorer_again(self) -> None:
-        calls = 0
+    def test_duplicate_subset_is_scored_once(self) -> None:
+        calls: list[tuple[int, ...]] = []
 
         def raw(kept: tuple[int, ...]) -> float:
-            nonlocal calls
-            calls += 1
-            return 0.0 if len(kept) >= 2 else -1.0
+            calls.append(kept)
+            return 0.0 if len(kept) == 4 else -1.0
 
         cached = ScoreCache(raw)
-        first = binary_search_prefix(4, cached, 0.95)
-        second = binary_search_prefix(4, cached, 0.95)
-        self.assertEqual(second.num_score_evaluations, 0)
-        self.assertEqual(calls, first.num_score_evaluations)
-        self.assertGreater(len(second.evaluated_prefix_lengths), 0)
+        batches: list[int] = []
 
-    def test_final_prefix_meets_the_fidelity_bound(self) -> None:
+        def score_many(keys: list[tuple[int, ...]]) -> list[float]:
+            batches.append(len(keys))
+            return [raw(key) for key in keys]
+
+        result = beam_search_subset(4, cached, 0.95, beam_width=4, score_many=score_many)
+        self.assertEqual(result.num_unique_subsets_evaluated, len(set(calls)))
+        self.assertEqual(calls.count((0, 1)), 1)
+        self.assertGreater(max(batches), 1)
+
+    def test_retained_beam_does_not_exceed_beam_width(self) -> None:
+        calls: list[tuple[int, ...]] = []
+
+        def score(kept: tuple[int, ...]) -> float:
+            calls.append(kept)
+            if kept == (0, 1, 2, 3):
+                return 0.0
+            if kept == (1, 2, 3):
+                return -0.1
+            if kept == (2, 3):
+                return -0.01
+            return -5.0
+
+        result = beam_search_subset(4, score, 0.95, beam_width=1)
+        self.assertEqual(result.kept, (2, 3))
+        self.assertEqual(result.retained_beam_sizes, (1,))
+        self.assertNotIn((0, 2), calls)
+        wide = beam_search_subset(
+            5, lambda kept: 0.0 if len(kept) == 5 else -1.0, 0.95, beam_width=2
+        )
+        self.assertTrue(wide.retained_beam_sizes)
+        self.assertTrue(all(size <= 2 for size in wide.retained_beam_sizes))
+        self.assertEqual(wide.retained_beam_sizes[0], 2)
+
+    def test_final_subset_meets_the_fidelity_bound(self) -> None:
         eta = 0.95
-        result = binary_search_prefix(8, _prefix_score(4), eta)
+        result = beam_search_subset(
+            3,
+            _table({(0, 1, 2): 0.0, (0, 2): -0.01, (1, 2): -1.0, (0, 1): -1.0}),
+            eta,
+            beam_width=4,
+        )
         self.assertGreaterEqual(result.final_score, result.original_score + math.log(eta))
         metrics = sample_compression(
-            8, len(result.kept), 80, 40, result.original_score, result.final_score
+            3, len(result.kept), 30, 20, result.original_score, result.final_score
         )
         self.assertGreaterEqual(metrics["fidelity"], eta - 1e-12)
-        self.assertAlmostEqual(metrics["step_reduction"], 0.5)
-        self.assertAlmostEqual(metrics["token_reduction"], 0.5)
 
 
 if __name__ == "__main__":

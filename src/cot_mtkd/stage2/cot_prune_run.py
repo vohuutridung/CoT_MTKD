@@ -32,7 +32,7 @@ from ..utils.local_logging import JsonlLogger
 from ..utils.manifest import read_json, require_file_sha256, write_json
 from .cot_prune import (
     ScoreCache,
-    binary_search_prefix,
+    beam_search_subset,
     candidate_token_ids,
     sample_compression,
     token_cut_summary,
@@ -65,16 +65,23 @@ def validate_pruning_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("cot_pruning.ensemble.aggregation must be geometric_mean")
     if pruning["ensemble"].get("score_space") != "log_probability":
         raise ValueError("cot_pruning.ensemble.score_space must be log_probability")
-    if pruning.get("method") != "binary_search_prefix":
-        raise ValueError("cot_pruning.method must be binary_search_prefix")
-    if pruning["search"].get("method") != "binary_search":
-        raise ValueError("cot_pruning.search.method must be binary_search")
-    if pruning["search"].get("monotonicity_assumption") is not True:
-        raise ValueError("cot_pruning.search.monotonicity_assumption must be true")
+    if pruning.get("method") != "beam_search":
+        raise ValueError("cot_pruning.method must be beam_search")
+    search = pruning["search"]
+    if search.get("method") != "beam_search":
+        raise ValueError("cot_pruning.search.method must be beam_search")
+    if isinstance(search.get("beam_width"), bool) or int(search.get("beam_width", 0)) < 1:
+        raise ValueError("cot_pruning.search.beam_width must be a positive integer")
+    max_deletions = search.get("max_deletions", None)
+    if max_deletions is not None and int(max_deletions) < 0:
+        raise ValueError("cot_pruning.search.max_deletions must be null or nonnegative")
     if int(pruning.get("min_steps", 1)) < 0:
         raise ValueError("cot_pruning.min_steps must be nonnegative")
-    if int(pruning.get("candidate_batch_size", 1)) < 1:
-        raise ValueError("cot_pruning.candidate_batch_size must be positive")
+    batch_size = search.get("candidate_batch_size", pruning.get("candidate_batch_size", 8))
+    if int(batch_size) < 1:
+        raise ValueError("cot_pruning.search.candidate_batch_size must be positive")
+    if pruning.get("cache", {}).get("enabled") is not True:
+        raise ValueError("cot_pruning.cache.enabled must be true")
     if not pruning.get("hf_repo"):
         raise ValueError("cot_pruning.hf_repo is required")
     if not pruning.get("data_config") or not pruning.get("source_prepared"):
@@ -126,8 +133,14 @@ class FrozenCouncil:
         self.pruning = pruning
         self.device = distributed.device
         self.chunk_tokens = int(config["runtime"]["lm_head_chunk_tokens"])
-        self.batch_size = int(pruning.get("candidate_batch_size", 1))
+        search = pruning["search"]
+        self.batch_size = int(
+            search.get("candidate_batch_size", pruning.get("candidate_batch_size", 8))
+        )
         self.min_steps = int(pruning.get("min_steps", 1))
+        self.beam_width = int(search["beam_width"])
+        max_deletions = search.get("max_deletions", None)
+        self.max_deletions = None if max_deletions is None else int(max_deletions)
         stage1_dir = Path(config["paths"]["stage1"])
         teachers = ensure_stage2_teachers(config)
         bundle_path = require_file_sha256(
@@ -251,8 +264,11 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
     count = len(rows)
     summary = {
         "records": count,
-        "method": "binary_search_prefix",
+        "method": "beam_search",
+        "beam_width": int(pruning["search"]["beam_width"]),
         "mean_deleted_steps": sum(row["pruning"]["num_deleted_steps"] for row in rows) / count,
+        "mean_num_score_evaluations": sum(row["pruning"]["num_score_evaluations"] for row in rows)
+        / count,
         "mean_step_reduction": sum(row["pruning"]["step_reduction"] for row in rows) / count,
         "mean_token_reduction": sum(row["pruning"]["token_reduction"] for row in rows) / count,
         "mean_fidelity": sum(row["pruning"]["fidelity"] for row in rows) / count,
@@ -309,8 +325,8 @@ def _prune_record(
 
     def score_many(keys: list[tuple[int, ...]]) -> list[float]:
         for key in keys:
-            if key != tuple(range(len(key))):
-                raise RuntimeError(f"{record.sample_id}: search requested a non-prefix")
+            if key != tuple(sorted(set(key))) or any(not 0 <= index < len(steps) for index in key):
+                raise RuntimeError(f"{record.sample_id}: search requested an invalid subset")
         sequences = [encode(key, True) for key in keys]
         prompt_ids = list(prefix)
         answer_ids = list(solution)
@@ -322,7 +338,15 @@ def _prune_record(
         return council.score_many(sequences, answer_length)
 
     cache = ScoreCache(lambda kept: score_many([kept])[0])
-    result = binary_search_prefix(len(steps), cache, eta, min_steps=council.min_steps)
+    result = beam_search_subset(
+        len(steps),
+        cache,
+        eta,
+        beam_width=council.beam_width,
+        min_steps=council.min_steps,
+        max_deletions=council.max_deletions,
+        score_many=score_many,
+    )
     chosen = result.kept
     original_tokens = sum(len(step) for step in steps)
     kept_tokens = sum(len(steps[index]) for index in chosen)
@@ -335,8 +359,8 @@ def _prune_record(
         result.final_score,
     )
     short_text = "\n\n".join(texts[index] for index in chosen)
-    evaluated = (
-        list(result.evaluated_prefix_lengths)
+    metadata = (
+        list(result.retained_beam_sizes)
         if pruning["output"].get("save_search_metadata", True)
         else []
     )
@@ -355,8 +379,9 @@ def _prune_record(
         if pruning["output"].get("save_pruned_reasoning", True)
         else [],
         "pruning": {
-            "method": "binary_search_prefix",
+            "method": "beam_search",
             "eta": eta,
+            "beam_width": result.beam_width,
             "original_score": result.original_score,
             "final_score": result.final_score,
             "threshold": result.threshold,
@@ -364,7 +389,10 @@ def _prune_record(
             "final_num_steps": len(chosen),
             "num_deleted_steps": len(steps) - len(chosen),
             "num_score_evaluations": result.num_score_evaluations,
-            "evaluated_prefix_lengths": evaluated,
+            "num_unique_subsets_evaluated": result.num_unique_subsets_evaluated,
+            "search_depth": result.search_depth,
+            "deleted_indices": list(result.deleted_indices),
+            "retained_beam_sizes": metadata,
             "original_reasoning_tokens": original_tokens,
             "final_reasoning_tokens": kept_tokens,
             "deleted_reasoning_tokens": original_tokens - kept_tokens,
@@ -376,8 +404,8 @@ def _prune_record(
     details = payload["pruning"]
     LOGGER.info(
         "sample_id=%s original_num_steps=%d final_num_steps=%d original_score=%.6f "
-        "final_score=%.6f threshold=%.6f eta=%s num_deleted_steps=%d "
-        "num_score_evaluations=%d fidelity=%.4f",
+        "final_score=%.6f threshold=%.6f eta=%s beam_width=%d num_deleted_steps=%d "
+        "search_depth=%d num_score_evaluations=%d fidelity=%.6g",
         record.sample_id,
         details["original_num_steps"],
         details["final_num_steps"],
@@ -385,7 +413,9 @@ def _prune_record(
         details["final_score"],
         details["threshold"],
         eta,
+        details["beam_width"],
         details["num_deleted_steps"],
+        details["search_depth"],
         details["num_score_evaluations"],
         details["fidelity"],
     )

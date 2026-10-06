@@ -1,14 +1,14 @@
-"""Shortest reasoning-prefix search for Phase-2 CoT pruning.
+"""Beam search over reasoning subsets for Phase-2 CoT pruning.
 
-Only a prefix of the original steps may be kept. Steps in the middle are never
-deleted, reordered, or rewritten, and the prompt is not part of the search.
+Any original step may be deleted. Surviving steps keep their original order.
+The prompt is not edited and no new reasoning is generated.
 
-Binary search assumes prefix validity is monotone: once a prefix clears the
-fixed threshold, every longer prefix is treated as valid too. The threshold is
-``S(R_original) + log(eta)`` and is not updated from later scores. This finds
-the shortest valid prefix under that assumption, not the shortest arbitrary
-subset. The score is the ensemble log-probability of the ground-truth answer
-only. No answer is generated.
+This is an approximation, not an exact shortest subset. Search increases the
+deletion count. It stops at the first depth that contains a candidate whose
+ensemble answer log-probability still clears the fixed original threshold
+``S(R_original) + log(eta)``. Deeper subsets are left unexplored. When a depth
+has no valid candidate, the ``beam_width`` highest-scoring children are kept
+so a later combination can still recover. No answer is generated.
 """
 
 from __future__ import annotations
@@ -21,12 +21,23 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class PruneResult:
     kept: tuple[int, ...]
+    deleted_indices: tuple[int, ...]
     original_score: float
     final_score: float
     threshold: float
     eta: float
+    beam_width: int
     num_score_evaluations: int
-    evaluated_prefix_lengths: tuple[int, ...]
+    num_unique_subsets_evaluated: int
+    search_depth: int
+    retained_beam_sizes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _BeamState:
+    active: tuple[int, ...]
+    score: float
+    deleted: tuple[int, ...]
 
 
 class ScoreCache:
@@ -90,7 +101,7 @@ def candidate_token_ids(
     answer_prefix: Sequence[int] = (),
     solution: Sequence[int] = (),
 ) -> list[int]:
-    """Prompt tokens stay the original prefix. Only a whole-step suffix is dropped."""
+    """Prompt tokens stay put. Kept steps stay in their original order."""
     ids = [int(token) for token in prefix]
     for index in kept:
         ids.extend(int(token) for token in steps[int(index)])
@@ -99,55 +110,90 @@ def candidate_token_ids(
     return ids
 
 
-def binary_search_prefix(
+def _deleted_indices(num_steps: int, active: tuple[int, ...]) -> tuple[int, ...]:
+    present = set(active)
+    return tuple(index for index in range(num_steps) if index not in present)
+
+
+def _rank(state: _BeamState) -> tuple[float, tuple[int, ...]]:
+    return (-state.score, state.deleted)
+
+
+def beam_search_subset(
     num_steps: int,
     score: Callable[[tuple[int, ...]], float],
     eta: float,
+    beam_width: int = 4,
     min_steps: int = 1,
+    max_deletions: int | None = None,
+    score_many: Callable[[list[tuple[int, ...]]], Sequence[float]] | None = None,
 ) -> PruneResult:
-    """Return the shortest prefix whose ensemble score clears the original threshold.
+    """Delete whole steps until one beam depth still clears the original threshold.
 
-    ``score`` receives ``(0, 1, ..., k-1)`` and must be the geometric-mean
-    log-probability of the unchanged ground-truth answer. Validity is assumed
-    to be monotone in ``k``: a short prefix may fail, and lengthening it is
-    what makes the threshold pass. The search therefore takes ``O(log T)``
-    score evaluations. It does not try non-prefix subsets.
+    ``score`` receives original step indices in increasing order. Equal scores
+    keep the lexicographically smaller ``deleted_indices``. Duplicate subsets
+    are scored once. The retained beam never exceeds ``beam_width``.
     """
     if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps < 0:
         raise ValueError("num_steps must be a nonnegative integer")
     if isinstance(min_steps, bool) or not isinstance(min_steps, int) or min_steps < 0:
         raise ValueError("min_steps must be a nonnegative integer")
+    if isinstance(beam_width, bool) or not isinstance(beam_width, int) or beam_width < 1:
+        raise ValueError("beam_width must be a positive integer")
+    if max_deletions is not None and (
+        isinstance(max_deletions, bool) or not isinstance(max_deletions, int) or max_deletions < 0
+    ):
+        raise ValueError("max_deletions must be null or a nonnegative integer")
     cached = score if isinstance(score, ScoreCache) else ScoreCache(score)
     misses_before = cached.misses
-    evaluated: list[int] = []
-
-    def cached_prefix(length: int) -> float:
-        evaluated.append(length)
-        return cached(tuple(range(length)))
-
-    original_score = cached_prefix(num_steps)
+    original = tuple(range(num_steps))
+    original_score = cached(original)
     threshold = fidelity_threshold(original_score, eta)
-    low = min_steps
-    high = num_steps
-    best_k = num_steps
-    while low <= high:
-        mid = (low + high) // 2
-        if cached_prefix(mid) >= threshold:
-            best_k = mid
-            high = mid - 1
-        else:
-            low = mid + 1
-    final_score = cached(tuple(range(best_k)))
-    if final_score < threshold:
-        raise RuntimeError("Selected prefix is below the fixed fidelity threshold")
+    best = _BeamState(original, original_score, ())
+    beam = [best]
+    retained: list[int] = []
+    room = max(0, num_steps - min_steps)
+    max_depth = room if max_deletions is None else min(room, max_deletions)
+    for _depth in range(1, max_depth + 1):
+        unique: dict[tuple[int, ...], None] = {}
+        for state in beam:
+            if len(state.active) - 1 < min_steps:
+                continue
+            for index in state.active:
+                child = tuple(step for step in state.active if step != index)
+                unique.setdefault(child, None)
+        if not unique:
+            break
+        children = list(unique)
+        cached.ensure(children, score_many)
+        scored = [
+            _BeamState(child, cached(child), _deleted_indices(num_steps, child))
+            for child in children
+        ]
+        scored.sort(key=_rank)
+        valid = [state for state in scored if state.score >= threshold]
+        if valid:
+            best = valid[0]
+            break
+        beam = scored[:beam_width]
+        retained.append(len(beam))
+        if not beam:
+            break
+    if best.score < threshold:
+        raise RuntimeError("Selected subset is below the fixed fidelity threshold")
+    evaluations = cached.misses - misses_before
     return PruneResult(
-        kept=tuple(range(best_k)),
+        kept=best.active,
+        deleted_indices=best.deleted,
         original_score=original_score,
-        final_score=final_score,
+        final_score=best.score,
         threshold=threshold,
         eta=float(eta),
-        num_score_evaluations=cached.misses - misses_before,
-        evaluated_prefix_lengths=tuple(evaluated),
+        beam_width=beam_width,
+        num_score_evaluations=evaluations,
+        num_unique_subsets_evaluated=evaluations,
+        search_depth=len(best.deleted),
+        retained_beam_sizes=tuple(retained),
     )
 
 
