@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import torch
+from tqdm.auto import tqdm
 
 from ..data.prepare import write_prepared_dataset
 from ..data.schema import PreparedRecord, TokenRegion
@@ -30,7 +31,13 @@ from ..signals.pag import answer_continuation_ids, record_pag_parts
 from ..utils.distributed import DistributedContext
 from ..utils.local_logging import JsonlLogger
 from ..utils.manifest import read_json, require_file_sha256, write_json
-from .cot_prune import ScoreCache, candidate_token_ids, choose_fallback, greedy_delete
+from .cot_prune import (
+    ScoreCache,
+    candidate_token_ids,
+    choose_fallback,
+    greedy_delete,
+    token_cut_summary,
+)
 from .online import _select_adapter
 from .teachers import ensure_stage2_teachers
 
@@ -264,8 +271,16 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
     eta = float(pruning["eta"])
     logger = JsonlLogger(export_dir / "metrics.jsonl", truncate=True)
     rows: list[dict[str, Any]] = []
-    for record in dataset:
-        rows.append(_prune_record(record, council, step_pattern, eta, pruning, logger))
+    seen_original = 0
+    seen_deleted = 0
+    progress = tqdm(dataset, total=len(dataset), desc="Pruning CoT")
+    for record in progress:
+        row = _prune_record(record, council, step_pattern, eta, pruning, logger)
+        rows.append(row)
+        seen_original += int(row["pruning"]["original_reasoning_tokens"])
+        seen_deleted += int(row["pruning"]["deleted_reasoning_tokens"])
+        running_cut = 0.0 if seen_original == 0 else 100.0 * seen_deleted / seen_original
+        progress.set_postfix(sample=record.sample_id, token_cut=f"{running_cut:.1f}%")
     export_path = export_dir / "train.jsonl"
     temporary = export_path.with_suffix(".jsonl.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -273,9 +288,22 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     temporary.replace(export_path)
     prepared = write_prepared_dataset(rows, council.tokenizer, _prepare_config(config, output_dir))
+    cuts = token_cut_summary(
+        [
+            (
+                int(row["pruning"]["original_reasoning_tokens"]),
+                int(row["pruning"]["deleted_reasoning_tokens"]),
+            )
+            for row in rows
+        ]
+    )
     summary = {
         "records": len(rows),
         "mean_deleted": sum(row["pruning"]["num_deleted"] for row in rows) / len(rows),
+        "mean_token_cut_percent": cuts["mean_token_cut_percent"],
+        "overall_token_cut_percent": cuts["overall_token_cut_percent"],
+        "total_original_reasoning_tokens": int(cuts["total_original_reasoning_tokens"]),
+        "total_deleted_reasoning_tokens": int(cuts["total_deleted_reasoning_tokens"]),
         "fallback_count": sum(bool(row["pruning"]["fallback_used"]) for row in rows),
         "correct_count": sum(bool(row["pruning"]["correct_after_pruning"]) for row in rows),
         "prepared_manifest": prepared,
@@ -285,11 +313,17 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
     write_json(export_dir / "summary.json", summary)
     _upload(rows, str(pruning["hf_repo"]), bool(pruning.get("hf_private", False)))
     LOGGER.info(
-        "Pruned %d samples (mean deleted %.2f, fallbacks %d) into %s",
+        "Pruned %d samples into %s: mean deleted steps %.2f, "
+        "mean token cut %.2f%%, overall token cut %.2f%% "
+        "(%d/%d reasoning tokens), fallbacks %d",
         len(rows),
-        summary["mean_deleted"],
-        summary["fallback_count"],
         output_dir,
+        summary["mean_deleted"],
+        summary["mean_token_cut_percent"],
+        summary["overall_token_cut_percent"],
+        summary["total_deleted_reasoning_tokens"],
+        summary["total_original_reasoning_tokens"],
+        summary["fallback_count"],
     )
     return summary
 
@@ -340,6 +374,8 @@ def _prune_record(
     chosen, correct, fallback_used = choose_fallback(result.states, is_correct)
     if not correctness_calls or correctness_calls[0] != result.kept:
         raise RuntimeError("Correctness must start at the final pruned trace")
+    original_tokens = sum(len(step) for step in steps)
+    kept_tokens = sum(len(steps[index]) for index in chosen)
     short_text = "\n\n".join(texts[index] for index in chosen)
     history = [item.__dict__ for item in result.history] if pruning["output"].get(
         "save_deletion_history", True
@@ -366,6 +402,9 @@ def _prune_record(
             "original_num_steps": len(steps),
             "final_num_steps": len(chosen),
             "num_deleted": len(steps) - len(chosen),
+            "original_reasoning_tokens": original_tokens,
+            "final_reasoning_tokens": kept_tokens,
+            "deleted_reasoning_tokens": original_tokens - kept_tokens,
             "correct_after_pruning": correct,
             "fallback_used": fallback_used,
             "deletion_history": history,

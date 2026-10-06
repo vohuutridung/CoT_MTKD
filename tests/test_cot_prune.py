@@ -8,7 +8,20 @@ from cot_mtkd.stage2.cot_prune import (
     choose_fallback,
     fidelity_threshold,
     greedy_delete,
+    token_cut_summary,
 )
+
+
+class TokenCutSummaryTests(unittest.TestCase):
+    def test_mean_is_unweighted_and_overall_weights_by_length(self) -> None:
+        summary = token_cut_summary([(100, 20), (50, 25), (0, 0)])
+        self.assertAlmostEqual(summary["mean_token_cut_percent"], (20.0 + 50.0 + 0.0) / 3)
+        self.assertAlmostEqual(summary["overall_token_cut_percent"], 100.0 * 45 / 150)
+        self.assertEqual(summary["total_deleted_reasoning_tokens"], 45.0)
+
+    def test_deleted_tokens_cannot_exceed_the_original(self) -> None:
+        with self.assertRaises(ValueError):
+            token_cut_summary([(4, 5)])
 
 
 class ReasoningSplitTests(unittest.TestCase):

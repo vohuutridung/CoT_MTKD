@@ -154,6 +154,33 @@ def greedy_delete(
     )
 
 
+def token_cut_summary(cuts: Sequence[tuple[int, int]]) -> dict[str, float]:
+    """Average and corpus-level share of deleted reasoning tokens.
+
+    Each pair is ``(original_reasoning_tokens, deleted_reasoning_tokens)`` for
+    one sample. The mean is unweighted across samples. The overall share weights
+    each sample by how many reasoning tokens it started with.
+    """
+    if not cuts:
+        raise ValueError("token cut summary needs at least one sample")
+    percents: list[float] = []
+    total_original = 0
+    total_deleted = 0
+    for original, deleted in cuts:
+        if original < 0 or deleted < 0 or deleted > original:
+            raise ValueError("deleted tokens must lie within the original count")
+        total_original += original
+        total_deleted += deleted
+        percents.append(0.0 if original == 0 else 100.0 * deleted / original)
+    overall = 0.0 if total_original == 0 else 100.0 * total_deleted / total_original
+    return {
+        "mean_token_cut_percent": sum(percents) / len(percents),
+        "overall_token_cut_percent": overall,
+        "total_original_reasoning_tokens": float(total_original),
+        "total_deleted_reasoning_tokens": float(total_deleted),
+    }
+
+
 def choose_fallback(
     states: Sequence[Sequence[int]],
     is_correct: Callable[[tuple[int, ...]], bool],
