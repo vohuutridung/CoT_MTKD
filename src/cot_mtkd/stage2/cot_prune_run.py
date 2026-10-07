@@ -395,6 +395,7 @@ def _prune_record(
             "cache_hits": result.cache_hits,
             "original_reasoning_tokens": original_tokens,
             "final_reasoning_tokens": kept_tokens,
+            "deleted_reasoning_tokens": original_tokens - kept_tokens,
             "answer_tokens": answer_length,
             "step_reduction": metrics["step_reduction"],
             "step_reduction_ratio": metrics["step_reduction"],
