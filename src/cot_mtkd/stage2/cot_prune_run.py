@@ -385,20 +385,31 @@ def _prune_record(
             "cache_hits": result.cache_hits,
             "original_reasoning_tokens": original_tokens,
             "final_reasoning_tokens": kept_tokens,
+            "original_num_reasoning_tokens": original_tokens,
+            "final_num_reasoning_tokens": kept_tokens,
             "deleted_reasoning_tokens": original_tokens - kept_tokens,
+            "answer_tokens": answer_length,
             "step_reduction": metrics["step_reduction"],
             "token_reduction": metrics["token_reduction"],
+            "token_reduction_ratio": metrics["token_reduction"],
             "fidelity": metrics["fidelity"],
+            "ensemble_likelihood_ratio": metrics["fidelity"],
         },
     }
     details = payload["pruning"]
     LOGGER.info(
-        "sample_id=%s original_num_steps=%d final_num_steps=%d original_score=%.6f "
+        "sample_id=%s original_num_steps=%d final_num_steps=%d "
+        "original_num_reasoning_tokens=%d final_num_reasoning_tokens=%d "
+        "token_reduction_ratio=%.4f answer_tokens=%d original_score=%.6f "
         "final_score=%.6f threshold=%.6f eta=%s num_deleted_steps=%d "
-        "num_model_evaluations=%d cache_hits=%d fidelity=%.6g",
+        "num_model_evaluations=%d cache_hits=%d ensemble_likelihood_ratio=%.6g",
         record.sample_id,
         details["original_num_steps"],
         details["final_num_steps"],
+        details["original_num_reasoning_tokens"],
+        details["final_num_reasoning_tokens"],
+        details["token_reduction_ratio"],
+        details["answer_tokens"],
         details["original_score"],
         details["final_score"],
         details["threshold"],
@@ -406,7 +417,7 @@ def _prune_record(
         details["num_deleted_steps"],
         details["num_model_evaluations"],
         details["cache_hits"],
-        details["fidelity"],
+        details["ensemble_likelihood_ratio"],
     )
     logger.log("cot_prune", sample_id=record.sample_id, **details)
     return payload
