@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any, Sequence
@@ -73,6 +74,11 @@ def validate_pruning_config(config: dict[str, Any]) -> dict[str, Any]:
     max_depth = search.get("max_depth", None)
     if max_depth is not None and int(max_depth) < 0:
         raise ValueError("cot_pruning.search.max_depth must be null or nonnegative")
+    if pruning.get("nll_budget_mode", "absolute") != "absolute":
+        raise ValueError("cot_pruning.nll_budget_mode must be absolute")
+    nll_budget = float(pruning.get("nll_budget", -1))
+    if not math.isfinite(nll_budget) or nll_budget < 0.0:
+        raise ValueError("cot_pruning.nll_budget must be finite and nonnegative")
     if int(pruning.get("min_steps", 1)) < 0:
         raise ValueError("cot_pruning.min_steps must be nonnegative")
     batch_size = search.get("candidate_batch_size", pruning.get("candidate_batch_size", 8))
@@ -229,14 +235,13 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
         raise RuntimeError("Source prepared dataset record count mismatch")
     council = FrozenCouncil(config, distributed)
     step_pattern = str(source_manifest["config"]["serialization"]["step_pattern"])
-    eta = float(pruning["eta"])
     logger = JsonlLogger(export_dir / "metrics.jsonl", truncate=True)
     rows: list[dict[str, Any]] = []
     seen_original = 0
     seen_deleted = 0
     progress = tqdm(dataset, total=len(dataset), desc="Pruning CoT")
     for record in progress:
-        row = _prune_record(record, council, step_pattern, eta, pruning, logger)
+        row = _prune_record(record, council, step_pattern, pruning, logger)
         rows.append(row)
         seen_original += int(row["pruning"]["original_reasoning_tokens"])
         seen_deleted += int(row["pruning"]["deleted_reasoning_tokens"])
@@ -267,7 +272,11 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
         / count,
         "mean_step_reduction": sum(row["pruning"]["step_reduction"] for row in rows) / count,
         "mean_token_reduction": sum(row["pruning"]["token_reduction"] for row in rows) / count,
-        "mean_fidelity": sum(row["pruning"]["fidelity"] for row in rows) / count,
+        "nll_budget": float(pruning["nll_budget"]),
+        "mean_nll_delta_from_original": sum(
+            row["pruning"]["nll_delta_from_original"] for row in rows
+        )
+        / count,
         "mean_token_cut_percent": cuts["mean_token_cut_percent"],
         "overall_token_cut_percent": cuts["overall_token_cut_percent"],
         "total_original_reasoning_tokens": int(cuts["total_original_reasoning_tokens"]),
@@ -281,7 +290,7 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
     LOGGER.info(
         "Pruned %d samples into %s: mean step reduction %.2f%%, "
         "mean token cut %.2f%%, overall token cut %.2f%% "
-        "(%d/%d reasoning tokens), mean fidelity %.4f",
+        "(%d/%d reasoning tokens), mean NLL delta %+.4f",
         count,
         output_dir,
         100.0 * summary["mean_step_reduction"],
@@ -289,7 +298,7 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
         summary["overall_token_cut_percent"],
         summary["total_deleted_reasoning_tokens"],
         summary["total_original_reasoning_tokens"],
-        summary["mean_fidelity"],
+        summary["mean_nll_delta_from_original"],
     )
     return summary
 
@@ -298,7 +307,6 @@ def _prune_record(
     record: PreparedRecord,
     council: FrozenCouncil,
     step_pattern: str,
-    eta: float,
     pruning: dict[str, Any],
     logger: JsonlLogger,
 ) -> dict[str, Any]:
@@ -334,10 +342,11 @@ def _prune_record(
         return council.score_many(sequences, answer_length)
 
     cache = ScoreCache(lambda kept: score_many([kept])[0])
+    nll_budget = float(pruning["nll_budget"])
     result = hierarchical_group_prune(
         len(steps),
         cache,
-        eta,
+        nll_budget,
         min_steps=council.min_steps,
         max_depth=council.max_depth,
         score_many=score_many,
@@ -350,8 +359,8 @@ def _prune_record(
         len(chosen),
         original_tokens,
         kept_tokens,
-        result.original_score,
-        result.final_score,
+        -result.original_nll,
+        -result.final_nll,
     )
     short_text = "\n\n".join(texts[index] for index in chosen)
     payload = {
@@ -371,10 +380,11 @@ def _prune_record(
         "pruning": {
             "algorithm": "hierarchical_group_pruning",
             "method": "hierarchical_group_pruning",
-            "eta": eta,
-            "original_score": result.original_score,
-            "final_score": result.final_score,
-            "threshold": result.threshold,
+            "nll_budget": result.nll_budget,
+            "nll_budget_mode": "absolute",
+            "original_nll": result.original_nll,
+            "final_nll": result.final_nll,
+            "nll_delta_from_original": result.nll_delta_from_original,
             "original_num_steps": len(steps),
             "final_num_steps": len(chosen),
             "num_deleted_steps": len(steps) - len(chosen),
@@ -385,39 +395,35 @@ def _prune_record(
             "cache_hits": result.cache_hits,
             "original_reasoning_tokens": original_tokens,
             "final_reasoning_tokens": kept_tokens,
-            "original_num_reasoning_tokens": original_tokens,
-            "final_num_reasoning_tokens": kept_tokens,
-            "deleted_reasoning_tokens": original_tokens - kept_tokens,
             "answer_tokens": answer_length,
             "step_reduction": metrics["step_reduction"],
+            "step_reduction_ratio": metrics["step_reduction"],
             "token_reduction": metrics["token_reduction"],
             "token_reduction_ratio": metrics["token_reduction"],
-            "fidelity": metrics["fidelity"],
-            "ensemble_likelihood_ratio": metrics["fidelity"],
         },
     }
     details = payload["pruning"]
     LOGGER.info(
         "sample_id=%s original_num_steps=%d final_num_steps=%d "
-        "original_num_reasoning_tokens=%d final_num_reasoning_tokens=%d "
-        "token_reduction_ratio=%.4f answer_tokens=%d original_score=%.6f "
-        "final_score=%.6f threshold=%.6f eta=%s num_deleted_steps=%d "
-        "num_model_evaluations=%d cache_hits=%d ensemble_likelihood_ratio=%.6g",
+        "original_reasoning_tokens=%d final_reasoning_tokens=%d answer_tokens=%d "
+        "original_nll=%.6f final_nll=%.6f nll_delta_from_original=%+.6f "
+        "nll_budget=%.4f token_reduction_ratio=%.4f step_reduction_ratio=%.4f "
+        "num_deleted_steps=%d num_model_evaluations=%d cache_hits=%d",
         record.sample_id,
         details["original_num_steps"],
         details["final_num_steps"],
-        details["original_num_reasoning_tokens"],
-        details["final_num_reasoning_tokens"],
-        details["token_reduction_ratio"],
+        details["original_reasoning_tokens"],
+        details["final_reasoning_tokens"],
         details["answer_tokens"],
-        details["original_score"],
-        details["final_score"],
-        details["threshold"],
-        eta,
+        details["original_nll"],
+        details["final_nll"],
+        details["nll_delta_from_original"],
+        details["nll_budget"],
+        details["token_reduction_ratio"],
+        details["step_reduction_ratio"],
         details["num_deleted_steps"],
         details["num_model_evaluations"],
         details["cache_hits"],
-        details["ensemble_likelihood_ratio"],
     )
     logger.log("cot_prune", sample_id=record.sample_id, **details)
     return payload

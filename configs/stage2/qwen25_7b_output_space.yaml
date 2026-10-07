@@ -58,7 +58,8 @@ runtime:
 cot_pruning:
   enabled: true
   method: hierarchical_group_pruning
-  eta: 0.95
+  nll_budget: 0.05
+  nll_budget_mode: absolute
   min_steps: 1
   data_config: configs/data/trainhihi.yaml
   source_prepared: artifacts/prepared/s1k_1_1_cot_only

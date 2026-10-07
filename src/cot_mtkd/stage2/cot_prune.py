@@ -1,15 +1,15 @@
 """Hierarchical group pruning for Phase-2 CoT compression.
 
 Contiguous groups of original reasoning steps are tested for deletion. A group
-that still clears the fixed threshold ``S(R) + log(eta)`` is removed. A group
-that misses the threshold is split in half, and both halves are searched.
-Failure to delete a group does not prune away its subgroups. Surviving steps
-keep their original indices and order. The prompt and answer are not edited.
+is removed when its answer-token NLL stays within ``nll_budget`` of the NLL of
+the trace accepted so far. A rejected group is split in half and both halves
+are searched. Deleted steps are not put back, and a deleted group is not
+searched again. Surviving steps keep their original indices and order.
 
-The partition tree is about ``log T`` levels deep. Both children can be scored,
-so the total number of ensemble evaluations is not guaranteed to be ``O(log T)``.
-The procedure is a heuristic, not an exhaustive shortest-subset search. No
-answer is generated.
+NLL may rise or fall when steps are removed. The budget is local to the
+current trace, so the total change from the original trace can exceed one
+budget. The procedure is a heuristic for distillation, not a proof that the
+deleted steps are redundant. No answer is generated.
 """
 
 from __future__ import annotations
@@ -23,10 +23,10 @@ from dataclasses import dataclass
 class PruneResult:
     kept: tuple[int, ...]
     deleted_indices: tuple[int, ...]
-    original_score: float
-    final_score: float
-    threshold: float
-    eta: float
+    original_nll: float
+    final_nll: float
+    nll_budget: float
+    nll_delta_from_original: float
     num_score_evaluations: int
     num_unique_subsets_evaluated: int
     cache_hits: int
@@ -81,12 +81,13 @@ class ScoreCache:
             self._store(key, value)
 
 
-def fidelity_threshold(original_score: float, eta: float) -> float:
-    if not math.isfinite(original_score):
-        raise ValueError("original_score must be finite")
-    if not math.isfinite(eta) or not 0.0 < eta <= 1.0:
-        raise ValueError("eta must be in (0, 1]")
-    return original_score + math.log(eta)
+def within_nll_budget(candidate_nll: float, current_nll: float, nll_budget: float) -> bool:
+    """Accept a deletion when it does not raise NLL by more than the local budget."""
+    if not math.isfinite(candidate_nll) or not math.isfinite(current_nll):
+        raise ValueError("NLL must be finite")
+    if not math.isfinite(nll_budget) or nll_budget < 0.0:
+        raise ValueError("nll_budget must be finite and nonnegative")
+    return candidate_nll <= current_nll + nll_budget
 
 
 def candidate_token_ids(
@@ -110,38 +111,26 @@ def _without(active: tuple[int, ...], group: Sequence[int]) -> tuple[int, ...]:
     return tuple(index for index in active if index not in banned)
 
 
-def _prefer(
-    current: tuple[int, ...],
-    current_score: float,
-    challenger: tuple[int, ...],
-    challenger_score: float,
-) -> bool:
-    """Fewer steps win. Equal length prefers the higher score, then smaller indices."""
-    if len(challenger) != len(current):
-        return len(challenger) < len(current)
-    if challenger_score != current_score:
-        return challenger_score > current_score
-    return challenger < current
-
-
 def hierarchical_group_prune(
     num_steps: int,
     score: Callable[[tuple[int, ...]], float],
-    eta: float,
+    nll_budget: float,
     min_steps: int = 1,
     max_depth: int | None = None,
     score_many: Callable[[list[tuple[int, ...]]], Sequence[float]] | None = None,
 ) -> PruneResult:
-    """Delete contiguous groups while the original fidelity threshold still holds.
+    """Delete contiguous groups while answer NLL stays inside the local budget.
 
-    ``score`` receives the surviving original step indices in increasing order.
-    After one sibling is removed, the other sibling is scored against that
-    updated active set. The threshold is never recomputed.
+    ``score`` returns the ensemble answer log-probability, so NLL is its
+    negation. Each accepted deletion replaces the NLL used for the next
+    comparison. ``score`` receives surviving original step indices in order.
     """
     if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps < 0:
         raise ValueError("num_steps must be a nonnegative integer")
     if isinstance(min_steps, bool) or not isinstance(min_steps, int) or min_steps < 0:
         raise ValueError("min_steps must be a nonnegative integer")
+    if not math.isfinite(nll_budget) or nll_budget < 0.0:
+        raise ValueError("nll_budget must be finite and nonnegative")
     if max_depth is not None and (
         isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0
     ):
@@ -150,26 +139,21 @@ def hierarchical_group_prune(
     misses_before = cached.misses
     hits_before = cached.hits
     original = tuple(range(num_steps))
-    original_score = cached(original)
-    threshold = fidelity_threshold(original_score, eta)
-    best = original
-    best_score = original_score
-
-    def consider(candidate: tuple[int, ...], candidate_score: float) -> None:
-        nonlocal best, best_score
-        if _prefer(best, best_score, candidate, candidate_score):
-            best = candidate
-            best_score = candidate_score
+    original_nll = -cached(original)
+    current_nll = original_nll
 
     def prune(active: tuple[int, ...], group: tuple[int, ...], depth: int) -> tuple[int, ...]:
+        nonlocal current_nll
+        if len(active) <= min_steps:
+            return active
         present = tuple(index for index in group if index in set(active))
         if not present:
             return active
         candidate = _without(active, present)
         if len(candidate) >= min_steps:
-            candidate_score = cached(candidate)
-            if candidate_score >= threshold:
-                consider(candidate, candidate_score)
+            candidate_nll = -cached(candidate)
+            if within_nll_budget(candidate_nll, current_nll, nll_budget):
+                current_nll = candidate_nll
                 return candidate
         if len(present) == 1:
             return active
@@ -189,21 +173,17 @@ def hierarchical_group_prune(
         return active
 
     final = prune(original, original, 0)
-    final_score = cached(final)
-    if _prefer(final, final_score, best, best_score):
-        final, final_score = best, best_score
-    elif _prefer(best, best_score, final, final_score):
-        best, best_score = final, final_score
-    if final_score < threshold:
-        raise RuntimeError("Selected subset is below the fixed fidelity threshold")
+    final_nll = -cached(final)
+    if final_nll != current_nll:
+        raise RuntimeError("Accepted trace NLL does not match the scored active set")
     evaluations = cached.misses - misses_before
     return PruneResult(
         kept=final,
         deleted_indices=_without(original, final),
-        original_score=original_score,
-        final_score=final_score,
-        threshold=threshold,
-        eta=float(eta),
+        original_nll=original_nll,
+        final_nll=final_nll,
+        nll_budget=float(nll_budget),
+        nll_delta_from_original=final_nll - original_nll,
         num_score_evaluations=evaluations,
         num_unique_subsets_evaluated=evaluations,
         cache_hits=cached.hits - hits_before,
