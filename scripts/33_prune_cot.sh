@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hierarchically delete CoT groups that preserve answer likelihood, then upload it.
+# Hierarchically delete CoT groups inside the original NLL budget and keep ratio.
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 if [[ "${NPROC_PER_NODE:-1}" -gt 1 ]]; then

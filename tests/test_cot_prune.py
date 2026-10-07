@@ -4,6 +4,7 @@ from cot_mtkd.stage2.cot_prune import (
     ScoreCache,
     candidate_token_ids,
     hierarchical_group_prune,
+    minimum_kept_steps,
     sample_compression,
     token_cut_summary,
     within_nll_budget,
@@ -47,6 +48,7 @@ class NllBudgetTests(unittest.TestCase):
             2,
             _from_nll({(0, 1): 10.0, (1,): 10.04, (0,): 11.0}),
             0.05,
+            target_keep_ratio=0.0,
         )
         self.assertEqual(result.kept, (1,))
         self.assertAlmostEqual(result.final_nll, 10.04)
@@ -69,13 +71,14 @@ class NllBudgetTests(unittest.TestCase):
             2,
             _from_nll({(0, 1): 10.0, (1,): 9.0, (0,): 12.0}),
             0.05,
+            target_keep_ratio=0.0,
         )
         self.assertEqual(result.kept, (1,))
         self.assertAlmostEqual(result.final_nll, 9.0)
         self.assertAlmostEqual(result.nll_delta_from_original, -1.0)
 
-    def test_budget_is_measured_from_the_current_trace(self) -> None:
-        # 10.07 exceeds the original budget of 10.05, but fits 10.03 + 0.05.
+    def test_budget_is_measured_from_the_original_trace(self) -> None:
+        # 10.07 would fit a local budget of 10.03 + 0.05, but not 10.00 + 0.05.
         score = _from_nll(
             {
                 (0, 1, 2, 3): 10.0,
@@ -89,11 +92,11 @@ class NllBudgetTests(unittest.TestCase):
                 (0, 1, 3): 12.0,
             }
         )
-        result = hierarchical_group_prune(4, score, 0.05)
-        self.assertEqual(result.kept, (3,))
-        self.assertAlmostEqual(result.final_nll, 10.07)
-        self.assertAlmostEqual(result.nll_delta_from_original, 0.07)
-        self.assertGreater(result.nll_delta_from_original, result.nll_budget)
+        result = hierarchical_group_prune(4, score, 0.05, target_keep_ratio=0.0)
+        self.assertEqual(result.kept, (2, 3))
+        self.assertAlmostEqual(result.final_nll, 10.03)
+        self.assertLessEqual(result.final_nll, result.original_nll + result.nll_budget)
+        self.assertAlmostEqual(result.nll_delta_from_original, 0.03)
 
     def test_a_rejected_large_group_still_allows_a_better_subgroup(self) -> None:
         score = _from_nll(
@@ -112,7 +115,7 @@ class NllBudgetTests(unittest.TestCase):
                 (0, 1, 3): 15.0,
             }
         )
-        result = hierarchical_group_prune(4, score, 0.05, min_steps=0)
+        result = hierarchical_group_prune(4, score, 0.05, min_steps=0, target_keep_ratio=0.0)
         self.assertEqual(result.kept, (2, 3))
         self.assertAlmostEqual(result.final_nll, 9.5)
         self.assertLess(result.nll_delta_from_original, 0.0)
@@ -158,7 +161,7 @@ class NllBudgetTests(unittest.TestCase):
                 (0, 2): 12.0,
             }
         )
-        result = hierarchical_group_prune(4, score, 0.05)
+        result = hierarchical_group_prune(4, score, 0.05, target_keep_ratio=0.0)
         self.assertEqual(result.kept, (0, 3))
         self.assertEqual(result.deleted_indices, (1, 2))
 
@@ -202,7 +205,7 @@ class NllBudgetTests(unittest.TestCase):
             def score(kept: tuple[int, ...]) -> float:
                 return -table.get(kept, 100.0)
 
-            result = hierarchical_group_prune(num_steps, score, 0.05)
+            result = hierarchical_group_prune(num_steps, score, 0.05, target_keep_ratio=0.0)
             ratio = sample_compression(
                 num_steps,
                 len(result.kept),
@@ -228,6 +231,71 @@ class NllBudgetTests(unittest.TestCase):
         self.assertEqual(unchanged.kept, (0, 1, 2))
         self.assertAlmostEqual(unchanged.nll_delta_from_original, 0.0)
         self.assertAlmostEqual(unchanged_ratio, 0.0)
+
+
+class RetentionFloorTests(unittest.TestCase):
+    def test_ceil_examples(self) -> None:
+        expected = {101: 71, 476: 334, 154: 108, 250: 175, 181: 127}
+        for steps, floor in expected.items():
+            self.assertEqual(minimum_kept_steps(steps, 1, 0.70), floor)
+            self.assertGreaterEqual(floor / steps, 0.70)
+
+    def test_min_steps_can_only_raise_the_floor(self) -> None:
+        self.assertEqual(minimum_kept_steps(10, 8, 0.70), 8)
+        self.assertEqual(minimum_kept_steps(10, 1, 0.70), 7)
+
+    def test_improving_deletions_stop_at_the_floor(self) -> None:
+        def score(kept: tuple[int, ...]) -> float:
+            return -float(len(kept))
+
+        seen: list[tuple[int, ...]] = []
+
+        def counting(kept: tuple[int, ...]) -> float:
+            seen.append(kept)
+            return score(kept)
+
+        result = hierarchical_group_prune(10, counting, 0.05, target_keep_ratio=0.70)
+        self.assertEqual(len(result.kept), 7)
+        self.assertGreaterEqual(len(result.kept) / 10, 0.70)
+        self.assertLess(result.final_nll, result.original_nll)
+        self.assertLessEqual(result.final_nll, result.original_nll + 0.05)
+        self.assertTrue(all(len(kept) >= 7 for kept in seen))
+
+    def test_stricter_min_steps_is_respected(self) -> None:
+        def score(kept: tuple[int, ...]) -> float:
+            return -float(len(kept))
+
+        result = hierarchical_group_prune(10, score, 0.05, min_steps=8, target_keep_ratio=0.70)
+        self.assertEqual(len(result.kept), 8)
+
+    def test_scripted_subset_stays_inside_both_constraints(self) -> None:
+        def prune(num_steps: int, score):
+            return hierarchical_group_prune(num_steps, score, 0.05, target_keep_ratio=0.70)
+
+        def shorter_is_better(kept: tuple[int, ...]) -> float:
+            return -float(len(kept))
+
+        def any_deletion_is_over_budget(kept: tuple[int, ...]) -> float:
+            return -4.0 if len(kept) == 8 else -6.0
+
+        def only_one_step_fits_the_budget(kept: tuple[int, ...]) -> float:
+            deleted = 10 - len(kept)
+            if deleted <= 1:
+                return -(5.0 + 0.04 * deleted)
+            return -6.0
+
+        improving = prune(10, shorter_is_better)
+        blocked = prune(8, any_deletion_is_over_budget)
+        one_step = prune(10, only_one_step_fits_the_budget)
+        self.assertEqual(len(improving.kept), 7)
+        self.assertLess(improving.final_nll, improving.original_nll)
+        self.assertEqual(len(blocked.kept), 8)
+        self.assertAlmostEqual(blocked.nll_delta_from_original, 0.0)
+        self.assertEqual(len(one_step.kept), 9)
+        self.assertAlmostEqual(one_step.nll_delta_from_original, 0.04)
+        for result, width in ((improving, 10), (blocked, 8), (one_step, 10)):
+            self.assertGreaterEqual(len(result.kept) / width, 0.70)
+            self.assertLessEqual(result.final_nll, result.original_nll + result.nll_budget)
 
 
 if __name__ == "__main__":

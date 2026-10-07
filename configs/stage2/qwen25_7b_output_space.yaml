@@ -60,6 +60,7 @@ cot_pruning:
   method: hierarchical_group_pruning
   nll_budget: 0.05
   nll_budget_mode: absolute
+  target_keep_ratio: 0.70
   min_steps: 1
   data_config: configs/data/trainhihi.yaml
   source_prepared: artifacts/prepared/s1k_1_1_cot_only

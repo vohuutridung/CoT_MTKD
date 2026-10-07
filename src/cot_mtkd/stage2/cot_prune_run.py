@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import statistics
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -35,6 +36,7 @@ from .cot_prune import (
     ScoreCache,
     candidate_token_ids,
     hierarchical_group_prune,
+    minimum_kept_steps,
     sample_compression,
     token_cut_summary,
 )
@@ -81,6 +83,9 @@ def validate_pruning_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("cot_pruning.nll_budget must be finite and nonnegative")
     if int(pruning.get("min_steps", 1)) < 0:
         raise ValueError("cot_pruning.min_steps must be nonnegative")
+    keep_ratio = float(pruning.get("target_keep_ratio", 0.70))
+    if not math.isfinite(keep_ratio) or not 0.0 <= keep_ratio <= 1.0:
+        raise ValueError("cot_pruning.target_keep_ratio must be between 0 and 1")
     batch_size = search.get("candidate_batch_size", pruning.get("candidate_batch_size", 8))
     if int(batch_size) < 1:
         raise ValueError("cot_pruning.search.candidate_batch_size must be positive")
@@ -272,11 +277,19 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
         / count,
         "mean_step_reduction": sum(row["pruning"]["step_reduction"] for row in rows) / count,
         "mean_token_reduction": sum(row["pruning"]["token_reduction"] for row in rows) / count,
+        "mean_token_reduction_ratio": sum(row["pruning"]["token_reduction_ratio"] for row in rows)
+        / count,
         "nll_budget": float(pruning["nll_budget"]),
+        "target_keep_ratio": float(pruning.get("target_keep_ratio", 0.70)),
         "mean_nll_delta_from_original": sum(
             row["pruning"]["nll_delta_from_original"] for row in rows
         )
         / count,
+        "mean_nll_delta": sum(row["pruning"]["nll_delta"] for row in rows) / count,
+        "mean_retention_ratio": sum(row["pruning"]["retention_ratio"] for row in rows) / count,
+        "median_retention_ratio": statistics.median(
+            [row["pruning"]["retention_ratio"] for row in rows]
+        ),
         "mean_token_cut_percent": cuts["mean_token_cut_percent"],
         "overall_token_cut_percent": cuts["overall_token_cut_percent"],
         "total_original_reasoning_tokens": int(cuts["total_original_reasoning_tokens"]),
@@ -288,17 +301,18 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
     write_json(export_dir / "summary.json", summary)
     _upload(rows, str(pruning["hf_repo"]), bool(pruning.get("hf_private", False)))
     LOGGER.info(
-        "Pruned %d samples into %s: mean step reduction %.2f%%, "
-        "mean token cut %.2f%%, overall token cut %.2f%% "
+        "Pruned %d samples into %s: mean retention %.2f%%, median retention %.2f%%, "
+        "mean token reduction %.2f%%, overall token cut %.2f%% "
         "(%d/%d reasoning tokens), mean NLL delta %+.4f",
         count,
         output_dir,
-        100.0 * summary["mean_step_reduction"],
-        summary["mean_token_cut_percent"],
+        100.0 * summary["mean_retention_ratio"],
+        100.0 * summary["median_retention_ratio"],
+        100.0 * summary["mean_token_reduction_ratio"],
         summary["overall_token_cut_percent"],
         summary["total_deleted_reasoning_tokens"],
         summary["total_original_reasoning_tokens"],
-        summary["mean_nll_delta_from_original"],
+        summary["mean_nll_delta"],
     )
     return summary
 
@@ -343,6 +357,7 @@ def _prune_record(
 
     cache = ScoreCache(lambda kept: score_many([kept])[0])
     nll_budget = float(pruning["nll_budget"])
+    keep_ratio = float(pruning.get("target_keep_ratio", 0.70))
     result = hierarchical_group_prune(
         len(steps),
         cache,
@@ -350,6 +365,7 @@ def _prune_record(
         min_steps=council.min_steps,
         max_depth=council.max_depth,
         score_many=score_many,
+        target_keep_ratio=keep_ratio,
     )
     chosen = result.kept
     original_tokens = sum(len(step) for step in steps)
@@ -363,6 +379,14 @@ def _prune_record(
         -result.final_nll,
     )
     short_text = "\n\n".join(texts[index] for index in chosen)
+    original_steps = len(steps)
+    final_steps = len(chosen)
+    retention_ratio = 1.0 if original_steps == 0 else final_steps / original_steps
+    floor = minimum_kept_steps(original_steps, council.min_steps, keep_ratio)
+    if final_steps < floor:
+        raise RuntimeError(f"{record.sample_id}: kept {final_steps} steps below the floor {floor}")
+    if result.final_nll > result.original_nll + nll_budget:
+        raise RuntimeError(f"{record.sample_id}: final answer NLL exceeds the original budget")
     payload = {
         "id": record.sample_id,
         "question": record.question,
@@ -385,11 +409,19 @@ def _prune_record(
             "original_nll": result.original_nll,
             "final_nll": result.final_nll,
             "nll_delta_from_original": result.nll_delta_from_original,
-            "original_num_steps": len(steps),
-            "final_num_steps": len(chosen),
-            "num_deleted_steps": len(steps) - len(chosen),
+            "nll_delta": result.nll_delta_from_original,
+            "original_num_steps": original_steps,
+            "final_num_steps": final_steps,
+            "original_steps": original_steps,
+            "final_steps": final_steps,
+            "num_deleted_steps": original_steps - final_steps,
+            "steps_removed": original_steps - final_steps,
+            "retention_ratio": retention_ratio,
+            "target_keep_ratio": keep_ratio,
+            "minimum_kept_steps": floor,
             "deleted_indices": list(result.deleted_indices),
             "num_model_evaluations": result.num_score_evaluations,
+            "num_evaluations": result.num_score_evaluations,
             "num_score_evaluations": result.num_score_evaluations,
             "num_unique_subsets_evaluated": result.num_unique_subsets_evaluated,
             "cache_hits": result.cache_hits,
@@ -405,25 +437,20 @@ def _prune_record(
     }
     details = payload["pruning"]
     LOGGER.info(
-        "sample_id=%s original_num_steps=%d final_num_steps=%d "
-        "original_reasoning_tokens=%d final_reasoning_tokens=%d answer_tokens=%d "
-        "original_nll=%.6f final_nll=%.6f nll_delta_from_original=%+.6f "
-        "nll_budget=%.4f token_reduction_ratio=%.4f step_reduction_ratio=%.4f "
-        "num_deleted_steps=%d num_model_evaluations=%d cache_hits=%d",
+        "sample_id=%s original_steps=%d final_steps=%d steps_removed=%d "
+        "retention_ratio=%.4f token_reduction_ratio=%.4f "
+        "original_nll=%.6f final_nll=%.6f nll_delta=%+.6f "
+        "num_evaluations=%d cache_hits=%d",
         record.sample_id,
-        details["original_num_steps"],
-        details["final_num_steps"],
-        details["original_reasoning_tokens"],
-        details["final_reasoning_tokens"],
-        details["answer_tokens"],
+        details["original_steps"],
+        details["final_steps"],
+        details["steps_removed"],
+        details["retention_ratio"],
+        details["token_reduction_ratio"],
         details["original_nll"],
         details["final_nll"],
-        details["nll_delta_from_original"],
-        details["nll_budget"],
-        details["token_reduction_ratio"],
-        details["step_reduction_ratio"],
-        details["num_deleted_steps"],
-        details["num_model_evaluations"],
+        details["nll_delta"],
+        details["num_evaluations"],
         details["cache_hits"],
     )
     logger.log("cot_prune", sample_id=record.sample_id, **details)

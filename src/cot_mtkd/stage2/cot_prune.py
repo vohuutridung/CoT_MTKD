@@ -1,15 +1,20 @@
 """Hierarchical group pruning for Phase-2 CoT compression.
 
 Contiguous groups of original reasoning steps are tested for deletion. A group
-is removed when its answer-token NLL stays within ``nll_budget`` of the NLL of
-the trace accepted so far. A rejected group is split in half and both halves
-are searched. Deleted steps are not put back, and a deleted group is not
-searched again. Surviving steps keep their original indices and order.
+is removed only when both of these hold:
 
-NLL may rise or fall when steps are removed. The budget is local to the
-current trace, so the total change from the original trace can exceed one
-budget. The procedure is a heuristic for distillation, not a proof that the
-deleted steps are redundant. No answer is generated.
+* its answer-token NLL is at most ``original_nll + nll_budget``
+* the candidate still keeps at least ``ceil(T * target_keep_ratio)`` steps
+
+The NLL reference is always the original trace. A rejected group is split in
+half and both halves are searched. A group that would drop the trace below the
+retention floor is not scored. Deleted steps are not put back, and a deleted
+group is not searched again. Surviving steps keep their original indices and
+order.
+
+NLL may rise or fall when steps are removed. An improvement is accepted when
+the retention floor still holds. The procedure is a heuristic for distillation,
+not a proof that the deleted steps are redundant. No answer is generated.
 """
 
 from __future__ import annotations
@@ -81,13 +86,30 @@ class ScoreCache:
             self._store(key, value)
 
 
-def within_nll_budget(candidate_nll: float, current_nll: float, nll_budget: float) -> bool:
-    """Accept a deletion when it does not raise NLL by more than the local budget."""
-    if not math.isfinite(candidate_nll) or not math.isfinite(current_nll):
+def within_nll_budget(candidate_nll: float, reference_nll: float, nll_budget: float) -> bool:
+    """Accept a deletion when answer NLL stays within budget of the original trace."""
+    if not math.isfinite(candidate_nll) or not math.isfinite(reference_nll):
         raise ValueError("NLL must be finite")
     if not math.isfinite(nll_budget) or nll_budget < 0.0:
         raise ValueError("nll_budget must be finite and nonnegative")
-    return candidate_nll <= current_nll + nll_budget
+    return candidate_nll <= reference_nll + nll_budget
+
+
+def minimum_kept_steps(num_steps: int, min_steps: int, target_keep_ratio: float) -> int:
+    """Fewest surviving steps: ``max(min_steps, ceil(T * target_keep_ratio))``."""
+    if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps < 0:
+        raise ValueError("num_steps must be a nonnegative integer")
+    if isinstance(min_steps, bool) or not isinstance(min_steps, int) or min_steps < 0:
+        raise ValueError("min_steps must be a nonnegative integer")
+    if (
+        isinstance(target_keep_ratio, bool)
+        or not isinstance(target_keep_ratio, (int, float))
+        or not math.isfinite(float(target_keep_ratio))
+        or not 0.0 <= float(target_keep_ratio) <= 1.0
+    ):
+        raise ValueError("target_keep_ratio must be between 0 and 1")
+    ratio_floor = math.ceil(num_steps * float(target_keep_ratio))
+    return min(num_steps, max(min_steps, ratio_floor))
 
 
 def candidate_token_ids(
@@ -118,42 +140,42 @@ def hierarchical_group_prune(
     min_steps: int = 1,
     max_depth: int | None = None,
     score_many: Callable[[list[tuple[int, ...]]], Sequence[float]] | None = None,
+    target_keep_ratio: float = 0.70,
 ) -> PruneResult:
-    """Delete contiguous groups while answer NLL stays inside the local budget.
+    """Delete contiguous groups inside the original-trace NLL budget and keep ratio.
 
     ``score`` returns the ensemble answer log-probability, so NLL is its
-    negation. Each accepted deletion replaces the NLL used for the next
-    comparison. ``score`` receives surviving original step indices in order.
+    negation. Every comparison uses the original trace, not the last accepted
+    candidate. ``score`` receives surviving original step indices in order.
     """
     if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps < 0:
         raise ValueError("num_steps must be a nonnegative integer")
-    if isinstance(min_steps, bool) or not isinstance(min_steps, int) or min_steps < 0:
-        raise ValueError("min_steps must be a nonnegative integer")
     if not math.isfinite(nll_budget) or nll_budget < 0.0:
         raise ValueError("nll_budget must be finite and nonnegative")
     if max_depth is not None and (
         isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0
     ):
         raise ValueError("max_depth must be null or a nonnegative integer")
+    floor = minimum_kept_steps(num_steps, min_steps, target_keep_ratio)
     cached = score if isinstance(score, ScoreCache) else ScoreCache(score)
     misses_before = cached.misses
     hits_before = cached.hits
     original = tuple(range(num_steps))
     original_nll = -cached(original)
-    current_nll = original_nll
 
     def prune(active: tuple[int, ...], group: tuple[int, ...], depth: int) -> tuple[int, ...]:
-        nonlocal current_nll
-        if len(active) <= min_steps:
+        if len(active) <= floor:
             return active
         present = tuple(index for index in group if index in set(active))
         if not present:
             return active
         candidate = _without(active, present)
-        if len(candidate) >= min_steps:
+        # A group that would cross the retention floor is not scored. It is
+        # partitioned only so a smaller contiguous piece can still be tested;
+        # a single step has no smaller piece, so that branch stops.
+        if len(candidate) >= floor:
             candidate_nll = -cached(candidate)
-            if within_nll_budget(candidate_nll, current_nll, nll_budget):
-                current_nll = candidate_nll
+            if within_nll_budget(candidate_nll, original_nll, nll_budget):
                 return candidate
         if len(present) == 1:
             return active
@@ -162,9 +184,7 @@ def hierarchical_group_prune(
         midpoint = len(present) // 2
         halves = (present[:midpoint], present[midpoint:])
         pending = [
-            _without(active, half)
-            for half in halves
-            if len(_without(active, half)) >= min_steps
+            _without(active, half) for half in halves if len(_without(active, half)) >= floor
         ]
         if pending:
             cached.ensure(pending, score_many)
@@ -174,8 +194,10 @@ def hierarchical_group_prune(
 
     final = prune(original, original, 0)
     final_nll = -cached(final)
-    if final_nll != current_nll:
-        raise RuntimeError("Accepted trace NLL does not match the scored active set")
+    if len(final) < floor:
+        raise RuntimeError("pruned trace kept fewer steps than the retention floor")
+    if not within_nll_budget(final_nll, original_nll, nll_budget):
+        raise RuntimeError("pruned trace exceeds the original answer-NLL budget")
     evaluations = cached.misses - misses_before
     return PruneResult(
         kept=final,
