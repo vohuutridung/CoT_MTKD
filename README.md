@@ -166,8 +166,8 @@ Meaning of each command:
 2. `prepare` builds the original tokenized corpus in `artifacts/prepared/s1k_1_1_cot_only/`.
 3. `fetch-teachers` downloads, verifies and imports the three experts into
    `artifacts/stage1/duyentl04_abc/`.
-4. `prune-cot` uses beam search (width 2) to delete reasoning steps anywhere
-   in the trace while keeping at least 95% of the original answer likelihood.
+4. `prune-cot` deletes contiguous reasoning groups, splitting a group when
+   removing it would drop answer likelihood below 95% of the original.
    It writes the shortened corpus to `artifacts/prepared/trainhihi/` and uploads
    it to `sonspeed/Trainhihi`.
 5. `stage2-cache` precomputes teacher targets on that shortened corpus and selects

@@ -32,8 +32,8 @@ from ..utils.local_logging import JsonlLogger
 from ..utils.manifest import read_json, require_file_sha256, write_json
 from .cot_prune import (
     ScoreCache,
-    beam_search_subset,
     candidate_token_ids,
+    hierarchical_group_prune,
     sample_compression,
     token_cut_summary,
 )
@@ -65,16 +65,14 @@ def validate_pruning_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("cot_pruning.ensemble.aggregation must be geometric_mean")
     if pruning["ensemble"].get("score_space") != "log_probability":
         raise ValueError("cot_pruning.ensemble.score_space must be log_probability")
-    if pruning.get("method") != "beam_search":
-        raise ValueError("cot_pruning.method must be beam_search")
+    if pruning.get("method") != "hierarchical_group_pruning":
+        raise ValueError("cot_pruning.method must be hierarchical_group_pruning")
     search = pruning["search"]
-    if search.get("method") != "beam_search":
-        raise ValueError("cot_pruning.search.method must be beam_search")
-    if isinstance(search.get("beam_width"), bool) or int(search.get("beam_width", 0)) < 1:
-        raise ValueError("cot_pruning.search.beam_width must be a positive integer")
-    max_deletions = search.get("max_deletions", None)
-    if max_deletions is not None and int(max_deletions) < 0:
-        raise ValueError("cot_pruning.search.max_deletions must be null or nonnegative")
+    if search.get("method") != "hierarchical_group_pruning":
+        raise ValueError("cot_pruning.search.method must be hierarchical_group_pruning")
+    max_depth = search.get("max_depth", None)
+    if max_depth is not None and int(max_depth) < 0:
+        raise ValueError("cot_pruning.search.max_depth must be null or nonnegative")
     if int(pruning.get("min_steps", 1)) < 0:
         raise ValueError("cot_pruning.min_steps must be nonnegative")
     batch_size = search.get("candidate_batch_size", pruning.get("candidate_batch_size", 8))
@@ -138,9 +136,8 @@ class FrozenCouncil:
             search.get("candidate_batch_size", pruning.get("candidate_batch_size", 8))
         )
         self.min_steps = int(pruning.get("min_steps", 1))
-        self.beam_width = int(search["beam_width"])
-        max_deletions = search.get("max_deletions", None)
-        self.max_deletions = None if max_deletions is None else int(max_deletions)
+        max_depth = search.get("max_depth", None)
+        self.max_depth = None if max_depth is None else int(max_depth)
         stage1_dir = Path(config["paths"]["stage1"])
         teachers = ensure_stage2_teachers(config)
         bundle_path = require_file_sha256(
@@ -264,8 +261,7 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
     count = len(rows)
     summary = {
         "records": count,
-        "method": "beam_search",
-        "beam_width": int(pruning["search"]["beam_width"]),
+        "method": "hierarchical_group_pruning",
         "mean_deleted_steps": sum(row["pruning"]["num_deleted_steps"] for row in rows) / count,
         "mean_num_score_evaluations": sum(row["pruning"]["num_score_evaluations"] for row in rows)
         / count,
@@ -338,13 +334,12 @@ def _prune_record(
         return council.score_many(sequences, answer_length)
 
     cache = ScoreCache(lambda kept: score_many([kept])[0])
-    result = beam_search_subset(
+    result = hierarchical_group_prune(
         len(steps),
         cache,
         eta,
-        beam_width=council.beam_width,
         min_steps=council.min_steps,
-        max_deletions=council.max_deletions,
+        max_depth=council.max_depth,
         score_many=score_many,
     )
     chosen = result.kept
@@ -359,11 +354,6 @@ def _prune_record(
         result.final_score,
     )
     short_text = "\n\n".join(texts[index] for index in chosen)
-    metadata = (
-        list(result.retained_beam_sizes)
-        if pruning["output"].get("save_search_metadata", True)
-        else []
-    )
     payload = {
         "id": record.sample_id,
         "question": record.question,
@@ -379,20 +369,20 @@ def _prune_record(
         if pruning["output"].get("save_pruned_reasoning", True)
         else [],
         "pruning": {
-            "method": "beam_search",
+            "algorithm": "hierarchical_group_pruning",
+            "method": "hierarchical_group_pruning",
             "eta": eta,
-            "beam_width": result.beam_width,
             "original_score": result.original_score,
             "final_score": result.final_score,
             "threshold": result.threshold,
             "original_num_steps": len(steps),
             "final_num_steps": len(chosen),
             "num_deleted_steps": len(steps) - len(chosen),
+            "deleted_indices": list(result.deleted_indices),
+            "num_model_evaluations": result.num_score_evaluations,
             "num_score_evaluations": result.num_score_evaluations,
             "num_unique_subsets_evaluated": result.num_unique_subsets_evaluated,
-            "search_depth": result.search_depth,
-            "deleted_indices": list(result.deleted_indices),
-            "retained_beam_sizes": metadata,
+            "cache_hits": result.cache_hits,
             "original_reasoning_tokens": original_tokens,
             "final_reasoning_tokens": kept_tokens,
             "deleted_reasoning_tokens": original_tokens - kept_tokens,
@@ -404,8 +394,8 @@ def _prune_record(
     details = payload["pruning"]
     LOGGER.info(
         "sample_id=%s original_num_steps=%d final_num_steps=%d original_score=%.6f "
-        "final_score=%.6f threshold=%.6f eta=%s beam_width=%d num_deleted_steps=%d "
-        "search_depth=%d num_score_evaluations=%d fidelity=%.6g",
+        "final_score=%.6f threshold=%.6f eta=%s num_deleted_steps=%d "
+        "num_model_evaluations=%d cache_hits=%d fidelity=%.6g",
         record.sample_id,
         details["original_num_steps"],
         details["final_num_steps"],
@@ -413,10 +403,9 @@ def _prune_record(
         details["final_score"],
         details["threshold"],
         eta,
-        details["beam_width"],
         details["num_deleted_steps"],
-        details["search_depth"],
-        details["num_score_evaluations"],
+        details["num_model_evaluations"],
+        details["cache_hits"],
         details["fidelity"],
     )
     logger.log("cot_prune", sample_id=record.sample_id, **details)

@@ -57,7 +57,7 @@ runtime:
   dataloader_workers: 0
 cot_pruning:
   enabled: true
-  method: beam_search
+  method: hierarchical_group_pruning
   eta: 0.95
   min_steps: 1
   data_config: configs/data/trainhihi.yaml
@@ -69,9 +69,8 @@ cot_pruning:
     aggregation: geometric_mean
     score_space: log_probability
   search:
-    method: beam_search
-    beam_width: 2
-    max_deletions: null
+    method: hierarchical_group_pruning
+    max_depth: null
     candidate_batch_size: 8
   cache:
     enabled: true

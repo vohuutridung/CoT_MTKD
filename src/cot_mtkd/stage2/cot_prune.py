@@ -1,14 +1,15 @@
-"""Beam search over reasoning subsets for Phase-2 CoT pruning.
+"""Hierarchical group pruning for Phase-2 CoT compression.
 
-Any original step may be deleted. Surviving steps keep their original order.
-The prompt is not edited and no new reasoning is generated.
+Contiguous groups of original reasoning steps are tested for deletion. A group
+that still clears the fixed threshold ``S(R) + log(eta)`` is removed. A group
+that misses the threshold is split in half, and both halves are searched.
+Failure to delete a group does not prune away its subgroups. Surviving steps
+keep their original indices and order. The prompt and answer are not edited.
 
-This is an approximation, not an exact shortest subset. Search increases the
-deletion count. It stops at the first depth that contains a candidate whose
-ensemble answer log-probability still clears the fixed original threshold
-``S(R_original) + log(eta)``. Deeper subsets are left unexplored. When a depth
-has no valid candidate, the ``beam_width`` highest-scoring children are kept
-so a later combination can still recover. No answer is generated.
+The partition tree is about ``log T`` levels deep. Both children can be scored,
+so the total number of ensemble evaluations is not guaranteed to be ``O(log T)``.
+The procedure is a heuristic, not an exhaustive shortest-subset search. No
+answer is generated.
 """
 
 from __future__ import annotations
@@ -26,18 +27,9 @@ class PruneResult:
     final_score: float
     threshold: float
     eta: float
-    beam_width: int
     num_score_evaluations: int
     num_unique_subsets_evaluated: int
-    search_depth: int
-    retained_beam_sizes: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class _BeamState:
-    active: tuple[int, ...]
-    score: float
-    deleted: tuple[int, ...]
+    cache_hits: int
 
 
 class ScoreCache:
@@ -47,6 +39,7 @@ class ScoreCache:
         self._score = score
         self._values: dict[tuple[int, ...], float] = {}
         self.misses = 0
+        self.hits = 0
 
     def _store(self, key: tuple[int, ...], value: float) -> float:
         value = float(value)
@@ -60,6 +53,8 @@ class ScoreCache:
         if key not in self._values:
             self.misses += 1
             self._store(key, self._score(key))
+        else:
+            self.hits += 1
         return self._values[key]
 
     def ensure(
@@ -110,90 +105,108 @@ def candidate_token_ids(
     return ids
 
 
-def _deleted_indices(num_steps: int, active: tuple[int, ...]) -> tuple[int, ...]:
-    present = set(active)
-    return tuple(index for index in range(num_steps) if index not in present)
+def _without(active: tuple[int, ...], group: Sequence[int]) -> tuple[int, ...]:
+    banned = {int(index) for index in group}
+    return tuple(index for index in active if index not in banned)
 
 
-def _rank(state: _BeamState) -> tuple[float, tuple[int, ...]]:
-    return (-state.score, state.deleted)
+def _prefer(
+    current: tuple[int, ...],
+    current_score: float,
+    challenger: tuple[int, ...],
+    challenger_score: float,
+) -> bool:
+    """Fewer steps win. Equal length prefers the higher score, then smaller indices."""
+    if len(challenger) != len(current):
+        return len(challenger) < len(current)
+    if challenger_score != current_score:
+        return challenger_score > current_score
+    return challenger < current
 
 
-def beam_search_subset(
+def hierarchical_group_prune(
     num_steps: int,
     score: Callable[[tuple[int, ...]], float],
     eta: float,
-    beam_width: int = 2,
     min_steps: int = 1,
-    max_deletions: int | None = None,
+    max_depth: int | None = None,
     score_many: Callable[[list[tuple[int, ...]]], Sequence[float]] | None = None,
 ) -> PruneResult:
-    """Delete whole steps until one beam depth still clears the original threshold.
+    """Delete contiguous groups while the original fidelity threshold still holds.
 
-    ``score`` receives original step indices in increasing order. Equal scores
-    keep the lexicographically smaller ``deleted_indices``. Duplicate subsets
-    are scored once. The retained beam never exceeds ``beam_width``.
+    ``score`` receives the surviving original step indices in increasing order.
+    After one sibling is removed, the other sibling is scored against that
+    updated active set. The threshold is never recomputed.
     """
     if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps < 0:
         raise ValueError("num_steps must be a nonnegative integer")
     if isinstance(min_steps, bool) or not isinstance(min_steps, int) or min_steps < 0:
         raise ValueError("min_steps must be a nonnegative integer")
-    if isinstance(beam_width, bool) or not isinstance(beam_width, int) or beam_width < 1:
-        raise ValueError("beam_width must be a positive integer")
-    if max_deletions is not None and (
-        isinstance(max_deletions, bool) or not isinstance(max_deletions, int) or max_deletions < 0
+    if max_depth is not None and (
+        isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0
     ):
-        raise ValueError("max_deletions must be null or a nonnegative integer")
+        raise ValueError("max_depth must be null or a nonnegative integer")
     cached = score if isinstance(score, ScoreCache) else ScoreCache(score)
     misses_before = cached.misses
+    hits_before = cached.hits
     original = tuple(range(num_steps))
     original_score = cached(original)
     threshold = fidelity_threshold(original_score, eta)
-    best = _BeamState(original, original_score, ())
-    beam = [best]
-    retained: list[int] = []
-    room = max(0, num_steps - min_steps)
-    max_depth = room if max_deletions is None else min(room, max_deletions)
-    for _depth in range(1, max_depth + 1):
-        unique: dict[tuple[int, ...], None] = {}
-        for state in beam:
-            if len(state.active) - 1 < min_steps:
-                continue
-            for index in state.active:
-                child = tuple(step for step in state.active if step != index)
-                unique.setdefault(child, None)
-        if not unique:
-            break
-        children = list(unique)
-        cached.ensure(children, score_many)
-        scored = [
-            _BeamState(child, cached(child), _deleted_indices(num_steps, child))
-            for child in children
+    best = original
+    best_score = original_score
+
+    def consider(candidate: tuple[int, ...], candidate_score: float) -> None:
+        nonlocal best, best_score
+        if _prefer(best, best_score, candidate, candidate_score):
+            best = candidate
+            best_score = candidate_score
+
+    def prune(active: tuple[int, ...], group: tuple[int, ...], depth: int) -> tuple[int, ...]:
+        present = tuple(index for index in group if index in set(active))
+        if not present:
+            return active
+        candidate = _without(active, present)
+        if len(candidate) >= min_steps:
+            candidate_score = cached(candidate)
+            if candidate_score >= threshold:
+                consider(candidate, candidate_score)
+                return candidate
+        if len(present) == 1:
+            return active
+        if max_depth is not None and depth >= max_depth:
+            return active
+        midpoint = len(present) // 2
+        halves = (present[:midpoint], present[midpoint:])
+        pending = [
+            _without(active, half)
+            for half in halves
+            if len(_without(active, half)) >= min_steps
         ]
-        scored.sort(key=_rank)
-        valid = [state for state in scored if state.score >= threshold]
-        if valid:
-            best = valid[0]
-            break
-        beam = scored[:beam_width]
-        retained.append(len(beam))
-        if not beam:
-            break
-    if best.score < threshold:
+        if pending:
+            cached.ensure(pending, score_many)
+        for half in halves:
+            active = prune(active, half, depth + 1)
+        return active
+
+    final = prune(original, original, 0)
+    final_score = cached(final)
+    if _prefer(final, final_score, best, best_score):
+        final, final_score = best, best_score
+    elif _prefer(best, best_score, final, final_score):
+        best, best_score = final, final_score
+    if final_score < threshold:
         raise RuntimeError("Selected subset is below the fixed fidelity threshold")
     evaluations = cached.misses - misses_before
     return PruneResult(
-        kept=best.active,
-        deleted_indices=best.deleted,
+        kept=final,
+        deleted_indices=_without(original, final),
         original_score=original_score,
-        final_score=best.score,
+        final_score=final_score,
         threshold=threshold,
         eta=float(eta),
-        beam_width=beam_width,
         num_score_evaluations=evaluations,
         num_unique_subsets_evaluated=evaluations,
-        search_depth=len(best.deleted),
-        retained_beam_sizes=tuple(retained),
+        cache_hits=cached.hits - hits_before,
     )
 
 
