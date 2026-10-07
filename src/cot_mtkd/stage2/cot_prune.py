@@ -123,7 +123,7 @@ def beam_search_subset(
     num_steps: int,
     score: Callable[[tuple[int, ...]], float],
     eta: float,
-    beam_width: int = 4,
+    beam_width: int = 2,
     min_steps: int = 1,
     max_deletions: int | None = None,
     score_many: Callable[[list[tuple[int, ...]]], Sequence[float]] | None = None,

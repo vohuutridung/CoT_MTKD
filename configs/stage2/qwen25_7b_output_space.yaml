@@ -70,7 +70,7 @@ cot_pruning:
     score_space: log_probability
   search:
     method: beam_search
-    beam_width: 4
+    beam_width: 2
     max_deletions: null
     candidate_batch_size: 8
   cache:
