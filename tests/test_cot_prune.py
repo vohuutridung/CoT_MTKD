@@ -1,5 +1,9 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
+from cot_mtkd.data.schema import PreparedRecord
 from cot_mtkd.stage2.cot_prune import (
     ScoreCache,
     candidate_token_ids,
@@ -9,7 +13,11 @@ from cot_mtkd.stage2.cot_prune import (
     token_cut_summary,
     within_nll_budget,
 )
-from cot_mtkd.stage2.cot_prune_run import reasoning_step_texts
+from cot_mtkd.stage2.cot_prune_run import (
+    load_prune_metrics,
+    reasoning_step_texts,
+    row_from_saved_pruning,
+)
 
 
 class TokenCutSummaryTests(unittest.TestCase):
@@ -296,6 +304,60 @@ class RetentionFloorTests(unittest.TestCase):
         for result, width in ((improving, 10), (blocked, 8), (one_step, 10)):
             self.assertGreaterEqual(len(result.kept) / width, 0.70)
             self.assertLessEqual(result.final_nll, result.original_nll + result.nll_budget)
+
+
+class SavedPruneResumeTests(unittest.TestCase):
+    def test_partial_final_line_is_dropped_and_a_row_can_be_rebuilt(self) -> None:
+        record = PreparedRecord(
+            sample_id="s1k-0000",
+            input_ids=[1],
+            labels=[1],
+            attention_mask=[1],
+            offset_mapping=[(0, 1)],
+            region_ids=[0],
+            step_ids=[0],
+            question="q",
+            thinking="alpha\n\nbeta\n\ngamma",
+            solution="ans",
+            deepseek_grade="yes",
+            original_length=1,
+            kept_length=1,
+            original_steps=3,
+            kept_steps=3,
+            truncated=False,
+            answer_start=0,
+            reasoning_start=0,
+            tokenizer_fingerprint="x",
+        )
+        saved = {
+            "time": 1.0,
+            "event": "cot_prune",
+            "sample_id": "s1k-0000",
+            "deleted_indices": [1],
+            "original_num_steps": 3,
+            "final_num_steps": 2,
+            "original_reasoning_tokens": 30,
+            "deleted_reasoning_tokens": 10,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.jsonl"
+            path.write_text(json.dumps(saved) + "\n{\"sample_id\":", encoding="utf-8")
+            loaded = load_prune_metrics(path)
+            self.assertEqual(list(loaded), ["s1k-0000"])
+            self.assertNotIn("time", loaded["s1k-0000"])
+            text = path.read_text(encoding="utf-8")
+            self.assertTrue(text.endswith("\n"))
+            self.assertNotIn('{"sample_id":', text)
+        row = row_from_saved_pruning(
+            record,
+            r"\n\n+",
+            {"output": {"save_original_reasoning": True, "save_pruned_reasoning": True}},
+            loaded["s1k-0000"],
+        )
+        self.assertEqual(row["deepseek_thinking_trajectory"], "alpha\n\ngamma")
+        self.assertEqual(row["pruning"]["deleted_indices"], [1])
+        self.assertEqual(row["question"], "q")
+        self.assertEqual(row["solution"], "ans")
 
 
 if __name__ == "__main__":

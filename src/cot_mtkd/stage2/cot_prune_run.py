@@ -211,6 +211,78 @@ def _prepare_config(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     return data_config
 
 
+def load_prune_metrics(path: Path) -> dict[str, dict[str, Any]]:
+    """Read finished per-sample prune decisions. A partial final line is dropped."""
+    if not path.exists():
+        return {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    saved: dict[str, dict[str, Any]] = {}
+    valid: list[str] = []
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            if index == len(lines) - 1:
+                LOGGER.warning("Dropping an incomplete final line from %s", path)
+                break
+            raise RuntimeError(f"{path}: invalid JSON on line {index + 1}") from None
+        if record.get("event") != "cot_prune" or "sample_id" not in record:
+            raise RuntimeError(f"{path}: line {index + 1} is not a finished prune record")
+        sample_id = str(record["sample_id"])
+        if sample_id in saved:
+            raise RuntimeError(f"{path}: duplicate prune record for {sample_id}")
+        pruning = {
+            key: value
+            for key, value in record.items()
+            if key not in {"time", "event", "sample_id"}
+        }
+        if "deleted_indices" not in pruning:
+            raise RuntimeError(f"{path}: {sample_id} has no deleted_indices")
+        saved[sample_id] = pruning
+        valid.append(line)
+    if len(valid) != sum(bool(line.strip()) for line in lines):
+        path.write_text("".join(f"{line}\n" for line in valid), encoding="utf-8")
+    return saved
+
+
+def row_from_saved_pruning(
+    record: PreparedRecord,
+    step_pattern: str,
+    pruning: dict[str, Any],
+    saved: dict[str, Any],
+) -> dict[str, Any]:
+    """Rebuild one exported row from the source trace and its saved deletion list."""
+    texts = reasoning_step_texts(record.thinking, step_pattern)
+    deleted = [int(index) for index in saved["deleted_indices"]]
+    out_of_range = any(index < 0 or index >= len(texts) for index in deleted)
+    if len(set(deleted)) != len(deleted) or out_of_range:
+        raise RuntimeError(f"{record.sample_id}: saved deleted_indices do not match the source")
+    if int(saved["original_num_steps"]) != len(texts):
+        raise RuntimeError(f"{record.sample_id}: saved step count does not match the source")
+    banned = set(deleted)
+    chosen = [index for index in range(len(texts)) if index not in banned]
+    if len(chosen) != int(saved["final_num_steps"]):
+        raise RuntimeError(f"{record.sample_id}: saved final step count does not match")
+    return {
+        "id": record.sample_id,
+        "question": record.question,
+        "prompt": record.question,
+        "solution": record.solution,
+        "answer": record.solution,
+        "deepseek_grade": record.deepseek_grade,
+        "deepseek_thinking_trajectory": "\n\n".join(texts[index] for index in chosen),
+        "reasoning_original": texts
+        if pruning["output"].get("save_original_reasoning", True)
+        else [],
+        "reasoning_short": [texts[index] for index in chosen]
+        if pruning["output"].get("save_pruned_reasoning", True)
+        else [],
+        "pruning": saved,
+    }
+
+
 def _upload(rows: list[dict[str, Any]], repo_id: str, private: bool) -> None:
     if os.environ.get("HF_HUB_OFFLINE") == "1":
         raise RuntimeError(
@@ -238,15 +310,36 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
     dataset = JsonlRecordDataset(source_data)
     if len(dataset) != int(source_manifest["records"]):
         raise RuntimeError("Source prepared dataset record count mismatch")
-    council = FrozenCouncil(config, distributed)
     step_pattern = str(source_manifest["config"]["serialization"]["step_pattern"])
-    logger = JsonlLogger(export_dir / "metrics.jsonl", truncate=True)
+    metrics_path = export_dir / "metrics.jsonl"
+    saved = load_prune_metrics(metrics_path)
+    source_ids = {dataset[index].sample_id for index in range(len(dataset))}
+    unknown = sorted(set(saved) - source_ids)
+    if unknown:
+        raise RuntimeError(
+            f"{metrics_path} contains {len(unknown)} sample ids that are not in the source corpus"
+        )
+    pending = len(dataset) - len(saved)
+    LOGGER.info(
+        "Reusing %d/%d pruned samples from %s; %d still need scoring",
+        len(saved),
+        len(dataset),
+        metrics_path,
+        pending,
+    )
+    council = FrozenCouncil(config, distributed) if pending else None
+    logger = JsonlLogger(metrics_path, truncate=False)
     rows: list[dict[str, Any]] = []
     seen_original = 0
     seen_deleted = 0
     progress = tqdm(dataset, total=len(dataset), desc="Pruning CoT")
     for record in progress:
-        row = _prune_record(record, council, step_pattern, pruning, logger)
+        if record.sample_id in saved:
+            row = row_from_saved_pruning(record, step_pattern, pruning, saved[record.sample_id])
+        else:
+            if council is None:
+                raise RuntimeError(f"{record.sample_id}: no saved prune record and no council")
+            row = _prune_record(record, council, step_pattern, pruning, logger)
         rows.append(row)
         seen_original += int(row["pruning"]["original_reasoning_tokens"])
         seen_deleted += int(row["pruning"]["deleted_reasoning_tokens"])
@@ -258,7 +351,10 @@ def prune_dataset(config: dict[str, Any], distributed: DistributedContext) -> di
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     temporary.replace(export_path)
-    prepared = write_prepared_dataset(rows, council.tokenizer, _prepare_config(config, output_dir))
+    tokenizer = (
+        council.tokenizer if council is not None else load_tokenizer(config["model"])
+    )
+    prepared = write_prepared_dataset(rows, tokenizer, _prepare_config(config, output_dir))
     cuts = token_cut_summary(
         [
             (
